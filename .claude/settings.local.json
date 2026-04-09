@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(printf '[core]\\\\n\\\\trepositoryformatversion = 0\\\\n\\\\tfilemode = false\\\\n\\\\tbare = false\\\\n\\\\tlogallrefupdates = true\\\\n\\\\tsymlinks = false\\\\n\\\\tignorecase = true\\\\n')",
+      "Bash(git -C /c/Users/simon/Downloads/claude_managed_agents status)"
+    ]
+  }
+}
