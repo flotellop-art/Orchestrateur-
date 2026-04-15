@@ -4,18 +4,28 @@ Ces fichiers sont destinés au **dépôt Appfacade** (séparé), pas à l'Orches
 Ils ont été livrés ici parce que le dépôt Appfacade n'était pas accessible lors
 de la génération de cette PR.
 
-## Copie manuelle dans Appfacade
+## Fichiers à copier dans Appfacade
 
+| Source (ce dépôt) | Destination (Appfacade) |
+|---|---|
+| `src/services/orchestrateurClient.ts` | `src/services/orchestrateurClient.ts` |
+| `src/components/settings/OrchestratorSync.tsx` | `src/components/settings/OrchestratorSync.tsx` |
+
+> ⚠️ **Ne pas copier** `src/services/activeApiKey.ts` : c'est un stub local
+> présent uniquement pour la validation isolée. Appfacade doit fournir sa
+> propre implémentation exposant `getActiveApiKey(): string | null`
+> (ou adapter l'import dans `OrchestratorSync.tsx`).
+
+## Intégration dans le panneau de paramètres
+
+Ajouter dans `SettingsModal.tsx` (ou équivalent), en dernière section :
+
+```tsx
+import { OrchestratorSync } from './OrchestratorSync';
+
+// ... dans le JSX retourné, en bas :
+<OrchestratorSync />
 ```
-appfacade-integration/src/services/orchestrateurClient.ts
-  → <appfacade>/src/services/orchestrateurClient.ts
-
-appfacade-integration/src/components/settings/OrchestratorSync.tsx
-  → <appfacade>/src/components/settings/OrchestratorSync.tsx
-```
-
-Puis ajouter `<OrchestratorSync />` comme dernière section dans le composant
-de paramètres existant (ex. `SettingsPanel.tsx` ou `SettingsModal.tsx`).
 
 ## Validation côté Appfacade
 
@@ -23,6 +33,19 @@ de paramètres existant (ex. `SettingsPanel.tsx` ou `SettingsModal.tsx`).
 cd <appfacade>
 npx tsc --noEmit   # doit passer sans erreur
 ```
+
+## Validation isolée effectuée ici
+
+Les deux fichiers ont été validés en isolation avec TypeScript strict :
+
+```bash
+cd appfacade-integration
+npm install
+npx tsc --noEmit   # ✅ exit 0
+```
+
+Config utilisée : `tsconfig.json` (strict, `noUncheckedIndexedAccess`,
+`jsx: react-jsx`, `lib: ES2020 + DOM`).
 
 ## Comportement attendu
 

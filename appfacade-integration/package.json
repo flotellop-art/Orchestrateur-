@@ -1,0 +1,9 @@
+{
+  "name": "appfacade-integration-check",
+  "private": true,
+  "description": "Setup de validation isolée des fichiers Phase 1 destinés à Appfacade.",
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/react": "^18.2.0"
+  }
+}
