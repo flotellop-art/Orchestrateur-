@@ -26,3 +26,17 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Runtime data — ne pas versionner
+*.db
+*.log
+*.sqlite
+projects/
+_archives/
+
+# Claude Code worktrees
+.claude/worktrees/
+
+# Node (electron-app)
+electron-app/node_modules/
+electron-app/dist/

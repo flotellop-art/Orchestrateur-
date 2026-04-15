@@ -1,0 +1,6 @@
+import base64, os
+data = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAABgklEQVR4AeySMUsDQRCFx0NUBBUUAgFTKIiBA1OI+AMsFC2sRBs7rS38HRbW2tkoVhaKFv4AEYtYRQQtIgQCCiqICSEJb6uwx2XfEJYkcAdz7M68mfnucUEYho1uRiBdfhKA/nMgNTok+7m0nK7Ny93WggmckUNN+0upHFifnZSzjazsZFMyMzEig8GACZyRQw0aDQQNgMGHSxmzMG4BgKCBNk5j5ykAWHuwOG33xt6hRU+soKVAAWzOTbX98pZ55ggn0GMujhcFsJwed4yJltkeCiAzNhzd4MiwPRSAY1dHZQqg+FtRL2F7KICH0o8agO2hAK5eP6VWb9AQ0KKHaaAAyn9VOX76YOYZDbToMRfHiwLAjJu3Lzl6LLZ1Al8ODbToYYIGwDAM3r0uyHmhLO/f/wYGS3FGDjVooGVDBYChsPYkX5K92xdZvXw2gTNyqEGjCTWAZjij7T2A++2c+Azbld5zwCb0fY84sHKRF59hf1AEwBb4vicAiQPeHXD9xE0AAAD//5PEjO8AAAAGSURBVAMAta/kQXUjiHUAAAAASUVORK5CYII="
+out = os.path.join(os.path.dirname(__file__), "assets", "icon.png")
+os.makedirs(os.path.dirname(out), exist_ok=True)
+with open(out, "wb") as f: f.write(base64.b64decode(data))
+print("Wrote", out)

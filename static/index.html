@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Créateur d'applications</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #f8f9fa; --white: #fff; --dark: #1a1a2e; --orange: #e8825a;
+  --orange-d: #c96840; --green: #27ae60; --red: #e74c3c; --grey: #6c757d;
+  --border: #dee2e6; --sh: 0 4px 20px rgba(0,0,0,.08); --r: 12px;
+}
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--bg); color: var(--dark); min-height: 100vh; }
+
+/* ── Header ── */
+header { background: var(--dark); color: #fff; padding: 18px 32px;
+  display: flex; align-items: center; justify-content: space-between; }
+header h1 { font-size: 1.2rem; font-weight: 700; }
+header h1 span { color: var(--orange); }
+.hdr-stats { display: flex; gap: 20px; font-size: .82rem; color: #aaa; }
+.hdr-stat strong { color: #fff; font-size: 1rem; }
+
+/* ── Hero ── */
+.hero { max-width: 760px; margin: 60px auto 0; padding: 0 20px; text-align: center; }
+.hero h2 { font-size: 2rem; font-weight: 700; margin-bottom: 12px; }
+.hero h2 span { color: var(--orange); }
+.hero p { color: var(--grey); font-size: 1.05rem; margin-bottom: 36px; line-height: 1.6; }
+.create-box { background: var(--white); border-radius: 16px; box-shadow: var(--sh); padding: 28px; }
+.create-box textarea {
+  width: 100%; border: 2px solid var(--border); border-radius: 10px;
+  padding: 16px; font-size: 1rem; font-family: inherit; resize: none;
+  min-height: 110px; transition: border-color .2s; outline: none; line-height: 1.6;
+}
+.create-box textarea:focus { border-color: var(--orange); }
+.create-box textarea::placeholder { color: #bbb; }
+.examples { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 20px; justify-content: center; }
+.example { background: #f0f0f0; border: none; border-radius: 20px; padding: 6px 14px;
+  font-size: .82rem; cursor: pointer; color: var(--grey); transition: background .15s; }
+.example:hover { background: var(--orange); color: #fff; }
+.btn-create { background: var(--orange); color: #fff; border: none; border-radius: 10px;
+  padding: 14px 40px; font-size: 1rem; font-weight: 700; cursor: pointer;
+  width: 100%; transition: background .15s, transform .1s; }
+.btn-create:hover { background: var(--orange-d); }
+.btn-create:active { transform: scale(.98); }
+.btn-create:disabled { opacity: .6; cursor: not-allowed; }
+
+/* ── Mes applications ── */
+.apps-section { max-width: 1100px; margin: 48px auto 40px; padding: 0 20px; }
+.apps-section h3 { font-size: 1.1rem; font-weight: 700; margin-bottom: 20px;
+  color: var(--grey); text-transform: uppercase; letter-spacing: .5px; font-size: .85rem; }
+.apps-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; }
+.app-card { background: var(--white); border-radius: var(--r); box-shadow: var(--sh);
+  padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+.app-card-header { display: flex; align-items: center; justify-content: space-between; }
+.app-name { font-weight: 700; font-size: 1rem; }
+.status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.dot-running { background: var(--green); box-shadow: 0 0 0 3px rgba(39,174,96,.2);
+  animation: pulse 2s infinite; }
+.dot-stopped { background: var(--border); }
+.dot-failed  { background: var(--red); }
+.dot-creating { background: var(--orange); animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+.app-desc { color: var(--grey); font-size: .85rem; line-height: 1.5; }
+.app-status-text { font-size: .78rem; font-weight: 600; padding: 3px 10px;
+  border-radius: 20px; width: fit-content; }
+.st-running  { background: #eafaf1; color: var(--green); }
+.st-stopped  { background: #f5f5f5; color: var(--grey); }
+.st-failed   { background: #fdedec; color: var(--red); }
+.st-creating { background: #fef0eb; color: var(--orange); }
+.app-actions { display: flex; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
+.btn { border: none; border-radius: 7px; padding: 8px 16px; font-size: .84rem;
+  font-weight: 600; cursor: pointer; transition: background .15s, transform .1s; }
+.btn:active { transform: scale(.97); }
+.btn-open    { background: var(--dark); color: #fff; }
+.btn-open:hover { background: #333; }
+.btn-start   { background: var(--green); color: #fff; }
+.btn-start:hover { background: #229954; }
+.btn-stop    { background: #f0f0f0; color: var(--dark); }
+.btn-stop:hover { background: #e0e0e0; }
+.btn-delete  { background: #fdedec; color: var(--red); margin-left: auto; }
+.btn-delete:hover { background: var(--red); color: #fff; }
+.empty-state { text-align: center; padding: 48px 20px; color: var(--grey); }
+.empty-state p { font-size: 1.05rem; margin-top: 8px; }
+
+/* ── Modal progression ── */
+.overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6);
+  z-index: 1000; align-items: center; justify-content: center; padding: 20px; }
+.overlay.show { display: flex; }
+.modal { background: var(--white); border-radius: 16px; width: 100%; max-width: 560px;
+  padding: 32px; box-shadow: 0 20px 60px rgba(0,0,0,.3); }
+.modal h3 { font-size: 1.1rem; font-weight: 700; margin-bottom: 24px; }
+.steps { display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px; }
+.step { display: flex; align-items: center; gap: 12px; font-size: .92rem;
+  color: var(--grey); transition: color .3s; }
+.step.active { color: var(--dark); font-weight: 600; }
+.step.done   { color: var(--green); }
+.step.error  { color: var(--red); }
+.step-icon { width: 28px; height: 28px; border-radius: 50%; display: flex;
+  align-items: center; justify-content: center; font-size: .9rem; flex-shrink: 0; }
+.step.active .step-icon { background: var(--orange); color: #fff; animation: pulse 1s infinite; }
+.step.done   .step-icon { background: var(--green); color: #fff; }
+.step.error  .step-icon { background: var(--red); color: #fff; }
+.step.pending .step-icon { background: #f0f0f0; color: #ccc; }
+.progress-bar { height: 6px; background: #f0f0f0; border-radius: 3px; overflow: hidden; }
+.progress-fill { height: 100%; background: var(--orange); border-radius: 3px;
+  transition: width .5s ease; }
+.modal-actions { display: flex; gap: 10px; margin-top: 20px; }
+.btn-cancel { background: #f0f0f0; color: var(--grey); padding: 10px 20px;
+  border: none; border-radius: 8px; cursor: pointer; font-size: .9rem; }
+.success-box { background: #eafaf1; border-radius: 10px; padding: 16px;
+  display: none; text-align: center; }
+.success-box.show { display: block; }
+.success-box h4 { color: var(--green); font-size: 1rem; margin-bottom: 8px; }
+.btn-open-app { background: var(--green); color: #fff; border: none; border-radius: 8px;
+  padding: 12px 28px; font-size: 1rem; font-weight: 700; cursor: pointer; width: 100%; }
+.btn-open-app:hover { background: #229954; }
+.error-box { background: #fdedec; border-radius: 10px; padding: 14px;
+  display: none; color: var(--red); font-size: .88rem; }
+.error-box.show { display: block; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>✨ Créateur d'<span>Applications</span></h1>
+  <div class="hdr-stats">
+    <div><strong id="hdr-total">0</strong> créées</div>
+    <div><strong id="hdr-running">0</strong> en ligne</div>
+  </div>
+</header>
+
+<!-- Zone de création -->
+<div class="hero">
+  <h2>Que voulez-vous <span>créer</span> ?</h2>
+  <p>Décrivez votre idée en quelques mots. L'IA s'occupe du reste.</p>
+  <div class="create-box">
+    <textarea id="description" placeholder="Ex : une liste de tâches avec la possibilité d'ajouter, cocher et supprimer des éléments..." maxlength="500"></textarea>
+    <div class="examples">
+      <button class="example" onclick="fillExample(this)">Liste de tâches</button>
+      <button class="example" onclick="fillExample(this)">Calculatrice</button>
+      <button class="example" onclick="fillExample(this)">Convertisseur de devises</button>
+      <button class="example" onclick="fillExample(this)">Prise de notes</button>
+      <button class="example" onclick="fillExample(this)">Minuteur / Chronomètre</button>
+      <button class="example" onclick="fillExample(this)">Générateur de mots de passe</button>
+    </div>
+    <button class="btn-create" id="btn-create" onclick="startCreation()">
+      ✨ Créer mon application
+    </button>
+  </div>
+</div>
+
+<!-- Mes applications -->
+<div class="apps-section">
+  <h3>Mes applications</h3>
+  <div class="apps-grid" id="apps-grid">
+    <div class="empty-state"><span style="font-size:2.5rem">🚀</span><p>Votre première application apparaîtra ici.</p></div>
+  </div>
+</div>
+
+<!-- Modal de progression -->
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <h3>⚙️ Création de votre application</h3>
+    <div class="steps" id="steps">
+      <div class="step pending" id="step-0"><div class="step-icon">💭</div><span>Réflexion sur votre application</span></div>
+      <div class="step pending" id="step-1"><div class="step-icon">✍️</div><span>Écriture du code</span></div>
+      <div class="step pending" id="step-2"><div class="step-icon">🔍</div><span>Vérification du code</span></div>
+      <div class="step pending" id="step-3"><div class="step-icon">📦</div><span>Installation des composants</span></div>
+      <div class="step pending" id="step-4"><div class="step-icon">🚀</div><span>Démarrage de l'application</span></div>
+      <div class="step pending" id="step-5"><div class="step-icon">⏳</div><span>Vérification que tout fonctionne</span></div>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" id="progress" style="width:0%"></div></div>
+    <div class="success-box" id="success-box">
+      <h4>✅ Votre application est prête !</h4>
+      <p style="color:#555;font-size:.9rem;margin-bottom:14px">Elle s'ouvre automatiquement dans votre navigateur.</p>
+      <button class="btn-open-app" id="btn-open-result" onclick="openResult()">🌐 Ouvrir mon application</button>
+    </div>
+    <div class="error-box" id="error-box"></div>
+    <div class="modal-actions">
+      <button class="btn-cancel" id="btn-cancel" onclick="cancelCreation()">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<script>
+var currentUrl = null;
+var creationRunning = false;
+
+// ── Exemples ──────────────────────────────────────────────────────────────────
+var EXAMPLES = {
+  'Liste de tâches': 'Une application de liste de tâches avec la possibilité d\'ajouter des tâches, les cocher comme faites, et les supprimer. Interface moderne et claire.',
+  'Calculatrice': 'Une calculatrice avec les opérations de base (addition, soustraction, multiplication, division) et un historique des calculs.',
+  'Convertisseur de devises': 'Un convertisseur pour les devises courantes (EUR, USD, GBP, JPY) avec des taux approximatifs. Interface simple avec deux champs.',
+  'Prise de notes': 'Une application de notes avec titre et contenu, possibilité d\'ajouter et supprimer des notes. Sauvegarde en session.',
+  'Minuteur / Chronomètre': 'Un minuteur avec décompte configurable et un chronomètre avec démarrer/arrêter/réinitialiser. Design épuré.',
+  'Générateur de mots de passe': 'Un générateur de mots de passe sécurisés avec options de longueur, majuscules, chiffres, symboles. Bouton copier.'
+};
+function fillExample(btn) {
+  var text = btn.textContent.trim();
+  document.getElementById('description').value = EXAMPLES[text] || text;
+}
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+async function loadStats() {
+  try {
+    var d = await (await fetch('/api/stats')).json();
+    document.getElementById('hdr-total').textContent = d.total;
+    document.getElementById('hdr-running').textContent = d.running;
+  } catch(e) {}
+}
+
+// ── Liste des apps ────────────────────────────────────────────────────────────
+async function loadApps() {
+  try {
+    var apps = await (await fetch('/api/apps')).json();
+    renderApps(apps);
+    await loadStats();
+  } catch(e) {}
+}
+
+function statusInfo(s) {
+  var map = {
+    running:  { text: '● En ligne',      cls: 'st-running',  dot: 'dot-running',  icon: '●' },
+    stopped:  { text: '◯ Arrêtée',       cls: 'st-stopped',  dot: 'dot-stopped',  icon: '◯' },
+    failed:   { text: '✗ Erreur',         cls: 'st-failed',   dot: 'dot-failed',   icon: '✗' },
+    creating: { text: '⏳ En création...', cls: 'st-creating', dot: 'dot-creating', icon: '⏳' },
+  };
+  return map[s] || map['stopped'];
+}
+
+function renderApps(apps) {
+  var el = document.getElementById('apps-grid');
+  if (!apps.length) {
+    el.innerHTML = '<div class="empty-state"><span style="font-size:2.5rem">🚀</span><p>Votre première application apparaîtra ici.</p></div>';
+    return;
+  }
+  el.innerHTML = apps.map(function(a) {
+    var si = statusInfo(a.status);
+    var url = 'http://localhost:' + a.port;
+    var isRunning = a.status === 'running';
+    var isStopped = a.status === 'stopped' || a.status === 'failed';
+    return '<div class="app-card" id="app-' + a.id + '">'
+      + '<div class="app-card-header">'
+      + '<span class="app-name">' + esc(a.name || ('Application #' + a.id)) + '</span>'
+      + '<span class="status-dot ' + si.dot + '"></span>'
+      + '</div>'
+      + '<div class="app-desc">' + esc(a.description.substring(0, 100) + (a.description.length > 100 ? '…' : '')) + '</div>'
+      + '<span class="app-status-text ' + si.cls + '">' + si.text + '</span>'
+      + (a.error && a.status === 'failed' ? '<div style="font-size:.76rem;color:#e74c3c;background:#fdedec;padding:6px 10px;border-radius:6px">' + esc(a.error.substring(0,120)) + '</div>' : '')
+      + '<div class="app-actions">'
+      + (isRunning ? '<button class="btn btn-open" onclick="openApp(\'' + url + '\')">🌐 Ouvrir</button>' : '')
+      + (isRunning ? '<button class="btn btn-stop" onclick="stopApp(' + a.id + ')">⏹ Arrêter</button>' : '')
+      + (isStopped ? '<button class="btn btn-start" onclick="startApp(' + a.id + ')">▶ Relancer</button>' : '')
+      + '<button class="btn btn-delete" onclick="deleteApp(' + a.id + ')">🗑</button>'
+      + '</div></div>';
+  }).join('');
+}
+
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Création ──────────────────────────────────────────────────────────────────
+var STEP_MAP = {
+  'réfléchis': 0, 'réflexion': 0, 'réfléchit': 0,
+  'écris': 1, 'écriture': 1, 'code': 1, 'j\'écris': 1,
+  'corrige': 2, 'vérif': 2, 'correction': 2, 'syntaxe': 2,
+  'installe': 3, 'bibliothèque': 3, 'composant': 3, 'install': 3,
+  'démarre': 4, 'démarr': 4, 'lance': 4, 'start': 4,
+  'attends': 5, 'attend': 5, 'prête': 5, 'prêt': 5,
+};
+
+function detectStep(msg) {
+  var lower = msg.toLowerCase();
+  for (var k in STEP_MAP) {
+    if (lower.includes(k)) return STEP_MAP[k];
+  }
+  return -1;
+}
+
+function setStep(stepIdx) {
+  for (var i = 0; i < 6; i++) {
+    var el = document.getElementById('step-' + i);
+    if (!el) continue;
+    el.className = 'step ' + (i < stepIdx ? 'done' : i === stepIdx ? 'active' : 'pending');
+  }
+  document.getElementById('progress').style.width = Math.round((stepIdx / 5) * 85) + '%';
+}
+
+async function startCreation() {
+  var desc = document.getElementById('description').value.trim();
+  if (!desc) { document.getElementById('description').focus(); return; }
+
+  creationRunning = true;
+  currentUrl = null;
+  document.getElementById('btn-create').disabled = true;
+  document.getElementById('success-box').className = 'success-box';
+  document.getElementById('error-box').className = 'error-box';
+  document.getElementById('error-box').textContent = '';
+  document.getElementById('btn-cancel').style.display = '';
+  for (var i = 0; i < 6; i++) {
+    var s = document.getElementById('step-' + i);
+    if (s) s.className = 'step pending';
+  }
+  document.getElementById('progress').style.width = '0%';
+  document.getElementById('overlay').classList.add('show');
+
+  try {
+    var resp = await fetch('/api/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: desc })
+    });
+
+    var reader = resp.body.getReader();
+    var dec = new TextDecoder();
+
+    while (true) {
+      var res = await reader.read();
+      if (res.done) break;
+      var lines = dec.decode(res.value).split('\n');
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        if (!line.startsWith('data: ')) continue;
+        try {
+          var ev = JSON.parse(line.slice(6));
+          if (ev.type === 'step') {
+            var s = detectStep(ev.msg);
+            if (s >= 0) setStep(s);
+          }
+          if (ev.type === 'done') {
+            currentUrl = ev.url;
+            document.getElementById('progress').style.width = '100%';
+            for (var j = 0; j < 6; j++) {
+              var el = document.getElementById('step-' + j);
+              if (el) el.className = 'step done';
+            }
+            document.getElementById('success-box').className = 'success-box show';
+            document.getElementById('btn-cancel').style.display = 'none';
+            await loadApps();
+            // Ouvrir automatiquement après 1.5s
+            setTimeout(function() { if (currentUrl) openApp(currentUrl); }, 1500);
+          }
+          if (ev.type === 'error') {
+            document.getElementById('error-box').textContent = '❌ ' + ev.msg;
+            document.getElementById('error-box').className = 'error-box show';
+            document.getElementById('btn-cancel').textContent = 'Fermer';
+            await loadApps();
+          }
+        } catch(e) {}
+      }
+    }
+  } catch(e) {
+    document.getElementById('error-box').textContent = '❌ Erreur de connexion : ' + e.message;
+    document.getElementById('error-box').className = 'error-box show';
+  }
+
+  creationRunning = false;
+  document.getElementById('btn-create').disabled = false;
+}
+
+function cancelCreation() {
+  document.getElementById('overlay').classList.remove('show');
+  document.getElementById('btn-cancel').textContent = 'Annuler';
+  loadApps();
+}
+
+function openResult() {
+  if (currentUrl) openApp(currentUrl);
+  cancelCreation();
+}
+
+function openApp(url) {
+  if (window.electronAPI && window.electronAPI.openExternal) {
+    window.electronAPI.openExternal(url);
+  } else {
+    window.open(url, '_blank');
+  }
+}
+
+// ── Actions sur les apps ──────────────────────────────────────────────────────
+async function stopApp(id) {
+  await fetch('/api/apps/' + id + '/stop', { method: 'POST' });
+  loadApps();
+}
+
+async function startApp(id) {
+  var card = document.getElementById('app-' + id);
+  if (card) {
+    var btn = card.querySelector('.btn-start');
+    if (btn) { btn.textContent = '⏳ Démarrage...'; btn.disabled = true; }
+  }
+  var r = await fetch('/api/apps/' + id + '/start', { method: 'POST' });
+  var d = await r.json();
+  if (d.status === 'running') openApp(d.url);
+  loadApps();
+}
+
+async function deleteApp(id) {
+  if (!confirm('Supprimer cette application ? Elle sera définitivement effacée.')) return;
+  await fetch('/api/apps/' + id, { method: 'DELETE' });
+  loadApps();
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadApps();
+setInterval(loadApps, 8000);
+</script>
+</body>
+</html>

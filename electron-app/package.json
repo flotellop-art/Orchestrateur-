@@ -1,0 +1,69 @@
+{
+  "name": "multi-agent-orchestrator",
+  "version": "1.0.0",
+  "description": "Multi-Agent Orchestrator - Application Desktop",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux",
+    "install-deps": "npm install"
+  },
+  "build": {
+    "appId": "com.telop.orchestrator",
+    "productName": "Multi-Agent Orchestrator",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "assets/**",
+      "node_modules/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../",
+        "to": "app",
+        "filter": [
+          "orchestrator.py",
+          "chat_agent.py",
+          "run.py",
+          "requirements_orchestrator.txt",
+          ".env",
+          "static/**",
+          "*.db"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis"
+        },
+        {
+          "target": "portable"
+        }
+      ]
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage"
+        }
+      ]
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg"
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.13.3"
+  }
+}

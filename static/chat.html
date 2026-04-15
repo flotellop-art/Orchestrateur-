@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Arty Agent — Chat</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #FAFAF8; color: #1C1C1C; height: 100dvh; display: flex; flex-direction: column; }
+header { background: #1C1C1C; color: white; padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+header h1 { font-size: 16px; font-weight: 600; }
+header a { color: #E8825A; font-size: 13px; text-decoration: none; }
+#messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.5; word-break: break-word; }
+.msg.user { background: #1C1C1C; color: white; align-self: flex-end; border-radius: 12px 12px 2px 12px; }
+.msg.assistant { background: white; border: 1px solid #E5E5E5; align-self: flex-start; border-radius: 12px 12px 12px 2px; }
+.msg.tool { background: #FFF8F5; border: 1px solid #E8825A33; color: #666; font-size: 12px; align-self: flex-start; padding: 6px 12px; }
+.msg.confirm { background: #FFF3E0; border: 2px solid #E8825A; align-self: flex-start; border-radius: 12px; }
+.confirm-buttons { display: flex; gap: 8px; margin-top: 8px; }
+.btn-yes { background: #E8825A; color: white; border: none; padding: 6px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.btn-no { background: transparent; color: #1C1C1C; border: 1.5px solid #1C1C1C; padding: 6px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.typing { align-self: flex-start; color: #999; font-size: 13px; font-style: italic; padding: 8px 0; }
+footer { background: white; border-top: 1px solid #E5E5E5; padding: 12px 16px; flex-shrink: 0; }
+.input-row { display: flex; gap: 8px; }
+#input { flex: 1; border: 1.5px solid #E5E5E5; border-radius: 8px; padding: 10px 14px; font-size: 14px; outline: none; resize: none; min-height: 44px; max-height: 120px; font-family: inherit; }
+#input:focus { border-color: #E8825A; }
+#send { background: #E8825A; color: white; border: none; border-radius: 8px; padding: 10px 18px; cursor: pointer; font-size: 14px; font-weight: 500; white-space: nowrap; }
+#send:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🤖 Arty Agent</h1>
+  <a href="/">← Dashboard</a>
+</header>
+<div id="messages"></div>
+<footer>
+  <div class="input-row">
+    <textarea id="input" placeholder="Dis-moi ce que tu veux faire..." rows="1"></textarea>
+    <button id="send" onclick="sendMessage()">Envoyer</button>
+  </div>
+</footer>
+<script>
+const messagesEl = document.getElementById('messages');
+const inputEl = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+
+async function loadHistory() {
+  try {
+    const r = await fetch('/api/chat/history');
+    const data = await r.json();
+    data.messages.forEach(m => addMessage(m.role, m.content));
+    scrollBottom();
+  } catch(e) {}
+}
+
+function addMessage(role, content, cls='') {
+  const div = document.createElement('div');
+  div.className = `msg ${cls || role}`;
+  div.innerHTML = content.replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+  messagesEl.appendChild(div);
+  return div;
+}
+
+function addTyping() {
+  const div = document.createElement('div');
+  div.className = 'typing';
+  div.id = 'typing';
+  div.textContent = 'Arty réfléchit...';
+  messagesEl.appendChild(div);
+  scrollBottom();
+  return div;
+}
+
+function scrollBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+async function sendMessage() {
+  const text = inputEl.value.trim();
+  if (!text) return;
+  inputEl.value = '';
+  sendBtn.disabled = true;
+
+  addMessage('user', text);
+  scrollBottom();
+
+  const typing = addTyping();
+  let assistantDiv = null;
+  let assistantText = '';
+
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text})
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      const lines = decoder.decode(value).split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const evt = JSON.parse(line.slice(6));
+          if (evt.type === 'text') {
+            typing.remove();
+            if (!assistantDiv) assistantDiv = addMessage('assistant', '');
+            assistantText += evt.content;
+            assistantDiv.innerHTML = assistantText.replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            scrollBottom();
+          } else if (evt.type === 'tool_start') {
+            typing.textContent = `Utilisation de l'outil: ${evt.tool}...`;
+          } else if (evt.type === 'tool_result') {
+            const td = document.createElement('div');
+            td.className = 'msg tool';
+            td.textContent = `🔧 ${evt.tool}: ${evt.result.substring(0,100)}...`;
+            messagesEl.appendChild(td);
+            scrollBottom();
+          } else if (evt.type === 'confirm') {
+            const cd = document.createElement('div');
+            cd.className = 'msg confirm';
+            cd.innerHTML = `<strong>Action requise</strong><br>${evt.tool}(${JSON.stringify(evt.input).substring(0,100)})<br>`;
+            const btns = document.createElement('div');
+            btns.className = 'confirm-buttons';
+            const yes = document.createElement('button');
+            yes.className = 'btn-yes'; yes.textContent = '✓ Confirmer';
+            yes.onclick = () => { cd.innerHTML = '✅ Action confirmée (simulation)'; };
+            const no = document.createElement('button');
+            no.className = 'btn-no'; no.textContent = '✗ Annuler';
+            no.onclick = () => { cd.innerHTML = '❌ Action annulée'; };
+            btns.appendChild(yes); btns.appendChild(no);
+            cd.appendChild(btns);
+            messagesEl.appendChild(cd);
+            scrollBottom();
+          } else if (evt.type === 'done') {
+            try { typing.remove(); } catch(e) {}
+          }
+        } catch(e) {}
+      }
+    }
+  } catch(e) {
+    addMessage('assistant', 'Erreur de connexion au serveur.');
+  }
+
+  try { typing.remove(); } catch(e) {}
+  sendBtn.disabled = false;
+  inputEl.focus();
+}
+
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+inputEl.addEventListener('input', () => {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+});
+
+loadHistory();
+</script>
+</body>
+</html>
