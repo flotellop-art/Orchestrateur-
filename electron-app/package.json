@@ -1,0 +1,38 @@
+{
+  "name": "orchestrateur-electron",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Shell Electron de l'Orchestrateur — embarque l'interface Arty et pilote le backend FastAPI local.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "start:dev": "cross-env ORCHESTRATEUR_DEV=1 electron .",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "electron": "^28.3.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.flotellop.orchestrateur",
+    "productName": "Orchestrateur",
+    "files": [
+      "main.js",
+      "preload.js",
+      "splash.html",
+      "assets/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../orchestrator.py",
+        "to": "orchestrator.py"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    }
+  }
+}

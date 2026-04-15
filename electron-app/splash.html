@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-store">
+<title>Orchestrateur — démarrage</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    font-family:'Segoe UI',system-ui,sans-serif;
+    background:radial-gradient(ellipse at top,#1e293b,#0f172a 70%);
+    color:#e2e8f0;display:flex;align-items:center;justify-content:center;
+  }
+  .card{
+    text-align:center;padding:48px 56px;max-width:480px;
+    background:rgba(30,41,59,0.6);border:1px solid #334155;border-radius:16px;
+    backdrop-filter:blur(6px);
+  }
+  h1{font-size:1.6rem;font-weight:800;color:#f97316;margin-bottom:8px;letter-spacing:.02em}
+  p.sub{font-size:.95rem;color:#94a3b8;margin-bottom:32px}
+  .spinner{
+    width:42px;height:42px;margin:0 auto 24px;border-radius:50%;
+    border:3px solid rgba(249,115,22,0.2);border-top-color:#f97316;
+    animation:spin 1s linear infinite;
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .status{font-size:.85rem;color:#cbd5e1}
+  .hint{font-size:.75rem;color:#64748b;margin-top:28px}
+  code{background:#0f172a;padding:2px 6px;border-radius:4px;color:#f97316;font-size:.78rem}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner" aria-hidden="true"></div>
+    <h1>Orchestrateur</h1>
+    <p class="sub">Démarrage du backend local et chargement d'Arty…</p>
+    <div class="status">Backend FastAPI : <code>127.0.0.1:8000</code></div>
+    <p class="hint">Si cet écran persiste plus de 30 secondes, vérifiez que Python et les dépendances (<code>fastapi</code>, <code>uvicorn</code>) sont installés.</p>
+  </div>
+</body>
+</html>
