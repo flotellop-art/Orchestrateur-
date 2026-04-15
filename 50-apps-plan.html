@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Orchestrateur IA — 50 Applications Utiles</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--o:#f97316;--d:#0f172a;--m:#1e293b;--l:#334155;--t:#e2e8f0;--mu:#94a3b8;--g:#22c55e;--b:#3b82f6;--p:#a855f7;--r:#ef4444;--y:#eab308}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--d);color:var(--t);line-height:1.6}
+header{background:linear-gradient(135deg,#0f172a,#1e293b,#0f172a);border-bottom:3px solid var(--o);padding:48px 40px;text-align:center}
+header h1{font-size:2.6rem;font-weight:800;color:var(--o);margin-bottom:12px}
+header p{font-size:1rem;color:var(--mu);max-width:700px;margin:0 auto 24px}
+.stats{display:flex;justify-content:center;gap:40px;flex-wrap:wrap}
+.stat-num{font-size:2.2rem;font-weight:800;color:var(--o)}
+.stat-label{font-size:.8rem;color:var(--mu);text-transform:uppercase;letter-spacing:.1em}
+.cats{display:flex;justify-content:center;gap:10px;padding:20px 40px;background:var(--m);border-bottom:1px solid var(--l);flex-wrap:wrap}
+.cat{padding:5px 14px;border-radius:20px;font-size:.78rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
+.c1{background:#1d4ed8;color:#bfdbfe}.c2{background:#15803d;color:#bbf7d0}.c3{background:#b91c1c;color:#fecaca}
+.c4{background:#d97706;color:#fef3c7}.c5{background:#065f46;color:#a7f3d0}.c6{background:#7c3aed;color:#ddd6fe}
+.c7{background:#0e7490;color:#cffafe}.c8{background:#be185d;color:#fce7f3}
+main{max-width:1400px;margin:0 auto;padding:40px}
+.sec-title{font-size:1.2rem;font-weight:700;color:var(--o);text-transform:uppercase;letter-spacing:.1em;margin:48px 0 20px;padding-bottom:10px;border-bottom:2px solid var(--l);display:flex;align-items:center;gap:10px}
+.sec-title::before{content:'';width:4px;height:22px;background:var(--o);border-radius:2px;display:inline-block}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(580px,1fr));gap:20px}
+.card{background:var(--m);border:1px solid var(--l);border-radius:14px;overflow:hidden;transition:border-color .2s}
+.card:hover{border-color:var(--o)}
+.ch{padding:18px 22px 14px;display:flex;align-items:flex-start;gap:14px;border-bottom:1px solid var(--l);background:rgba(0,0,0,.2)}
+.num{font-size:.72rem;font-weight:700;color:var(--o);background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.3);border-radius:7px;padding:3px 9px;white-space:nowrap;margin-top:2px}
+.ico{font-size:1.8rem;line-height:1;margin-top:2px}
+.ctb h3{font-size:1.05rem;font-weight:700;color:#fff;margin-bottom:3px}
+.ctb p{font-size:.83rem;color:var(--mu)}
+.cbadges{margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:5px}
+.badge{font-size:.68rem;font-weight:700;padding:2px 9px;border-radius:10px;white-space:nowrap}
+.cb{padding:18px 22px}
+.cb h4{font-size:.72rem;font-weight:700;color:var(--o);text-transform:uppercase;letter-spacing:.08em;margin:14px 0 8px}
+.cb h4:first-child{margin-top:0}
+.feats{list-style:none;display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.feats li{font-size:.8rem;color:var(--t);display:flex;align-items:flex-start;gap:5px}
+.feats li::before{content:'✓';color:var(--g);font-weight:700;flex-shrink:0}
+.stack{display:flex;flex-wrap:wrap;gap:5px}
+.tech{font-size:.7rem;padding:2px 9px;background:rgba(59,130,246,.15);border:1px solid rgba(59,130,246,.3);color:#93c5fd;border-radius:7px;font-family:'Courier New',monospace}
+.routes{list-style:none;display:flex;flex-direction:column;gap:3px}
+.routes li{font-size:.76rem;color:var(--t);font-family:'Courier New',monospace;display:flex;align-items:center;gap:6px}
+.m{font-size:.63rem;font-weight:700;padding:2px 5px;border-radius:4px;min-width:36px;text-align:center}
+.get{background:#166534;color:#86efac}.post{background:#1d4ed8;color:#bfdbfe}.put{background:#b45309;color:#fde68a}.del{background:#991b1b;color:#fca5a5}
+.dm{background:rgba(0,0,0,.35);border-radius:8px;padding:10px 12px;font-size:.73rem;font-family:'Courier New',monospace;color:#86efac;white-space:pre;overflow-x:auto;line-height:1.5}
+.uc{background:rgba(168,85,247,.1);border-left:3px solid var(--p);padding:7px 11px;border-radius:0 7px 7px 0;font-size:.8rem;color:#d8b4fe;font-style:italic;margin-top:4px}
+.cpx{display:flex;align-items:center;gap:7px;margin-top:8px}
+.cpx-lbl{font-size:.73rem;color:var(--mu)}
+.dots{display:flex;gap:3px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--l)}
+.dot.a.lo{background:var(--g)}.dot.a.me{background:var(--y)}.dot.a.hi{background:var(--r)}
+footer{text-align:center;padding:48px 40px;color:var(--mu);border-top:1px solid var(--l);margin-top:60px;font-size:.875rem}
+footer a{color:var(--o);text-decoration:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>🤖 Orchestrateur IA — 50 Applications Utiles</h1>
+  <p>Chaque application a une vraie utilité. Plan de code complet : fonctionnalités, stack technique, routes API, modèle de données, cas d'usage.</p>
+  <div class="stats">
+    <div class="stat"><div class="stat-num">50</div><div class="stat-label">Applications</div></div>
+    <div class="stat"><div class="stat-num">8</div><div class="stat-label">Catégories</div></div>
+    <div class="stat"><div class="stat-num">Flask</div><div class="stat-label">Backend</div></div>
+    <div class="stat"><div class="stat-num">Python 3.10+</div><div class="stat-label">Langage</div></div>
+  </div>
+</header>
+<div class="cats">
+  <span class="cat c1">📋 Productivité (10)</span>
+  <span class="cat c2">💰 Finance (8)</span>
+  <span class="cat c3">❤️ Santé (7)</span>
+  <span class="cat c4">🏠 Quotidien (7)</span>
+  <span class="cat c5">🌿 Écologie (4)</span>
+  <span class="cat c6">📚 Éducation (5)</span>
+  <span class="cat c7">💼 Pro (5)</span>
+  <span class="cat c8">🎨 Créatif (4)</span>
+</div>
+<main>
+<!-- ===== SECTION 1 : PRODUCTIVITÉ ===== -->
+<div class="sec-title">📋 Productivité — 10 Applications</div>
+<div class="grid">
+
+<!-- APP 1 -->
+<div class="card">
+<div class="ch">
+  <span class="num">App 01</span>
+  <span class="ico">⏱️</span>
+  <div class="ctb"><h3>Timer Pomodoro Pro</h3><p>Gestion du temps par intervalles de travail et de pause</p></div>
+  <div class="cbadges"><span class="badge c1">Productivité</span><span class="badge" style="background:#1e293b;color:#94a3b8">Moyen</span></div>
+</div>
+<div class="cb">
+  <h4>Fonctionnalités réelles</h4>
+  <ul class="feats">
+    <li>Timer 25/5/15 min configurable</li><li>Sons d'alerte (Web Audio API)</li>
+    <li>Historique des sessions SQLite</li><li>Stats journalières/hebdo</li>
+    <li>Mode focus (plein écran)</li><li>Export CSV des sessions</li>
+    <li>Objectifs quotidiens de pomodoros</li><li>Thèmes clair/sombre</li>
+  </ul>
+  <h4>Stack technique</h4>
+  <div class="stack">
+    <span class="tech">Flask</span><span class="tech">SQLite + aiosqlite</span><span class="tech">Web Audio API</span><span class="tech">Chart.js CDN</span><span class="tech">localStorage</span>
+  </div>
+  <h4>Routes API</h4>
+  <ul class="routes">
+    <li><span class="m get">GET</span>/sessions — historique des sessions</li>
+    <li><span class="m post">POST</span>/sessions — enregistrer une session</li>
+    <li><span class="m get">GET</span>/stats — statistiques agrégées</li>
+    <li><span class="m post">POST</span>/settings — sauvegarder config</li>
+  </ul>
+  <h4>Modèle de données</h4>
+  <div class="dm">sessions(id, date, duration_min, type, completed, notes)
+settings(key, value)</div>
+  <div class="uc">💡 Cas d'usage : Étudiant qui veut suivre ses heures de révision et visualiser sa progression semaine par semaine.</div>
+</div>
+</div>
+
+<!-- APP 2 -->
+<div class="card">
+<div class="ch">
+  <span class="num">App 02</span>
+  <span class="ico">✅</span>
+  <div class="ctb"><h3>Gestionnaire de Tâches GTD</h3><p>Méthode Getting Things Done avec projets et contextes</p></div>
+  <div class="cbadges"><span class="badge c1">Productivité</span><span class="badge" style="background:#1e293b;color:#94a3b8">Moyen</span></div>
+</div>
+<div class="cb">
+  <h4>Fonctionnalités réelles</h4>
+  <ul class="feats">
+    <li>Tâches avec priorité 1-4 (Eisenhower)</li><li>Projets hiérarchiques</li>
+    <li>Contextes (@maison, @bureau…)</li><li>Dates d'échéance + rappels</li>
+    <li>Filtre par contexte/projet</li><li>Drag & drop (Sortable.js CDN)</li>
+    <li>Sous-tâches imbriquées</li><li>Recherche full-text</li>
+  </ul>
+  <h4>Stack technique</h4>
+  <div class="stack">
+    <span class="tech">Flask</span><span class="tech">SQLite</span><span class="tech">Sortable.js CDN</span><span class="tech">Full-text search SQLite FTS5</span>
+  </div>
+  <h4>Routes API</h4>
+  <ul class="routes">
+    <li><span class="m get">GET</span>/tasks?context=&project=&priority= — filtrage</li>
+    <li><span class="m post">POST</span>/tasks — créer tâche</li>
+    <li><span class="m put">PUT</span>/tasks/&lt;id&gt; — modifier/compléter</li>
+    <li><span class="m del">DEL</span>/tasks/&lt;id&gt; — supprimer</li>
+    <li><span class="m get">GET</span>/projects — liste projets</li>
+  </ul>
+  <h4>Modèle de données</h4>
+  <div class="dm">tasks(id, title, project_id, context, priority, due_date, completed, notes)
+projects(id, name, color, parent_id)</div>
+  <div class="uc">💡 Freelance qui gère plusieurs clients simultanément et veut ne rien oublier.</div>
+</div>
+</div>
+
+<!-- APP 3 -->
+<div class="card">
+<div class="ch">
+  <span class="num">App 03</span>
+  <span class="ico">📓</span>
+  <div class="ctb"><h3>Journal / Carnet de bord</h3><p>Journal personnel avec entrées quotidiennes et humeur</p></div>
+  <div class="cbadges"><span class="badge c1">Productivité</span><span class="badge" style="background:#1e293b;color:#94a3b8">Simple</span></div>
+</div>
+<div class="cb">
+  <h4>Fonctionnalités réelles</h4>
+  <ul class="feats">
+    <li>Éditeur rich text (Quill CDN)</li><li>Humeur journalière 1-5 + emoji</li>
+    <li>Tags libres par entrée</li><li>Calendrier de navigation</li>
+    <li>Recherche dans le texte</li><li>Graphique d'humeur Chart.js</li>
+    <li>Export PDF (WeasyPrint)</li><li>Chiffrement AES des entrées</li>
+  </ul>
+  <h4>Stack technique</h4>
+  <div class="stack">
+    <span class="tech">Flask</span><span class="tech">SQLite FTS5</span><span class="tech">Quill.js CDN</span><span class="tech">Chart.js CDN</span><span class="tech">cryptography (Fernet)</span>
+  </div>
+  <h4>Routes API</h4>
+  <ul class="routes">
+    <li><span class="m get">GET</span>/entries?date=&tag= — lister entrées</li>
+    <li><span class="m post">POST</span>/entries — nouvelle entrée</li>
+    <li><span class="m put">PUT</span>/entries/&lt;id&gt; — modifier</li>
+    <li><span class="m get">GET</span>/mood-chart — données graphique</li>
+  </ul>
+  <h4>Modèle de données</h4>
+  <div class="dm">entries(id, date, content_enc, mood, tags, word_count, created_at)</div>
+  <div class="uc">💡 Personne voulant suivre son bien-être mental et voir si certains événements influencent son humeur.</div>
+</div>
+</div>
+
+<!-- APP 4 -->
+<div class="card">
+<div class="ch">
+  <span class="num">App 04</span>
+  <span class="ico">🔖</span>
+  <div class="ctb"><h3>Gestionnaire de Marque-pages</h3><p>Bookmarks avec tags, screenshots et recherche</p></div>
+  <div class="cbadges"><span class="badge c1">Productivité</span><span class="badge" style="background:#1e293b;color:#94a3b8">Moyen</span></div>
+</div>
+<div class="cb">
+  <h4>Fonctionnalités réelles</h4>
+  <ul class="feats">
+    <li>Sauvegarde URL + titre auto (requests)</li><li>Tags hiérarchiques</li>
+    <li>Capture screenshot via URL (Playwright)</li><li>Recherche full-text</li>
+    <li>Détection de liens morts</li><li>Import depuis HTML Firefox/Chrome</li>
+    <li>Collections partageables</li><li>Vue galerie / liste</li>
+  </ul>
+  <h4>Stack technique</h4>
+  <div class="stack">
+    <span class="tech">Flask</span><span class="tech">SQLite FTS5</span><span class="tech">requests + BeautifulSoup</span><span class="tech">Playwright</span>
+  </div>
+  <h4>Routes API</h4>
+  <ul class="routes">
+    <li><span class="m post">POST</span>/bookmarks — ajouter + fetch metadata</li>
+    <li><span class="m get">GET</span>/bookmarks?q=&tag= — recherche</li>
+    <li><span class="m put">PUT</span>/bookmarks/&lt;id&gt;/tags — modifier tags</li>
+    <li><span class="m post">POST</span>/import — import HTML bookmarks</li>
+  </ul>
+  <h4>Modèle de données</h4>
+  <div class="dm">bookmarks(id, url, title, description, favicon, tags, collection_id, created_at)
+collections(id, name, is_public, share_token)</div>
+  <div class="uc">💡 Chercheur ou développeur qui veut retrouver rapidement une ressource parmi des centaines de liens sauvegardés.</div>
+</div>
+</div>
+
+<!-- APP 5 -->
+<div class="card">
+<div class="ch">
+  <span class="num">App 05</span>
+  <span class="ico">🗒️</span>
+  <div class="ctb"><h3>Prise de Notes Rapide</h3><p>Notes Markdown avec recherche instantanée et sync</p></div>
+  <div class="cbadges"><span class="badge c1">Productivité</span><span class="badge" style="background:#1e293b;color:#94a3b8">Simple</span></div>
+</div>
+<div class="cb">
+  <h4>Fonctionnalités réelles</h4>
+  <ul class="feats">
+    <li>Éditeur Markdown split-view live</li><li>Raccourci clavier Ctrl+N nouvelle note</li>
+    <li>Recherche instantanée (SQLite FTS5)</li><li>Épinglage de notes importantes</li>
+    <li>Export Markdown / HTML / PDF</li><li>Liens entre notes [[wiki-style]]</li>
+    <li>Corbeille avec restauration</li><li>Auto-save toutes les 5s</li>
+  </ul>
+  <h4>Stack technique</h4>
+  <div class="stack">
+    <span class="tech">Flask</span><span class="tech">SQLite FTS5</span><span class="tech">marked.js CDN</span><span class="tech">highlight.js CDN</span>
+  </div>
+  <h4>Routes API</h4>
+  <ul class="routes">
+    <li><span class="m get">GET</span>/notes?q= — liste + recherche</li>
+    <li><span class="m post">POST</span>/notes — créer note</li>
+    <li><span class="m put">PUT</span>/notes/&lt;id&gt; — auto-save</li>
+    <li><span class="m get">GET</span>/notes/&lt;id&gt;/export/&lt;format&gt;</li>
+  </ul>
+  <h4>Modèle de données</h4>
+  <div class="dm">notes(id, title, content, is_pinned, tags, word_count, updated_at, deleted_at)</div>
+  <div class="uc">💡 Développeur qui prend des notes techniques pendant ses recherches et veut les retrouver par mots-clés.</div>
+</div>
+</div>
+
+<!-- APP 6 -->
+<div class="card">
+<div class="ch">
+  <span class="num">App 06</span>
+  <span class="ico">📅</span>
+  <div class="ctb"><h3>Planning Hebdomadaire Visuel</h3><p>Agenda semainier avec blocs horaires drag & drop</p></div>
+  <div class="cbadges"><span class="badge c1">Productivité</span><span class="badge" style="background:#1e293b;color:#94a3b8">Avancé</span></div>
+</div>
+<div class="cb">
+  <h4>Fonctionnalités réelles</h4>
+  <ul class="feats">
+    <li>Grille 7j × 24h glissable (Interact.js)</li><li>Catégories de blocs colorées</li>
+    <li>Récurrence hebdomadaire</li><li>Export PNG / PDF (html2canvas)</li>
+    <li>Import/Export iCal (.ics)</li><li>Templates de semaine type</li>
+    <li>Calcul du temps par catégorie</li><li>Vue mensuelle/hebdo</li>
+  </ul>
+  <h4>Stack technique</h4>
+  <div class="stack">
+    <span class="tech">Flask</span><span class="tech">SQLite</span><span class="tech">Interact.js CDN</span><span class="tech">ical.js CDN</span><span class="tech">html2canvas CDN</span>
+  </div>
+  <h4>Routes API</h4>
+  <ul class="routes">
+    <li><span class="m get">GET</span>/events?week= — événements d'une semaine</li>
+    <li><span class="m post">POST</span>/events — créer bloc</li>
+    <li><span class="m put">PUT</span>/events/&lt;id&gt; — déplacer/redimensionner</li>
+    <li><span class="m get">GET</span>/export/ical — export calendrier</li>
+  </ul>
+  <h4>Modèle de données</h4>
+  <div class="dm">events(id, title, day, start_hour, end_hour, category, color, recurrent)
+categories(id, name, color, weekly_goal_hours)</div>
+  <div class="uc">💡 Indépendant qui veut visualiser et équilibrer son temps entre projets, admin et vie perso.</div>
+</div>
+</div>
+
+<!-- APP 7 -->
+<div class="card">
+<div class="ch">
+  <span class="num">App 07</span>
+  <span class="ico">⏲️</span>
+  <div class="ctb"><h3>Minuteur Multi-Tâches</h3><p>Plusieurs timers simultanés avec alertes sonores</p></div>
+  <div class="cbadges"><span class="badge c1">Productivité</span><span class="badge" style="background:#1e293b;color:#94a3b8">Simple</span></div>
+</div>
+<div class="cb">
+  <h4>Fonctionnalités réelles</h4>
+  <ul class="feats">
+    <li>Jusqu'à 8 timers simultanés</li><li>Compte à rebours + chronomètre</li>
+    <li>Sons personnalisables (ding, klaxon…)</li><li>Labels et couleurs personnalisés</li>
+    <li>Sauvegarde des presets favoris</li><li>Notifications navigateur</li>
+    <li>Historique des timers terminés</li><li>Mode cuisine (timers liés)</li>
+  </ul>
+  <h4>Stack technique</h4>
+  <div class="stack">
+    <span class="tech">Flask</span><span class="tech">Web Audio API</span><span class="tech">Notifications API</span><span class="tech">localStorage</span>
+  </div>
+  <h4>Routes API</h4>
+  <ul class="routes">
+    <li><span class="m get">GET</span>/presets — timers favoris</li>
+    <li><span class="m post">POST</span>/presets — sauvegarder preset</li>
+    <li><span class="m del">DEL</span>/presets/&lt;id&gt; — supprimer</li>
+  </ul>
+  <h4>Modèle de données</h4>
+  <div class="dm">presets(id, name, duration_sec, sound, color, category)
+history(id, preset_id, started_at, completed)</div>
+  <div class="uc">💡 Cuisinier qui gère plusieurs plats simultanément avec des temps de cuisson différents.</div>
+</div>
+</div>
+
+<!-- APP 8 -->
+<div class="card">
+<div class="ch">
+  <span class="num">App 08</span>
+  <span class="ico">🔐</span>
+  <div class="ctb"><h3>Gestionnaire de Mots de Passe</h3><p>Coffre-fort local chiffré AES-256</p></div>
+  <div class="cbadges"><span class="badge c1">Productivité</span><span class="badge" style="background:#1e293b;color:#94a3b8">Avancé</span></div>
+</div>
+<div class="cb">
+  <h4>Fonctionnalités réelles</h4>
+  <ul class="feats">
+    <li>Chiffrement AES-256 (cryptography lib)</li><li>Générateur de mdp fort intégré</li>
+    <li>Score de sécurité par mot de passe</li><li>Détection des doublons</li>
+    <li>Catégories (banque, perso, pro…)</li><li>Copie en 1 clic (clipboard API)</li>
+    <li>Export chiffré + import</li><li>Mot de passe maître PBKDF2</li>
+  </ul>
+  <h4>Stack technique</h4>
+  <div class="stack">
+    <span class="tech">Flask</span><span class="tech">SQLite</span><span class="tech">cryptography (Fernet+PBKDF2)</span><span class="tech">zxcvbn.js CDN</span>
+  </div>
+  <h4>Routes API</h4>
+  <ul class="routes">
+    <li><span class="m post">POST</span>/unlock — déverrouiller avec mdp maître</li>
+    <li><span class="m get">GET</span>/passwords — liste (chiffrée)</li>
+    <li><span class="m post">POST</span>/passwords — ajouter entrée</li>
+    <li><span class="m get">GET</span>/generate — générer mdp fort</li>
+  </ul>
+  <h4>Modèle de données</h4>
+  <div class="dm">vault(id, site, login, password_enc, category, url, notes_enc, strength_score)
+master(salt, iterations, check_hash)</div>
+  <div class="uc">💡 Toute personne qui utilise les mêmes mots de passe partout et veut sécuriser ses comptes sans cloud.</div>
+</div>
+</div>
+
+<!-- APP 9 -->
+<div class="card">
+<div class="ch">
+  <span class="num">App 09</span>
+  <span class="ico">📊</span>
+  <div class="ctb"><h3>Suivi de Temps par Projet</h3><p>Time tracking avec rapports détaillés et facturation</p></div>
+  <div class="cbadges"><span class="badge c1">Productivité</span><span class="badge" style="background:#1e293b;color:#94a3b8">Avancé</span></div>
+</div>
+<div class="cb">
+  <h4>Fonctionnalités réelles</h4>
+  <ul class="feats">
+    <li>Chronomètre start/stop par projet</li><li>Entrées manuelles de temps</li>
+    <li>Taux horaire par projet/client</li><li>Rapport hebdomadaire PDF</li>
+    <li>Facturation automatique (calcul)</li><li>Graphique répartition Chart.js</li>
+    <li>Export CSV pour comptabilité</li><li>Objectif d'heures par projet</li>
+  </ul>
+  <h4>Stack technique</h4>
+  <div class="stack">
+    <span class="tech">Flask</span><span class="tech">SQLite</span><span class="tech">Chart.js CDN</span><span class="tech">ReportLab (PDF)</span>
+  </div>
+  <h4>Routes API</h4>
+  <ul class="routes">
+    <li><span class="m post">POST</span>/entries/start — démarrer timer</li>
+    <li><span class="m post">POST</span>/entries/stop — stopper + enregistrer</li>
+    <li><span class="m get">GET</span>/reports?from=&to=&project= — rapports</li>
+    <li><span class="m get">GET</span>/invoice/&lt;project_id&gt; — générer facture</li>
+  </ul>
+  <h4>Modèle de données</h4>
+  <div class="dm">projects(id, name, client, hourly_rate, color, budget_hours)
+entries(id, project_id, start_time, end_time, duration_min, description)</div>
+  <div class="uc">💡 Consultant qui facture ses clients à l'heure et veut prouver le temps passé avec un rapport clair.</div>
+</div>
+</div>
+
+<!-- APP 10 -->
+<div class="card">
+<div class="ch">
+  <span class="num">App 10</span>
+  <span class="ico">🎯</span>
+  <div class="ctb"><h3>Tracker d'Objectifs OKR</h3><p>Objectifs et résultats clés avec progression visuelle</p></div>
+  <div class="cbadges"><span class="badge c1">Productivité</span><span class="badge" style="background:#1e293b;color:#94a3b8">Moyen</span></div>
+</div>
+<div class="cb">
+  <h4>Fonctionnalités réelles</h4>
+  <ul class="feats">
+    <li>Objectifs trimestriels + annuels</li><li>Résultats clés (Key Results) mesurables</li>
+    <li>Progression en % auto-calculée</li><li>Check-ins hebdomadaires</li>
+    <li>Historique de progression Chart.js</li><li>Alertes si objectif en retard</li>
+    <li>Export rapport trimestriel PDF</li><li>Objectifs liés (dépendances)</li>
+  </ul>
+  <h4>Stack technique</h4>
+  <div class="stack">
+    <span class="tech">Flask</span><span class="tech">SQLite</span><span class="tech">Chart.js CDN</span><span class="tech">ReportLab</span>
+  </div>
+  <h4>Routes API</h4>
+  <ul class="routes">
+    <li><span class="m get">GET</span>/objectives?quarter= — objectifs</li>
+    <li><span class="m post">POST</span>/checkins — enregistrer progression</li>
+    <li><span class="m get">GET</span>/progress/&lt;id&gt; — courbe historique</li>
+    <li><span class="m get">GET</span>/report/&lt;quarter&gt; — PDF trimestriel</li>
+  </ul>
+  <h4>Modèle de données</h4>
+  <div class="dm">objectives(id, title, quarter, owner, description)
+key_results(id, obj_id, title, target_value, current_value, unit)
+checkins(id, kr_id, value, date, notes)</div>
+  <div class="uc">💡 Manager ou entrepreneur qui veut aligner son équipe sur des objectifs mesurables avec suivi hebdomadaire.</div>
+</div>
+</div>
+
+</div><!-- end grid prod -->
