@@ -44,6 +44,7 @@ PROJECTS.mkdir(exist_ok=True)
 DEFAULT_CLAUDE = "claude-opus-4-7"
 DEFAULT_GEMINI = "gemini-3.5-flash"
 DEFAULT_OPENAI = "gpt-5.5"
+STABLE_CLAUDE = "claude-sonnet-4-6"  # repli eprouve si le modele Claude demande echoue
 
 
 def _default_model(provider: str) -> str:
@@ -212,14 +213,28 @@ def _gemini_available() -> bool:
     return bool(os.getenv("GEMINI_API_KEY"))
 
 
-async def _call_claude(model, system, messages) -> str:
+async def _claude_request(model, system, messages) -> str:
     resp = await _client.messages.create(
-        model=model or DEFAULT_CLAUDE,
+        model=model,
         max_tokens=MAX_TOKENS,
         system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         messages=messages,
     )
     return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+
+
+async def _call_claude(model, system, messages, on_notice=None) -> str:
+    target = model or DEFAULT_CLAUDE
+    try:
+        return await _claude_request(target, system, messages)
+    except Exception as e:
+        if target == STABLE_CLAUDE:
+            raise  # le modele de repli a aussi echoue : on remonte l'erreur
+        log.warning("[modele] Claude %s erreur: %s -> repli %s", target, e, STABLE_CLAUDE)
+        if on_notice:
+            await on_notice("Erreur Claude " + target + " (" + str(e)[:100]
+                            + ") -> repli sur " + STABLE_CLAUDE + ".")
+        return await _claude_request(STABLE_CLAUDE, system, messages)
 
 
 async def _call_gemini(model, system, messages) -> str:
@@ -263,7 +278,7 @@ async def call_model(provider, model, system, messages, on_notice=None) -> str:
         if not _gemini_available():
             if on_notice:
                 await on_notice("Gemini indisponible (GEMINI_API_KEY manquante) -> repli sur Claude.")
-            return await _call_claude(DEFAULT_CLAUDE, system, messages)
+            return await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice)
         try:
             out = await _call_gemini(model, system, messages)
             log.info("[modele] Gemini OK (%d caracteres)", len(out))
@@ -272,12 +287,12 @@ async def call_model(provider, model, system, messages, on_notice=None) -> str:
             log.warning("[modele] Gemini erreur: %s", e)
             if on_notice:
                 await on_notice("Erreur Gemini (" + str(e)[:120] + ") -> repli sur Claude.")
-            return await _call_claude(DEFAULT_CLAUDE, system, messages)
+            return await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice)
     if provider == "openai":
         if not _openai_available():
             if on_notice:
                 await on_notice("OpenAI indisponible (OPENAI_API_KEY manquante) -> repli sur Claude.")
-            return await _call_claude(DEFAULT_CLAUDE, system, messages)
+            return await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice)
         try:
             out = await _call_openai(model, system, messages)
             log.info("[modele] OpenAI OK (%d caracteres)", len(out))
@@ -286,8 +301,8 @@ async def call_model(provider, model, system, messages, on_notice=None) -> str:
             log.warning("[modele] OpenAI erreur: %s", e)
             if on_notice:
                 await on_notice("Erreur OpenAI (" + str(e)[:120] + ") -> repli sur Claude.")
-            return await _call_claude(DEFAULT_CLAUDE, system, messages)
-    return await _call_claude(model or DEFAULT_CLAUDE, system, messages)
+            return await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice)
+    return await _call_claude(model or DEFAULT_CLAUDE, system, messages, on_notice)
 
 
 # ── Extraction JSON (calque de repair_json d'orchestrator.py) ────────────────
@@ -1024,7 +1039,7 @@ router = APIRouter()
 
 @router.get("/workspace")
 async def workspace_page():
-    return FileResponse(STATIC / "workspace.html")
+    return FileResponse(STATIC / "workspace.html", headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/tasks")
