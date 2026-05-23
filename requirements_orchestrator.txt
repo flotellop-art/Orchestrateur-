@@ -3,3 +3,7 @@ uvicorn
 anthropic
 python-dotenv
 aiosqlite
+google-genai
+openai
+claude-agent-sdk
+pytest
