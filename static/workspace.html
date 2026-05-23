@@ -164,6 +164,13 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
     <button class="link-add" onclick="addSeed()">+ Ajouter un agent</button>
   </div>
 
+  <div class="card">
+    <label for="design-image">Maquette de design (optionnel)</label>
+    <p class="muted">Ajoutez une image (capture, croquis, maquette) : les agents s'en inspireront pour l'UI.</p>
+    <input type="file" id="design-image" accept="image/*" onchange="previewDesign()">
+    <div id="design-preview"></div>
+  </div>
+
   <button class="btn btn-primary btn-launch" id="btn-launch" onclick="launch()">Lancer l'equipe</button>
   <p class="muted" id="launch-err" style="color:var(--red);margin-top:10px"></p>
 </div>
@@ -171,7 +178,9 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 <!-- Espace de travail live -->
 <div class="live" id="live">
   <div class="panel panel-team">
-    <h3>Equipe</h3>
+    <h3>Graphe</h3>
+    <svg id="agent-graph" viewBox="0 0 220 200" width="100%" height="180"></svg>
+    <h3 style="margin-top:14px">Equipe</h3>
     <div id="team-list"><p class="muted">En attente du chef...</p></div>
   </div>
 
@@ -183,6 +192,7 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
       <button class="btn btn-ghost btn-small" onclick="ctrl('stop')">Arreter</button>
       <button class="btn btn-ghost btn-small" onclick="launchApp()">Lancer l'app</button>
       <button class="btn btn-ghost btn-small" onclick="stopApp()">Arreter l'app</button>
+      <button class="btn btn-ghost btn-small" onclick="exportApp()">Exporter (zip)</button>
       <button class="btn btn-ghost btn-small" onclick="newTask()">Nouvel objectif</button>
     </div>
     <div id="result-area"></div>
@@ -199,7 +209,15 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
   <div class="panel panel-files">
     <h3>Fichiers produits</h3>
     <div id="file-list"><p class="muted">Aucun fichier pour l'instant.</p></div>
-    <div class="file-view" id="file-view"></div>
+    <div id="editor-bar" style="display:none;margin-top:10px;display:none">
+      <span class="muted" id="editor-file"></span>
+      <div style="display:flex;gap:6px;margin-top:6px">
+        <button class="btn btn-primary btn-small" onclick="saveCurrentFile()">Enregistrer (Ctrl+S)</button>
+        <button class="btn btn-ghost btn-small" onclick="launchApp()">Recharger l'app</button>
+      </div>
+    </div>
+    <textarea id="file-edit" class="file-view" style="display:none;width:100%;height:50vh;color:#e6e6e6"
+      spellcheck="false"></textarea>
   </div>
 </div>
 
@@ -208,6 +226,24 @@ var taskId = null;
 var evtSource = null;
 var seedCount = 0;
 var teamNames = {};
+var designImageData = null;   // data URL de la maquette (#17)
+var currentFile = null;       // fichier ouvert dans l'editeur (#13)
+var graphAgents = [];         // noms d'agents pour le graphe (#11)
+var activeAgent = null;
+
+// ── Maquette de design (#17) ──────────────────────────────────────────────────
+function previewDesign() {
+  var f = document.getElementById('design-image').files[0];
+  var prev = document.getElementById('design-preview');
+  if (!f) { designImageData = null; prev.innerHTML = ''; return; }
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    designImageData = e.target.result;  // "data:image/...;base64,..."
+    prev.innerHTML = '<img src="' + designImageData + '" style="max-width:100%;max-height:160px;'
+      + 'border-radius:8px;margin-top:8px">';
+  };
+  reader.readAsDataURL(f);
+}
 
 function esc(s) {
   if (s === null || s === undefined) return '';
@@ -254,7 +290,8 @@ async function launch() {
     agents: collectSeeds(),
     web_enabled: document.getElementById('web-enabled').checked,
     max_iterations: parseInt(document.getElementById('max-iter').value) || 15,
-    max_agents: parseInt(document.getElementById('max-agents').value) || 4
+    max_agents: parseInt(document.getElementById('max-agents').value) || 4,
+    image: designImageData
   };
 
   document.getElementById('btn-launch').disabled = true;
@@ -282,11 +319,25 @@ function startLive() {
   document.getElementById('result-area').innerHTML = '';
   document.getElementById('launch-area').innerHTML = '';
   document.getElementById('chat-input').value = '';
+  document.getElementById('file-edit').style.display = 'none';
+  document.getElementById('editor-bar').style.display = 'none';
+  document.getElementById('agent-graph').innerHTML = '';
   teamNames = {};
+  graphAgents = [];
+  activeAgent = null;
+  currentFile = null;
   setStatus('running');
   connectStream();
   refreshFiles();
 }
+
+// Ctrl+S enregistre le fichier en cours d'edition
+document.addEventListener('keydown', function(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 's' && currentFile) {
+    e.preventDefault();
+    saveCurrentFile();
+  }
+});
 
 function connectStream() {
   if (evtSource) evtSource.close();
@@ -312,8 +363,10 @@ function handleEvent(ev) {
     case 'turn_start':
       document.getElementById('turn-info').textContent = 'Tour ' + ev.iteration;
       feedAdd('<div class="msg turn">— Tour ' + ev.iteration + ' —</div>');
+      setActive('Chef');
       break;
     case 'chef':
+      setActive('Chef');
       var ins = ev.instruction ? ('<div><b>Consigne :</b> ' + esc(ev.instruction) + '</div>') : '';
       feedAdd('<div class="msg chef"><div class="who">Chef &middot; ' + esc(ev.decision) + '</div>'
         + (ev.thought ? '<div>' + esc(ev.thought) + '</div>' : '') + ins + '</div>');
@@ -323,11 +376,13 @@ function handleEvent(ev) {
       feedAdd('<div class="msg sys">Nouvel agent : <b>' + esc(ev.name) + '</b> (' + esc(ev.role) + ')</div>');
       break;
     case 'agent_message':
+      setActive(ev.agent);
       var cls = ev.kind === 'result' ? 'result' : 'agent';
       feedAdd('<div class="msg ' + cls + '"><div class="who">' + esc(ev.agent)
         + (ev.kind === 'result' ? ' &middot; resultat' : '') + '</div><div>' + esc(ev.content) + '</div></div>');
       break;
     case 'tool_call':
+      setActive(ev.agent);
       feedAdd('<div class="msg tool"><div class="who">' + esc(ev.agent) + ' &rarr; ' + esc(ev.tool)
         + '</div><pre>' + esc(JSON.stringify(ev.input)) + '</pre></div>');
       break;
@@ -379,6 +434,8 @@ function handleEvent(ev) {
 function addTeamCard(name, role, model) {
   if (teamNames[name]) return;
   teamNames[name] = true;
+  graphAgents.push(name);
+  renderGraph();
   var list = document.getElementById('team-list');
   if (list.querySelector('.muted')) list.innerHTML = '';
   var div = document.createElement('div');
@@ -425,10 +482,68 @@ function renderFiles(files) {
 async function viewFile(path) {
   try {
     var d = await (await fetch('/api/tasks/' + taskId + '/file?path=' + encodeURIComponent(path))).json();
-    var v = document.getElementById('file-view');
-    v.textContent = d.content;
-    v.classList.add('show');
+    currentFile = path;
+    var ed = document.getElementById('file-edit');
+    ed.value = d.content;
+    ed.style.display = 'block';
+    document.getElementById('editor-bar').style.display = 'block';
+    document.getElementById('editor-file').textContent = 'Edition : ' + path;
   } catch(e) {}
+}
+
+async function saveCurrentFile() {
+  if (!taskId || !currentFile) return;
+  var content = document.getElementById('file-edit').value;
+  var r = await fetch('/api/tasks/' + taskId + '/file', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path: currentFile, content: content})
+  });
+  var bar = document.getElementById('editor-file');
+  bar.textContent = r.ok ? ('Enregistre : ' + currentFile) : 'Echec de l\'enregistrement';
+  if (r.ok) refreshFiles();
+}
+
+// ── Export du projet (#14) ─────────────────────────────────────────────────────
+function exportApp() {
+  if (!taskId) return;
+  window.open('/api/tasks/' + taskId + '/export', '_blank');
+}
+
+// ── Graphe des agents (#11) ─────────────────────────────────────────────────────
+function renderGraph() {
+  var svg = document.getElementById('agent-graph');
+  if (!svg) return;
+  var cx = 110, cy = 100, r = 70;
+  var parts = [];
+  // aretes chef -> agents
+  graphAgents.forEach(function(name, i) {
+    var a = (2 * Math.PI * i) / Math.max(graphAgents.length, 1) - Math.PI / 2;
+    var x = cx + r * Math.cos(a), y = cy + r * Math.sin(a);
+    parts.push('<line x1="' + cx + '" y1="' + cy + '" x2="' + x + '" y2="' + y
+      + '" stroke="#ccc" stroke-width="1.5"/>');
+  });
+  // noeud chef
+  var chefActive = (activeAgent === 'Chef' || activeAgent === 'chef');
+  parts.push(nodeSvg(cx, cy, 'Chef', chefActive, '#e8825a'));
+  // noeuds agents
+  graphAgents.forEach(function(name, i) {
+    var a = (2 * Math.PI * i) / Math.max(graphAgents.length, 1) - Math.PI / 2;
+    var x = cx + r * Math.cos(a), y = cy + r * Math.sin(a);
+    parts.push(nodeSvg(x, y, name, activeAgent === name, '#3a6ea5'));
+  });
+  svg.innerHTML = parts.join('');
+}
+
+function nodeSvg(x, y, label, active, color) {
+  var short = label.length > 10 ? label.slice(0, 9) + '…' : label;
+  return '<circle cx="' + x + '" cy="' + y + '" r="16" fill="' + color + '"'
+    + (active ? ' stroke="#27ae60" stroke-width="3"' : ' stroke="#fff" stroke-width="2"') + '/>'
+    + '<text x="' + x + '" y="' + (y + 28) + '" text-anchor="middle" font-size="8" fill="#1a1a2e">'
+    + esc(short) + '</text>';
+}
+
+function setActive(name) {
+  if (activeAgent !== name) { activeAgent = name; renderGraph(); }
 }
 
 // ── Lancer l'app produite ─────────────────────────────────────────────────────
@@ -494,6 +609,9 @@ async function newTaskFromMessage() {
 function newTask() {
   if (evtSource) evtSource.close();
   taskId = null;
+  designImageData = null;
+  var di = document.getElementById('design-image'); if (di) di.value = '';
+  var dp = document.getElementById('design-preview'); if (dp) dp.innerHTML = '';
   document.getElementById('live').classList.remove('show');
   document.getElementById('setup').style.display = '';
   document.getElementById('btn-launch').disabled = false;
