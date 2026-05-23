@@ -40,7 +40,7 @@ PROJECTS.mkdir(exist_ok=True)
 # Modeles par defaut par provider (verifies via recherche web, mai 2026).
 # Gemini 3.5 Pro n'est pas encore dispo (prevu juin 2026) -> tier Flash, stable.
 # Un identifiant errone n'est pas bloquant : le provider retombe sur Claude (voir call_model).
-DEFAULT_CLAUDE = "claude-opus-4-6"
+DEFAULT_CLAUDE = "claude-opus-4-7"
 DEFAULT_GEMINI = "gemini-3.5-flash"
 DEFAULT_OPENAI = "gpt-5.5"
 
