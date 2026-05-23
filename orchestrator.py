@@ -21,6 +21,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+import team
+
 load_dotenv()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -378,6 +380,7 @@ async def creation_pipeline(app_id, description, folder, port):
 @asynccontextmanager
 async def lifespan(app):
     await init_db()
+    await team.init_team_db()
     log.info("App Creator demarre.")
     yield
     for proc in running_servers.values():
@@ -388,6 +391,7 @@ async def lifespan(app):
     log.info("App Creator arrete.")
 
 app = FastAPI(title="App Creator", lifespan=lifespan)
+app.include_router(team.router)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
