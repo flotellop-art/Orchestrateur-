@@ -214,6 +214,7 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
       <button class="btn btn-ghost btn-small" id="btn-pause" onclick="ctrl('pause')">Pause</button>
       <button class="btn btn-ghost btn-small" id="btn-resume" onclick="ctrl('resume')" style="display:none">Reprendre</button>
       <button class="btn btn-ghost btn-small" id="btn-step" onclick="ctrl('step')">Etape</button>
+      <button class="btn btn-primary btn-small" id="btn-restart" onclick="restartTask()" style="display:none">Reprendre la tache</button>
       <button class="btn btn-ghost btn-small" onclick="ctrl('stop')">Arreter</button>
       <button class="btn btn-ghost btn-small" onclick="launchApp()">Lancer l'app</button>
       <button class="btn btn-ghost btn-small" onclick="stopApp()">Arreter l'app</button>
@@ -542,6 +543,9 @@ function setStatus(s) {
   b.textContent = labels[s] || s;
   document.getElementById('btn-pause').style.display = (s === 'running') ? '' : 'none';
   document.getElementById('btn-resume').style.display = (s === 'paused') ? '' : 'none';
+  // "Reprendre la tache" : visible quand la tache est terminee/arretee/echouee.
+  document.getElementById('btn-restart').style.display =
+    (s === 'failed' || s === 'stopped' || s === 'done') ? '' : 'none';
 }
 
 async function ctrl(action) {
@@ -549,6 +553,24 @@ async function ctrl(action) {
   await fetch('/api/tasks/' + taskId + '/' + action, {method: 'POST'});
   if (action === 'pause') setStatus('paused');
   if (action === 'resume') setStatus('running');
+}
+
+async function restartTask() {
+  if (!taskId) return;
+  var r = await fetch('/api/tasks/' + taskId + '/restart', {method: 'POST'});
+  if (!r.ok) {
+    var d = await r.json();
+    feedAdd('<div class="msg err">Reprise impossible : ' + esc(d.detail || '') + '</div>');
+    return;
+  }
+  if (evtSource) evtSource.close();
+  document.getElementById('feed').innerHTML = '';
+  document.getElementById('team-list').innerHTML = '<p class="muted">Reprise...</p>';
+  document.getElementById('agent-graph').innerHTML = '';
+  teamNames = {}; graphAgents = []; activeAgent = null;
+  setStatus('running');
+  connectStream();   // re-tail le flux complet (historique + nouveaux messages)
+  refreshFiles();
 }
 
 // ── Fichiers ──────────────────────────────────────────────────────────────────
