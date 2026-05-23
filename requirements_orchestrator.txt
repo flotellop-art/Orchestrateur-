@@ -4,5 +4,6 @@ anthropic
 python-dotenv
 aiosqlite
 google-generativeai
+openai
 claude-agent-sdk
 pytest

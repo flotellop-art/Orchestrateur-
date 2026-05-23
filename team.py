@@ -37,8 +37,18 @@ STATIC = Path(__file__).parent / "static"
 PROJECTS = Path(__file__).parent / "projects"
 PROJECTS.mkdir(exist_ok=True)
 
-DEFAULT_CLAUDE = "claude-sonnet-4-6"
-DEFAULT_GEMINI = "gemini-2.5-flash"
+# Modeles par defaut par provider.
+# NOTE: identifiants potentiellement a ajuster selon les noms exacts de l'API.
+# Un identifiant errone n'est pas bloquant : le provider retombe sur Claude (voir call_model).
+DEFAULT_CLAUDE = "claude-opus-4-6"
+DEFAULT_GEMINI = "gemini-3.5-pro"
+DEFAULT_OPENAI = "gpt-5.5"
+
+
+def _default_model(provider: str) -> str:
+    return {"gemini": DEFAULT_GEMINI, "openai": DEFAULT_OPENAI}.get(provider, DEFAULT_CLAUDE)
+
+
 MAX_AGENTS_CEILING = 8
 MAX_ITER_CEILING = 40
 WORKER_MAX_STEPS = 6
@@ -220,6 +230,21 @@ async def _call_gemini(model, system, messages) -> str:
     return resp.text or ""
 
 
+def _openai_available() -> bool:
+    return bool(os.getenv("OPENAI_API_KEY"))
+
+
+async def _call_openai(model, system, messages) -> str:
+    from openai import AsyncOpenAI  # importe a la demande
+    oai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    msgs = [{"role": "system", "content": system}]
+    for m in messages:
+        role = m["role"] if m["role"] in ("user", "assistant") else "user"
+        msgs.append({"role": role, "content": m["content"]})
+    resp = await oai.chat.completions.create(model=model or DEFAULT_OPENAI, messages=msgs)
+    return resp.choices[0].message.content or ""
+
+
 async def call_model(provider, model, system, messages, on_notice=None) -> str:
     if provider == "gemini":
         if not _gemini_available():
@@ -232,6 +257,18 @@ async def call_model(provider, model, system, messages, on_notice=None) -> str:
             log.warning("Gemini error: %s", e)
             if on_notice:
                 await on_notice("Erreur Gemini (" + str(e)[:120] + ") -> repli sur Claude.")
+            return await _call_claude(DEFAULT_CLAUDE, system, messages)
+    if provider == "openai":
+        if not _openai_available():
+            if on_notice:
+                await on_notice("OpenAI indisponible (OPENAI_API_KEY manquante) -> repli sur Claude.")
+            return await _call_claude(DEFAULT_CLAUDE, system, messages)
+        try:
+            return await _call_openai(model, system, messages)
+        except Exception as e:
+            log.warning("OpenAI error: %s", e)
+            if on_notice:
+                await on_notice("Erreur OpenAI (" + str(e)[:120] + ") -> repli sur Claude.")
             return await _call_claude(DEFAULT_CLAUDE, system, messages)
     return await _call_claude(model or DEFAULT_CLAUDE, system, messages)
 
@@ -417,15 +454,16 @@ A CHAQUE TOUR, reponds UNIQUEMENT avec un objet JSON (aucun texte autour) decriv
 
 - Creer un agent :
   {{"thought":"...","action":"create_agent","name":"NomCourt","role":"role / specialite","provider":"claude"}}
-  ("provider" peut etre "claude" ou "gemini")
+  ("provider" peut etre "claude", "gemini" ou "openai")
 
 - Confier une sous-tache a un agent existant :
   {{"thought":"...","action":"assign_task","agent":"NomDeLAgent","instruction":"consigne precise et autonome"}}
 
-- Lancer un CHALLENGE (verification croisee entre les deux modeles) :
+- Lancer un CHALLENGE (verification croisee entre les trois modeles) :
   {{"thought":"...","action":"challenge","instruction":"consigne precise","rounds":2}}
-  Un Producteur (Claude) realise le travail, puis un Critique (Gemini) cherche les erreurs et conteste ;
-  le Producteur corrige sur plusieurs tours. Utilise-le pour les livrables importants ou sensibles aux erreurs.
+  Un Producteur (Claude par defaut) realise le travail, puis les DEUX autres modeles (Gemini et ChatGPT)
+  le critiquent chacun de leur cote ; il n'est valide que si les deux critiques approuvent, sinon il
+  corrige sur plusieurs tours. Utilise-le pour les livrables importants ou sensibles aux erreurs.
 
 - Terminer (objectif atteint) :
   {{"thought":"...","action":"finish","final":"resume du resultat livre"}}
@@ -580,18 +618,30 @@ async def _run_critic(task_id, iteration, critic_agent, instruction, producer_re
     return verdict, issues, comment
 
 
+PROVIDER_LABEL = {"claude": "Claude", "gemini": "Gemini", "openai": "ChatGPT"}
+
+
 async def _run_challenge(task_id, iteration, instruction, folder, web_enabled, rounds,
                          worker_histories, notice,
-                         producer_provider="claude", critic_provider="gemini"):
+                         producer_provider="claude", critic_providers=None):
     rounds = max(1, min(int(rounds or 2), 4))
-    prod = await _ensure_agent(
-        task_id, "Producteur", "produit et corrige la solution",
-        producer_provider, DEFAULT_GEMINI if producer_provider == "gemini" else DEFAULT_CLAUDE, iteration)
-    crit = await _ensure_agent(
-        task_id, "Critique", "cherche les erreurs et conteste le travail",
-        critic_provider, DEFAULT_GEMINI if critic_provider == "gemini" else DEFAULT_CLAUDE, iteration)
+    if not critic_providers:
+        critic_providers = [p for p in ("claude", "gemini", "openai") if p != producer_provider]
+    seen = set()
+    critic_providers = [p for p in critic_providers if not (p in seen or seen.add(p))]
 
-    last_issues, last_comment, final_report = [], "", ""
+    prod = await _ensure_agent(
+        task_id, "Producteur (" + PROVIDER_LABEL.get(producer_provider, producer_provider) + ")",
+        "produit et corrige la solution",
+        producer_provider, _default_model(producer_provider), iteration)
+    critics = []
+    for cp in critic_providers:
+        critics.append(await _ensure_agent(
+            task_id, "Critique (" + PROVIDER_LABEL.get(cp, cp) + ")",
+            "cherche les erreurs et conteste le travail",
+            cp, _default_model(cp), iteration))
+
+    last_issues, final_report, last_comments = [], "", []
     for r in range(1, rounds + 1):
         await _wait_if_paused(task_id)
         if await _is_stopped(task_id):
@@ -601,23 +651,32 @@ async def _run_challenge(task_id, iteration, instruction, folder, web_enabled, r
         prod_instruction = instruction
         if last_issues:
             prod_instruction = (instruction + NL + NL
-                                + "Le critique a souleve ces points, corrige-les :" + NL
+                                + "Les critiques ont souleve ces points, corrige-les :" + NL
                                 + NL.join("- " + str(i) for i in last_issues))
         final_report = await _run_worker(task_id, iteration, prod, prod_instruction,
                                          folder, web_enabled, worker_histories, notice)
 
-        await _wait_if_paused(task_id)
-        if await _is_stopped(task_id):
-            break
-        verdict, last_issues, last_comment = await _run_critic(
-            task_id, iteration, crit, instruction, final_report, folder, notice)
-        if verdict == "approved":
-            return ("Challenge approuve au round " + str(r) + "/" + str(rounds)
-                    + ". Resultat : " + final_report[:800])
-    return ("Challenge termine apres " + str(rounds) + " round(s) sans approbation finale. "
-            + "Dernier avis : " + (last_comment or "n/a")
+        round_issues, all_approved, last_comments = [], True, []
+        for crit in critics:
+            await _wait_if_paused(task_id)
+            if await _is_stopped(task_id):
+                all_approved = False
+                break
+            verdict, issues, comment = await _run_critic(
+                task_id, iteration, crit, instruction, final_report, folder, notice)
+            last_comments.append(crit["name"] + " : " + (comment or verdict))
+            if verdict != "approved":
+                all_approved = False
+                round_issues.extend(issues)
+        last_issues = round_issues
+        if all_approved:
+            return ("Challenge approuve a l'unanimite au round " + str(r) + "/" + str(rounds)
+                    + " par " + ", ".join(c["name"] for c in critics)
+                    + ". Resultat : " + final_report[:700])
+    return ("Challenge termine apres " + str(rounds) + " round(s) sans approbation unanime. "
+            + "Avis : " + (" | ".join(last_comments) or "n/a")
             + ". Points restants : " + ("; ".join(str(i) for i in last_issues) if last_issues else "aucun")
-            + ". Resultat : " + final_report[:800])
+            + ". Resultat : " + final_report[:600])
 
 
 # ── Moteur : la boucle du chef ───────────────────────────────────────────────
@@ -683,9 +742,9 @@ async def _run_task(task_id):
                 name = (decision.get("name") or ("agent" + str(len(team) + 1))).strip()
                 role = decision.get("role", "")
                 provider = decision.get("provider", "claude")
-                if provider not in ("claude", "gemini"):
+                if provider not in ("claude", "gemini", "openai"):
                     provider = "claude"
-                model = decision.get("model") or (DEFAULT_GEMINI if provider == "gemini" else DEFAULT_CLAUDE)
+                model = decision.get("model") or _default_model(provider)
                 if await db_get_agent(task_id, name):
                     chef_messages.append({"role": "user", "content":
                                           "Un agent nomme '" + name + "' existe deja. Choisis un autre nom ou delegue-lui."})
@@ -720,7 +779,7 @@ async def _run_task(task_id):
                     task_id, iteration, instruction, folder, web_enabled,
                     decision.get("rounds", 2), worker_histories, notice,
                     decision.get("producer_provider", "claude"),
-                    decision.get("critic_provider", "gemini"))
+                    decision.get("critic_providers"))
                 chef_messages.append({"role": "user", "content":
                                       "Resultat du challenge : " + report[:2000]})
                 continue
@@ -783,9 +842,8 @@ async def create_task(body: TaskCreate):
         name = (a.name or "").strip()
         if not name:
             continue
-        provider = a.model if a.model in ("claude", "gemini") else "claude"
-        model = DEFAULT_GEMINI if provider == "gemini" else DEFAULT_CLAUDE
-        await db_add_agent(task_id, name, a.role, provider, model, "user")
+        provider = a.model if a.model in ("claude", "gemini", "openai") else "claude"
+        await db_add_agent(task_id, name, a.role, provider, _default_model(provider), "user")
     return {"id": task_id, "folder": folder}
 
 
