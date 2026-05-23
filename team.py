@@ -220,16 +220,21 @@ async def _call_claude(model, system, messages) -> str:
 
 
 async def _call_gemini(model, system, messages) -> str:
-    import google.generativeai as genai  # importe a la demande
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    gm = genai.GenerativeModel(model or DEFAULT_GEMINI, system_instruction=system)
+    from google import genai  # nouveau paquet google-genai, importe a la demande
+    from google.genai import types
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     contents = [
-        {"role": ("user" if m["role"] == "user" else "model"), "parts": [m["content"]]}
+        {"role": ("user" if m["role"] == "user" else "model"),
+         "parts": [{"text": m["content"]}]}
         for m in messages
     ]
-    resp = await asyncio.to_thread(
-        gm.generate_content, contents,
-        generation_config={"max_output_tokens": MAX_TOKENS},
+    resp = await client.aio.models.generate_content(
+        model=model or DEFAULT_GEMINI,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            max_output_tokens=MAX_TOKENS,
+        ),
     )
     return resp.text or ""
 
@@ -250,15 +255,18 @@ async def _call_openai(model, system, messages) -> str:
 
 
 async def call_model(provider, model, system, messages, on_notice=None) -> str:
+    log.info("[modele] appel %s (%s)", provider, model or _default_model(provider))
     if provider == "gemini":
         if not _gemini_available():
             if on_notice:
                 await on_notice("Gemini indisponible (GEMINI_API_KEY manquante) -> repli sur Claude.")
             return await _call_claude(DEFAULT_CLAUDE, system, messages)
         try:
-            return await _call_gemini(model, system, messages)
+            out = await _call_gemini(model, system, messages)
+            log.info("[modele] Gemini OK (%d caracteres)", len(out))
+            return out
         except Exception as e:
-            log.warning("Gemini error: %s", e)
+            log.warning("[modele] Gemini erreur: %s", e)
             if on_notice:
                 await on_notice("Erreur Gemini (" + str(e)[:120] + ") -> repli sur Claude.")
             return await _call_claude(DEFAULT_CLAUDE, system, messages)
@@ -268,9 +276,11 @@ async def call_model(provider, model, system, messages, on_notice=None) -> str:
                 await on_notice("OpenAI indisponible (OPENAI_API_KEY manquante) -> repli sur Claude.")
             return await _call_claude(DEFAULT_CLAUDE, system, messages)
         try:
-            return await _call_openai(model, system, messages)
+            out = await _call_openai(model, system, messages)
+            log.info("[modele] OpenAI OK (%d caracteres)", len(out))
+            return out
         except Exception as e:
-            log.warning("OpenAI error: %s", e)
+            log.warning("[modele] OpenAI erreur: %s", e)
             if on_notice:
                 await on_notice("Erreur OpenAI (" + str(e)[:120] + ") -> repli sur Claude.")
             return await _call_claude(DEFAULT_CLAUDE, system, messages)
