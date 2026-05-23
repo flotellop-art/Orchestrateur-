@@ -37,11 +37,11 @@ STATIC = Path(__file__).parent / "static"
 PROJECTS = Path(__file__).parent / "projects"
 PROJECTS.mkdir(exist_ok=True)
 
-# Modeles par defaut par provider.
-# NOTE: identifiants potentiellement a ajuster selon les noms exacts de l'API.
+# Modeles par defaut par provider (verifies via recherche web, mai 2026).
+# Gemini 3.5 Pro n'est pas encore dispo (prevu juin 2026) -> tier Flash, stable.
 # Un identifiant errone n'est pas bloquant : le provider retombe sur Claude (voir call_model).
 DEFAULT_CLAUDE = "claude-opus-4-6"
-DEFAULT_GEMINI = "gemini-3.5-pro"
+DEFAULT_GEMINI = "gemini-3.5-flash"
 DEFAULT_OPENAI = "gpt-5.5"
 
 
