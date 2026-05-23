@@ -556,6 +556,49 @@ def _list_target_files(target_path: str) -> list[str]:
     return out
 
 
+async def _clone_repo(url, token=None):
+    """Clone un depot GitHub en LECTURE SEULE dans un cache local, et renvoie son chemin.
+    Le token (depot prive) sert au clone puis est scrubbe (remote supprime) ; jamais stocke/log."""
+    url = (url or "").strip().rstrip("/")
+    if not re.match(r"^https://", url):
+        raise ValueError("URL invalide : une URL https est requise.")
+    m = re.search(r"github\.com/([^/]+)/([^/]+?)(?:\.git)?$", url)
+    name = (m.group(1) + "_" + m.group(2)) if m else re.sub(r"[^A-Za-z0-9_.-]", "_", url)[-40:]
+    dest = PROJECTS / ".repos" / name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        await asyncio.to_thread(shutil.rmtree, str(dest), True)  # re-clone propre
+    auth_url = url.replace("https://", "https://" + token + "@", 1) if token else url
+    proc = await asyncio.create_subprocess_exec(
+        "git", "clone", "--depth", "1", auth_url, str(dest),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise ValueError("git clone : delai depasse (depot trop gros ou reseau lent).")
+    except FileNotFoundError:
+        raise ValueError("git introuvable sur la machine (installe Git).")
+    if proc.returncode != 0:
+        msg = out.decode("utf-8", "replace")
+        if token:
+            msg = msg.replace(token, "***")  # ne jamais fuiter le token
+        raise ValueError(msg.strip()[-300:] or "echec inconnu")
+    # Scrubber le remote : aucune trace du token dans .git/config.
+    if (dest / ".git").exists():
+        try:
+            p2 = await asyncio.create_subprocess_exec(
+                "git", "-C", str(dest), "remote", "remove", "origin",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await p2.communicate()
+        except Exception:
+            pass
+    return str(dest.resolve())
+
+
 async def _run_cmd(folder: str, cmd: str, timeout: int = 60) -> str:
     try:
         parts = shlex.split(cmd or "")
@@ -1370,6 +1413,8 @@ class TaskCreate(BaseModel):
     image: Optional[str] = None  # data URL (data:image/...;base64,...) d'une maquette
     company_mode: bool = False   # mode entreprise tech (audit d'un depot externe en lecture seule)
     target_path: Optional[str] = None  # chemin local du depot a auditer (lecture seule)
+    target_repo_url: Optional[str] = None  # URL GitHub a cloner localement (lecture seule)
+    github_token: Optional[str] = None  # token pour depot prive (utilise pour le clone, jamais stocke)
 
 
 router = APIRouter()
@@ -1392,9 +1437,16 @@ async def create_task(body: TaskCreate):
     max_agents = max(1, min(body.max_agents, agents_ceiling))
     target_path = None
     if company:
-        if not body.target_path or not Path(body.target_path).exists():
-            raise HTTPException(400, "Mode entreprise : 'target_path' (depot a auditer) introuvable.")
-        target_path = str(Path(body.target_path).resolve())
+        if body.target_repo_url:
+            try:
+                target_path = await _clone_repo(body.target_repo_url, body.github_token)
+            except Exception as e:
+                raise HTTPException(400, "Connexion au depot GitHub impossible : " + str(e)[:300])
+        elif body.target_path and Path(body.target_path).exists():
+            target_path = str(Path(body.target_path).resolve())
+        else:
+            raise HTTPException(400, "Mode entreprise : fournis une URL GitHub (target_repo_url) "
+                                     "OU un chemin local existant (target_path).")
     folder = str(PROJECTS / ("task_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S")
                              + "_" + uuid.uuid4().hex[:6]))
     Path(folder).mkdir(parents=True, exist_ok=True)

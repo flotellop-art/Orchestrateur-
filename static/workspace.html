@@ -169,10 +169,16 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
       <label for="company-mode" style="color:var(--purple)">Mode Entreprise Tech (audit d'un depot, lecture seule)</label>
     </div>
     <div id="company-box" style="display:none;margin-top:10px;border-left:3px solid var(--purple);padding-left:12px">
-      <label for="target-path">Chemin local du depot a auditer (ex : C:\\Users\\Tellop\\Arty)</label>
-      <input type="text" id="target-path" placeholder="C:\\chemin\\vers\\le\\depot">
-      <p class="muted">L'entreprise lit ce depot en lecture seule et ecrit ses livrables dans un dossier
-        <b>delivery/</b> local (elle ne pousse jamais, ne merge pas). Limites etendues (jusqu'a 24 agents / 300 tours).</p>
+      <label for="target-repo-url">Depot GitHub a auditer (l'app le clone toute seule)</label>
+      <input type="text" id="target-repo-url" placeholder="https://github.com/flotellop-art/Arty">
+      <input type="password" id="github-token" placeholder="Token GitHub (uniquement si le depot est prive)"
+        style="margin-top:8px" autocomplete="off">
+      <p class="muted" style="margin-top:8px">— ou —</p>
+      <label for="target-path" style="margin-top:4px">Chemin d'un depot deja clone en local (optionnel)</label>
+      <input type="text" id="target-path" placeholder="C:\\Users\\Tellop\\arty-repo">
+      <p class="muted">L'entreprise lit le depot en <b>lecture seule</b> et ecrit ses livrables dans un dossier
+        <b>delivery/</b> local (elle ne pousse jamais, ne merge pas). Le token sert au clone puis n'est ni
+        stocke ni journalise. Limites etendues (jusqu'a 24 agents / 300 tours).</p>
     </div>
   </div>
 
@@ -334,7 +340,16 @@ async function launch() {
 
   var company = document.getElementById('company-mode').checked;
   var targetPath = document.getElementById('target-path').value.trim();
-  if (company && !targetPath) { errEl.textContent = 'Mode entreprise : indiquez le chemin du depot a auditer.'; return; }
+  var repoUrl = document.getElementById('target-repo-url').value.trim();
+  var ghToken = document.getElementById('github-token').value.trim();
+  if (company && !repoUrl && !targetPath) {
+    errEl.textContent = 'Mode entreprise : donne une URL GitHub OU un chemin local de depot.'; return;
+  }
+  if (company && repoUrl) {
+    errEl.textContent = '';
+    document.getElementById('launch-err').style.color = 'var(--grey)';
+    errEl.textContent = 'Clonage du depot en cours (peut prendre un moment)...';
+  }
   var body = {
     objective: objective,
     chef_model: document.getElementById('chef-model').value,
@@ -344,7 +359,9 @@ async function launch() {
     max_agents: parseInt(document.getElementById('max-agents').value) || 4,
     image: designImageData,
     company_mode: company,
-    target_path: company ? targetPath : null
+    target_path: company ? (targetPath || null) : null,
+    target_repo_url: company ? (repoUrl || null) : null,
+    github_token: company ? (ghToken || null) : null
   };
 
   document.getElementById('btn-launch').disabled = true;
@@ -358,6 +375,7 @@ async function launch() {
     await fetch('/api/tasks/' + taskId + '/start', {method: 'POST'});
     startLive();
   } catch(e) {
+    errEl.style.color = 'var(--red)';
     errEl.textContent = 'Erreur : ' + e.message;
     document.getElementById('btn-launch').disabled = false;
   }
@@ -762,6 +780,8 @@ function newTask() {
   document.getElementById('btn-launch').disabled = false;
   document.getElementById('status-badge').style.display = 'none';
   document.getElementById('turn-info').textContent = '';
+  var gh = document.getElementById('github-token'); if (gh) gh.value = '';  // ne pas garder le token
+  var le = document.getElementById('launch-err'); if (le) { le.textContent = ''; le.style.color = 'var(--red)'; }
   var cm = document.getElementById('company-mode');
   if (cm) { cm.checked = false; toggleCompany(); }
 }
