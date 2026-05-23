@@ -438,23 +438,44 @@ async def web_search(query: str) -> str:
 # Verifie cote serveur : un agent ne peut activer qu'un serveur de cette liste
 # (serveurs de reference du projet Model Context Protocol).
 OFFICIAL_MCP = {
-    "filesystem": ["npx", "-y", "@modelcontextprotocol/server-filesystem"],
-    "memory": ["npx", "-y", "@modelcontextprotocol/server-memory"],
-    "sequentialthinking": ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
-    "everything": ["npx", "-y", "@modelcontextprotocol/server-everything"],
-    "fetch": ["uvx", "mcp-server-fetch"],
-    "git": ["uvx", "mcp-server-git"],
-    "time": ["uvx", "mcp-server-time"],
+    # Python : auto-installables via pip + Python courant -> AUCUN prerequis pour l'utilisateur.
+    "fetch": {"kind": "python", "pip": "mcp-server-fetch", "module": "mcp_server_fetch"},
+    "git": {"kind": "python", "pip": "mcp-server-git", "module": "mcp_server_git",
+            "args": ["--repository", "{folder}"]},
+    "time": {"kind": "python", "pip": "mcp-server-time", "module": "mcp_server_time"},
+    # Node : necessitent npx (Node.js), non auto-installable de facon fiable.
+    "filesystem": {"kind": "npx", "package": "@modelcontextprotocol/server-filesystem",
+                   "args": ["{folder}"]},
+    "memory": {"kind": "npx", "package": "@modelcontextprotocol/server-memory"},
+    "sequentialthinking": {"kind": "npx", "package": "@modelcontextprotocol/server-sequential-thinking"},
+    "everything": {"kind": "npx", "package": "@modelcontextprotocol/server-everything"},
 }
 
 
-def _mcp_command(name, folder):
-    cmd = list(OFFICIAL_MCP[name])
-    if name == "filesystem":
-        cmd = cmd + [folder]               # cantonne l'acces au dossier de la tache
-    elif name == "git":
-        cmd = cmd + ["--repository", folder]
-    return cmd
+async def _pip_install(pkg):
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "pip", "install", "-q", pkg,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await asyncio.wait_for(proc.communicate(), timeout=240)
+    if proc.returncode != 0:
+        raise RuntimeError("pip install " + pkg + " a echoue : "
+                           + out.decode("utf-8", "replace")[-300:])
+
+
+async def _ensure_mcp_command(name, folder):
+    """Construit la commande de lancement, en installant le serveur si besoin (Python)."""
+    spec = OFFICIAL_MCP[name]
+    args = [a.replace("{folder}", folder) for a in spec.get("args", [])]
+    if spec["kind"] == "python":
+        import importlib.util
+        try:
+            present = importlib.util.find_spec(spec["module"]) is not None
+        except Exception:
+            present = False
+        if not present:
+            await _pip_install(spec["pip"])   # les agents installent eux-memes
+        return [sys.executable, "-m", spec["module"]] + args
+    return ["npx", "-y", spec["package"]] + args   # kind == "npx"
 
 
 class MCPServer:
@@ -534,12 +555,18 @@ async def _tool_add_mcp(task_id, folder, server):
     if server in registry:
         return ("Serveur MCP '" + server + "' deja actif. Outils : "
                 + ", ".join(t.get("name", "") for t in registry[server].tools))
-    s = MCPServer(server, _mcp_command(server, folder))
     try:
-        await asyncio.wait_for(s.start(), timeout=60)
+        command = await _ensure_mcp_command(server, folder)
     except Exception as e:
-        return ("Echec demarrage MCP '" + server + "' : " + str(e)[:200]
-                + " (npx/uvx est-il installe ?)")
+        return "Echec preparation MCP '" + server + "' : " + str(e)[:250]
+    s = MCPServer(server, command)
+    try:
+        await asyncio.wait_for(s.start(), timeout=90)
+    except FileNotFoundError:
+        return ("Le serveur MCP '" + server + "' necessite Node.js (npx), absent. "
+                "Prefere un serveur Python qui s'installe seul : fetch, git ou time.")
+    except Exception as e:
+        return "Echec demarrage MCP '" + server + "' : " + str(e)[:200]
     registry[server] = s
     return ("Serveur MCP officiel '" + server + "' demarre. Outils : "
             + ", ".join(t.get("name", "") for t in s.tools)
@@ -657,6 +684,8 @@ Regles :
 - Tu peux installer des paquets Python via run_command (ex: "pip install requests").
 - Outils MCP OFFICIELS uniquement : active un serveur avec add_mcp (autorises : {mcp_servers}),
   puis utilise ses outils via mcp_call. Tout serveur non officiel est refuse automatiquement.
+  fetch/git/time s'installent tout seuls (Python) ; filesystem/memory/sequentialthinking/everything
+  necessitent Node.js. Tu peux aussi installer des paquets toi-meme via run_command (pip install ...).
 - Quand ta mission est accomplie : "done": true et un "report". Sinon "done": false avec des actions.
 - Un seul JSON par reponse, aucun texte autour."""
 
