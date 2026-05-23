@@ -1582,9 +1582,12 @@ async def _proc_run(args, cwd, timeout):
 
 def _http_ping(url, timeout=5):
     import urllib.request
+    import urllib.error
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             return getattr(resp, "status", resp.getcode())
+    except urllib.error.HTTPError as e:
+        return e.code  # 3xx/4xx -> le serveur repond quand meme
     except Exception as e:
         return "erreur: " + str(e)[:120]
 
@@ -1594,11 +1597,16 @@ async def _build_ping(folder, py_exe):
     entry = next((n for n in WEB_ENTRYPOINTS if (base / n).exists()), None)
     if not entry:
         return {"name": "ping HTTP /", "ok": True, "log": "Pas d'app web Python (ignore)."}
+    # Empeche le reloader Flask/Werkzeug de forker un process enfant (zombie au kill).
+    env = os.environ.copy()
+    env["WERKZEUG_RUN_MAIN"] = "true"
+    env["FLASK_RUN_FROM_CLI"] = "true"
+    env["FLASK_DEBUG"] = "0"
     proc = None
     url = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            py_exe, entry, cwd=str(base),
+            py_exe, entry, cwd=str(base), env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         for _ in range(16):
             try:
@@ -1614,7 +1622,7 @@ async def _build_ping(folder, py_exe):
         if not url:
             return {"name": "ping HTTP /", "ok": False, "log": "URL non detectee au demarrage."}
         status = await asyncio.to_thread(_http_ping, url)
-        ok = (status == 200)
+        ok = isinstance(status, int) and status < 500  # serveur qui repond = succes
         return {"name": "ping HTTP /", "ok": ok, "log": url + " -> " + str(status)}
     finally:
         if proc and proc.returncode is None:
@@ -1721,6 +1729,9 @@ async def delete_task(task_id: int):
     t = await db_get_task(task_id)
     if t:
         shutil.rmtree(t["folder"], ignore_errors=True)
+    # Nettoyer aussi le venv de CI et les snapshots (sinon orphelins, ~50 Mo+).
+    shutil.rmtree(PROJECTS / ".ci" / str(task_id), ignore_errors=True)
+    shutil.rmtree(PROJECTS / ".snapshots" / str(task_id), ignore_errors=True)
     await db_delete_task(task_id)
     return {"deleted": True}
 
