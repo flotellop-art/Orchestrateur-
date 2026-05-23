@@ -639,7 +639,7 @@ class TaskCreate(BaseModel):
     objective: str
     chef_model: str = DEFAULT_CLAUDE
     agents: list[AgentSeed] = []
-    web_enabled: bool = False
+    web_enabled: bool = True
     max_iterations: int = 15
     max_agents: int = 4
 
