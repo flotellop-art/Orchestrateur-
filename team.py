@@ -141,6 +141,16 @@ async def init_team_db():
                 created_at TEXT
             )
         """)
+        # Historique des builds CI locaux (#16).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS builds (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id    INTEGER NOT NULL,
+                status     TEXT,
+                report     TEXT DEFAULT '',
+                created_at TEXT
+            )
+        """)
         # Memoire long terme partagee (inter-taches). FTS5 si dispo, sinon table simple.
         global _KNOWLEDGE_FTS
         try:
@@ -1545,6 +1555,159 @@ async def export_task(task_id: int):
         headers={"Content-Disposition": "attachment; filename=task_" + str(task_id) + ".zip"})
 
 
+# ── CI locale : build & test + historique (#16) ──────────────────────────────
+def _venv_python(venv_dir: Path) -> Path:
+    sub = "Scripts" if os.name == "nt" else "bin"
+    return venv_dir / sub / ("python.exe" if os.name == "nt" else "python")
+
+
+async def _proc_run(args, cwd, timeout):
+    """Lance une commande, renvoie (code, sortie tronquee)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    except FileNotFoundError:
+        return 1, "Programme introuvable: " + str(args[0])
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode, out.decode("utf-8", "replace")[:3000]
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return 1, "TIMEOUT apres " + str(timeout) + "s."
+
+
+def _http_ping(url, timeout=5):
+    import urllib.request
+    import urllib.error
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return getattr(resp, "status", resp.getcode())
+    except urllib.error.HTTPError as e:
+        return e.code  # 3xx/4xx -> le serveur repond quand meme
+    except Exception as e:
+        return "erreur: " + str(e)[:120]
+
+
+async def _build_ping(folder, py_exe):
+    base = Path(folder)
+    entry = next((n for n in WEB_ENTRYPOINTS if (base / n).exists()), None)
+    if not entry:
+        return {"name": "ping HTTP /", "ok": True, "log": "Pas d'app web Python (ignore)."}
+    # Empeche le reloader Flask/Werkzeug de forker un process enfant (zombie au kill).
+    env = os.environ.copy()
+    env["WERKZEUG_RUN_MAIN"] = "true"
+    env["FLASK_RUN_FROM_CLI"] = "true"
+    env["FLASK_DEBUG"] = "0"
+    proc = None
+    url = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            py_exe, entry, cwd=str(base), env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        for _ in range(16):
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.5)
+            except asyncio.TimeoutError:
+                break
+            if not line:
+                break
+            m = re.search(r"https?://[^\s'\"]+", line.decode("utf-8", "replace"))
+            if m:
+                url = m.group(0).replace("0.0.0.0", "localhost")
+                break
+        if not url:
+            return {"name": "ping HTTP /", "ok": False, "log": "URL non detectee au demarrage."}
+        status = await asyncio.to_thread(_http_ping, url)
+        ok = isinstance(status, int) and status < 500  # serveur qui repond = succes
+        return {"name": "ping HTTP /", "ok": ok, "log": url + " -> " + str(status)}
+    finally:
+        if proc and proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+async def _run_build(task_id, folder):
+    import py_compile
+    base = Path(folder)
+    steps = []
+
+    # 1. Verification syntaxique globale
+    py_files = [p for p in base.rglob("*.py")
+                if not any(x in p.parts for x in (".ci", "venv", ".venv", "__pycache__"))]
+    errs = []
+    for p in py_files:
+        try:
+            await asyncio.to_thread(py_compile.compile, str(p), None, str(p), True)
+        except py_compile.PyCompileError as e:
+            errs.append(str(e)[:300])
+    steps.append({"name": "syntaxe", "ok": not errs,
+                  "log": (str(len(py_files)) + " fichier(s) OK") if not errs else NL.join(errs)})
+
+    # 2. Installation propre dans un venv dedie (si requirements.txt)
+    py_exe = sys.executable
+    if (base / "requirements.txt").exists():
+        venv_dir = PROJECTS / ".ci" / str(task_id) / "venv"
+        venv_dir.parent.mkdir(parents=True, exist_ok=True)
+        code, vlog = await _proc_run([sys.executable, "-m", "venv", str(venv_dir)], base, 120)
+        cand = _venv_python(venv_dir)
+        if code == 0 and cand.exists():
+            py_exe = str(cand)
+            code, ilog = await _proc_run([py_exe, "-m", "pip", "install", "-q", "-r", "requirements.txt"], base, 300)
+            steps.append({"name": "install (venv)", "ok": code == 0, "log": ilog or "OK"})
+        else:
+            steps.append({"name": "install (venv)", "ok": False, "log": "Creation du venv echouee: " + vlog})
+    else:
+        steps.append({"name": "install (venv)", "ok": True, "log": "Pas de requirements.txt (ignore)."})
+
+    # 3. Tests unitaires (pytest)
+    code, tlog = await _proc_run([py_exe, "-m", "pytest", "-q"], base, 180)
+    # pytest renvoie 5 quand aucun test collecte -> on ne compte pas ca comme un echec
+    steps.append({"name": "pytest", "ok": code in (0, 5), "log": tlog or "(aucune sortie)"})
+
+    # 4. Ping HTTP /
+    steps.append(await _build_ping(folder, py_exe))
+
+    status = "success" if all(s["ok"] for s in steps) else "failed"
+    report = json.dumps(steps, ensure_ascii=False)
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        await db.execute("INSERT INTO builds (task_id, status, report, created_at) VALUES (?,?,?,?)",
+                         (task_id, status, report, datetime.utcnow().isoformat()))
+        await db.commit()
+    return {"status": status, "steps": steps}
+
+
+@router.post("/api/tasks/{task_id}/build")
+async def build_task(task_id: int):
+    t = await db_get_task(task_id)
+    if not t:
+        raise HTTPException(404, "Tache introuvable")
+    return await _run_build(task_id, t["folder"])
+
+
+@router.get("/api/tasks/{task_id}/builds")
+async def list_builds(task_id: int):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, status, report, created_at FROM builds WHERE task_id=? ORDER BY id DESC LIMIT 20",
+            (task_id,)) as cur:
+            rows = await cur.fetchall()
+    out = []
+    for r in rows:
+        try:
+            steps = json.loads(r["report"])
+        except Exception:
+            steps = []
+        out.append({"id": r["id"], "status": r["status"], "steps": steps, "created_at": r["created_at"]})
+    return {"builds": out}
+
+
 @router.get("/api/tasks")
 async def list_tasks():
     return await db_list_tasks()
@@ -1566,6 +1729,9 @@ async def delete_task(task_id: int):
     t = await db_get_task(task_id)
     if t:
         shutil.rmtree(t["folder"], ignore_errors=True)
+    # Nettoyer aussi le venv de CI et les snapshots (sinon orphelins, ~50 Mo+).
+    shutil.rmtree(PROJECTS / ".ci" / str(task_id), ignore_errors=True)
+    shutil.rmtree(PROJECTS / ".snapshots" / str(task_id), ignore_errors=True)
     await db_delete_task(task_id)
     return {"deleted": True}
 

@@ -201,10 +201,12 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
       <button class="btn btn-ghost btn-small" onclick="launchApp()">Lancer l'app</button>
       <button class="btn btn-ghost btn-small" onclick="stopApp()">Arreter l'app</button>
       <button class="btn btn-ghost btn-small" onclick="exportApp()">Exporter (zip)</button>
+      <button class="btn btn-ghost btn-small" onclick="runBuild()">Build &amp; Test</button>
       <button class="btn btn-ghost btn-small" onclick="newTask()">Nouvel objectif</button>
     </div>
     <div id="result-area"></div>
     <div id="launch-area"></div>
+    <div id="build-area"></div>
     <div id="feed"></div>
     <div class="chat-bar">
       <input id="chat-input" placeholder="Message a l'equipe (changer / ajouter une consigne)..."
@@ -337,6 +339,7 @@ function startLive() {
   document.getElementById('team-list').innerHTML = '<p class="muted">En attente du chef...</p>';
   document.getElementById('result-area').innerHTML = '';
   document.getElementById('launch-area').innerHTML = '';
+  document.getElementById('build-area').innerHTML = '';
   document.getElementById('chat-input').value = '';
   document.getElementById('file-edit').style.display = 'none';
   document.getElementById('editor-bar').style.display = 'none';
@@ -529,6 +532,42 @@ async function saveCurrentFile() {
 function exportApp() {
   if (!taskId) return;
   window.open('/api/tasks/' + taskId + '/export', '_blank');
+}
+
+// ── CI locale : Build & Test (#16) ──────────────────────────────────────────────
+function renderSteps(steps) {
+  return (steps || []).map(function(s) {
+    return '<div style="margin-top:4px"><b>' + (s.ok ? '✅' : '❌') + ' ' + esc(s.name) + '</b>'
+      + '<details><summary class="muted">log</summary><pre>' + esc(s.log || '') + '</pre></details></div>';
+  }).join('');
+}
+
+async function runBuild() {
+  if (!taskId) return;
+  var el = document.getElementById('build-area');
+  el.innerHTML = '<div class="msg sys">Build &amp; test en cours (peut prendre une minute)...</div>';
+  try {
+    var r = await (await fetch('/api/tasks/' + taskId + '/build', {method: 'POST'})).json();
+    var ok = r.status === 'success';
+    el.innerHTML = '<div class="msg" style="border-left:4px solid ' + (ok ? 'var(--green)' : 'var(--red)')
+      + '"><div class="who">Build ' + (ok ? 'réussi' : 'échoué') + '</div>' + renderSteps(r.steps) + '</div>';
+    loadBuilds();
+  } catch (e) { el.innerHTML = '<div class="msg err">Build impossible.</div>'; }
+}
+
+async function loadBuilds() {
+  if (!taskId) return;
+  try {
+    var d = await (await fetch('/api/tasks/' + taskId + '/builds')).json();
+    if (!d.builds || !d.builds.length) return;
+    var hist = d.builds.map(function(b) {
+      return '<span class="badge ' + (b.status === 'success' ? 'done' : 'failed') + '">'
+        + (b.status === 'success' ? 'OK' : 'KO') + '</span> '
+        + '<span class="muted">' + esc((b.created_at || '').replace('T', ' ').slice(0, 19)) + '</span>';
+    }).join('<br>');
+    var box = document.getElementById('build-area');
+    box.innerHTML += '<div class="msg sys"><b>Historique des builds</b><br>' + hist + '</div>';
+  } catch (e) {}
 }
 
 // ── Inspecteur de prompt + time-travel (#18) ────────────────────────────────────
