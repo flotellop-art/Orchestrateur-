@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -62,8 +63,10 @@ COMMAND_WHITELIST = {
 
 _client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# task_id -> {"task": asyncio.Task, "pause": asyncio.Event, "step": bool}
+# task_id -> {"task": asyncio.Task, "pause": asyncio.Event, "step": bool, "inbox": list}
 running_tasks: dict[int, dict] = {}
+# task_id -> {"proc": Process, "url": str|None, "output": list}
+launched_apps: dict[int, dict] = {}
 
 NL = chr(10)
 
@@ -720,6 +723,13 @@ async def _run_task(task_id):
             if await _is_stopped(task_id):
                 break
 
+            ctrl = running_tasks.get(task_id)
+            if ctrl and ctrl.get("inbox"):
+                pending, ctrl["inbox"] = ctrl["inbox"], []
+                for um in pending:
+                    chef_messages.append({"role": "user", "content":
+                        "Nouvelle consigne de l'utilisateur (integre-la a l'objectif courant) : " + um})
+
             iteration += 1
             await db_update_task(task_id, iteration=iteration)
             await emit(task_id, iteration, "chef", "turn_start", {"iteration": iteration})
@@ -870,7 +880,7 @@ async def start_task(task_id: int):
         return {"status": "already_running"}
     pause = asyncio.Event()
     pause.set()  # set = en marche ; clear = en pause
-    running_tasks[task_id] = {"pause": pause, "step": False}
+    running_tasks[task_id] = {"pause": pause, "step": False, "inbox": []}
     coro = _run_task(task_id)
     running_tasks[task_id]["task"] = asyncio.create_task(coro)
     return {"status": "running"}
@@ -918,8 +928,122 @@ async def stop_task(task_id: int):
     ctrl = running_tasks.get(task_id)
     if ctrl:
         ctrl["pause"].set()  # debloque la boucle pour qu'elle constate l'arret
+    await _stop_launched(task_id)
     await emit(task_id, 0, "systeme", "stopped", {})
     return {"status": "stopped"}
+
+
+class TaskMessage(BaseModel):
+    text: str
+
+
+@router.post("/api/tasks/{task_id}/message")
+async def task_message(task_id: int, body: TaskMessage):
+    ctrl = running_tasks.get(task_id)
+    if not ctrl:
+        raise HTTPException(404, "Tache non active (terminee ou arretee)")
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "Message vide")
+    ctrl.setdefault("inbox", []).append(text)
+    t = await db_get_task(task_id)
+    await emit(task_id, t["iteration"] if t else 0, "utilisateur", "user_message", {"content": text})
+    return {"queued": True}
+
+
+# ── Lancement de l'app produite ──────────────────────────────────────────────
+WEB_ENTRYPOINTS = ["app.py", "main.py", "server.py", "run.py"]
+
+
+async def _stop_launched(task_id):
+    info = launched_apps.pop(task_id, None)
+    if info and info.get("proc") and info["proc"].returncode is None:
+        try:
+            info["proc"].terminate()
+        except Exception:
+            pass
+
+
+async def _drain_proc(task_id, proc):
+    try:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            info = launched_apps.get(task_id)
+            if info is None:
+                break
+            info["output"].append(line.decode("utf-8", "replace"))
+            info["output"] = info["output"][-200:]
+    except Exception:
+        pass
+
+
+async def _launch_python_app(task_id, base, name):
+    await _stop_launched(task_id)
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, name, cwd=str(base),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    launched_apps[task_id] = {"proc": proc, "url": None, "output": []}
+    url, lines = None, []
+    for _ in range(15):
+        try:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.5)
+        except asyncio.TimeoutError:
+            break
+        if not line:
+            break
+        text = line.decode("utf-8", "replace")
+        lines.append(text)
+        m = re.search(r"https?://[^\s'\"]+", text)
+        if m:
+            url = m.group(0)
+            break
+        m2 = re.search(r"port[^\d]{0,6}(\d{2,5})", text, re.IGNORECASE)
+        if m2:
+            url = "http://localhost:" + m2.group(1)
+            break
+    launched_apps[task_id]["output"] = lines
+    launched_apps[task_id]["url"] = url
+    asyncio.create_task(_drain_proc(task_id, proc))
+    return {"type": "python", "entry": name, "url": url,
+            "running": proc.returncode is None, "output": "".join(lines)[-1500:]}
+
+
+@router.post("/api/tasks/{task_id}/launch")
+async def launch_app(task_id: int):
+    t = await db_get_task(task_id)
+    if not t:
+        raise HTTPException(404, "Tache introuvable")
+    base = Path(t["folder"])
+    for name in WEB_ENTRYPOINTS:
+        if (base / name).exists():
+            return await _launch_python_app(task_id, base, name)
+    htmls = [f for f in _list_files(t["folder"]) if f.endswith(".html")]
+    if htmls:
+        target = "index.html" if "index.html" in htmls else htmls[0]
+        return {"type": "static", "url": "/api/tasks/" + str(task_id) + "/app/" + target}
+    return {"type": "none", "message": "Aucun point d'entree lancable (app.py/main.py/index.html)."}
+
+
+@router.post("/api/tasks/{task_id}/launch/stop")
+async def launch_stop(task_id: int):
+    await _stop_launched(task_id)
+    return {"stopped": True}
+
+
+@router.get("/api/tasks/{task_id}/app/{path:path}")
+async def serve_app(task_id: int, path: str):
+    t = await db_get_task(task_id)
+    if not t:
+        raise HTTPException(404, "Tache introuvable")
+    try:
+        p = _safe_path(t["folder"], path)
+    except ValueError:
+        raise HTTPException(400, "Chemin invalide")
+    if not p.exists() or not p.is_file():
+        raise HTTPException(404, "Fichier introuvable")
+    return FileResponse(p)
 
 
 @router.get("/api/tasks")

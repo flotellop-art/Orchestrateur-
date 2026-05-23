@@ -89,6 +89,11 @@ textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
 .msg pre { white-space: pre-wrap; word-break: break-word; margin-top: 6px;
   background: rgba(0,0,0,.04); padding: 8px; border-radius: 6px; max-height: 240px; overflow: auto; }
 .msg ul { margin: 6px 0 0 18px; font-size: .85rem; line-height: 1.5; }
+.msg.user { border-left: 4px solid var(--purple); background: #f3effa; }
+.msg.user .who { color: var(--purple); }
+.chat-bar { position: sticky; bottom: 0; display: flex; gap: 7px; background: var(--bg);
+  padding: 10px 0; border-top: 1px solid var(--border); margin-top: 10px; }
+.chat-bar input { flex: 1; }
 details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 
 .file-item { padding: 7px 10px; background: var(--white); border-radius: 7px; margin-bottom: 6px;
@@ -176,10 +181,19 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
       <button class="btn btn-ghost btn-small" id="btn-resume" onclick="ctrl('resume')" style="display:none">Reprendre</button>
       <button class="btn btn-ghost btn-small" id="btn-step" onclick="ctrl('step')">Etape</button>
       <button class="btn btn-ghost btn-small" onclick="ctrl('stop')">Arreter</button>
+      <button class="btn btn-ghost btn-small" onclick="launchApp()">Lancer l'app</button>
+      <button class="btn btn-ghost btn-small" onclick="stopApp()">Arreter l'app</button>
       <button class="btn btn-ghost btn-small" onclick="newTask()">Nouvel objectif</button>
     </div>
     <div id="result-area"></div>
+    <div id="launch-area"></div>
     <div id="feed"></div>
+    <div class="chat-bar">
+      <input id="chat-input" placeholder="Message a l'equipe (changer / ajouter une consigne)..."
+        onkeydown="if(event.key==='Enter')sendMessage()">
+      <button class="btn btn-primary btn-small" onclick="sendMessage()">Envoyer</button>
+      <button class="btn btn-ghost btn-small" onclick="newTaskFromMessage()">Nouvelle tache</button>
+    </div>
   </div>
 
   <div class="panel panel-files">
@@ -266,6 +280,8 @@ function startLive() {
   document.getElementById('feed').innerHTML = '';
   document.getElementById('team-list').innerHTML = '<p class="muted">En attente du chef...</p>';
   document.getElementById('result-area').innerHTML = '';
+  document.getElementById('launch-area').innerHTML = '';
+  document.getElementById('chat-input').value = '';
   teamNames = {};
   setStatus('running');
   connectStream();
@@ -334,6 +350,9 @@ function handleEvent(ev) {
       break;
     case 'files_changed':
       renderFiles(ev.list);
+      break;
+    case 'user_message':
+      feedAdd('<div class="msg user"><div class="who">Vous</div><div>' + esc(ev.content) + '</div></div>');
       break;
     case 'info':
       feedAdd('<div class="msg sys">' + esc(ev.msg) + '</div>');
@@ -410,6 +429,66 @@ async function viewFile(path) {
     v.textContent = d.content;
     v.classList.add('show');
   } catch(e) {}
+}
+
+// ── Lancer l'app produite ─────────────────────────────────────────────────────
+async function launchApp() {
+  if (!taskId) return;
+  var el = document.getElementById('launch-area');
+  el.innerHTML = '<div class="msg sys">Lancement en cours...</div>';
+  try {
+    var r = await (await fetch('/api/tasks/' + taskId + '/launch', {method: 'POST'})).json();
+    if (r.type === 'none') { el.innerHTML = '<div class="msg sys">' + esc(r.message || 'Rien a lancer.') + '</div>'; return; }
+    if (r.url) {
+      var full = r.url.indexOf('http') === 0 ? r.url : (location.origin + r.url);
+      el.innerHTML = '<div class="result-box"><h4>App lancee</h4><a href="' + esc(full)
+        + '" target="_blank">' + esc(full) + '</a></div>';
+      window.open(full, '_blank');
+    } else {
+      el.innerHTML = '<div class="msg tool"><div class="who">App demarree (' + esc(r.entry || '') + ')</div>'
+        + '<pre>' + esc(r.output || '(pas de sortie)') + '</pre>'
+        + '<div class="muted">URL non detectee automatiquement, voir la sortie ci-dessus.</div></div>';
+    }
+  } catch (e) { el.innerHTML = '<div class="msg err">Echec du lancement.</div>'; }
+}
+
+async function stopApp() {
+  if (!taskId) return;
+  await fetch('/api/tasks/' + taskId + '/launch/stop', {method: 'POST'});
+  document.getElementById('launch-area').innerHTML = '<div class="msg sys">App arretee.</div>';
+}
+
+// ── Chat : piloter la tache en cours / nouvelle tache ─────────────────────────
+async function sendMessage() {
+  var inp = document.getElementById('chat-input');
+  var t = inp.value.trim();
+  if (!t || !taskId) return;
+  inp.value = '';
+  var r = await fetch('/api/tasks/' + taskId + '/message', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: t})
+  });
+  if (!r.ok) {
+    var d = await r.json();
+    feedAdd('<div class="msg err">' + esc(d.detail || 'Envoi impossible (tache terminee ?)') + '</div>');
+  }
+}
+
+async function newTaskFromMessage() {
+  var inp = document.getElementById('chat-input');
+  var t = inp.value.trim();
+  if (!t) return;
+  inp.value = '';
+  var chefSel = document.getElementById('chef-model');
+  var body = {
+    objective: t, chef_model: chefSel ? chefSel.value : 'claude-opus-4-7',
+    web_enabled: true, max_iterations: 15, max_agents: 4
+  };
+  var d = await (await fetch('/api/tasks', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+  })).json();
+  taskId = d.id;
+  await fetch('/api/tasks/' + taskId + '/start', {method: 'POST'});
+  startLive();
 }
 
 function newTask() {
