@@ -65,6 +65,8 @@ COMMAND_WHITELIST = {
     "ls", "cat", "echo", "pwd", "head", "tail", "wc",
     "node", "npm",
 }
+# Outils sans effet de bord -> executables en parallele (#15).
+PARALLEL_SAFE_TOOLS = {"web_search", "read_file", "search_knowledge", "mcp_call"}
 
 _client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -126,6 +128,17 @@ async def init_team_db():
             await db.execute("ALTER TABLE tasks ADD COLUMN image_path TEXT")
         except Exception:
             pass
+        # Prompts envoyes a l'API, pour l'inspecteur (#18).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS prompts (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id    INTEGER NOT NULL,
+                iteration  INTEGER DEFAULT 0,
+                agent      TEXT DEFAULT '',
+                payload    TEXT DEFAULT '',
+                created_at TEXT
+            )
+        """)
         # Memoire long terme partagee (inter-taches). FTS5 si dispo, sinon table simple.
         global _KNOWLEDGE_FTS
         try:
@@ -216,6 +229,25 @@ async def emit(task_id, iteration, agent, kind, payload: dict):
              datetime.utcnow().isoformat()),
         )
         await db.commit()
+
+
+async def _log_prompt(task_id, iteration, agent, system, messages):
+    payload = json.dumps({"system": system, "messages": messages}, ensure_ascii=False, default=str)[:50000]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO prompts (task_id, iteration, agent, payload, created_at) VALUES (?,?,?,?,?)",
+            (task_id, iteration, agent, payload, datetime.utcnow().isoformat()))
+        await db.commit()
+
+
+def _snapshot(task_id, folder, iteration):
+    dest = PROJECTS / ".snapshots" / str(task_id) / ("iter_" + str(iteration))
+    try:
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(folder, dest)
+    except Exception as e:
+        log.warning("snapshot iter %s echec: %s", iteration, e)
 
 
 async def db_messages_after(task_id, after_id):
@@ -781,6 +813,10 @@ A CHAQUE TOUR, reponds UNIQUEMENT avec un objet JSON (aucun texte autour) decriv
 - Confier une sous-tache a un agent existant :
   {{"thought":"...","action":"assign_task","agent":"NomDeLAgent","instruction":"consigne precise et autonome"}}
 
+- Confier PLUSIEURS sous-taches EN PARALLELE (gagne du temps) :
+  {{"thought":"...","action":"parallel_assign","assignments":[{{"agent":"DevA","instruction":"le frontend"}},{{"agent":"DevB","instruction":"le backend"}}]}}
+  IMPORTANT : n'utilise le parallele que si les agents travaillent sur des FICHIERS DISJOINTS (sinon risque de conflits).
+
 - Lancer un CHALLENGE (verification croisee entre les trois modeles) :
   {{"thought":"...","action":"challenge","instruction":"consigne precise","rounds":2}}
   Un Producteur (Claude par defaut) realise le travail, puis les DEUX autres modeles (Gemini et ChatGPT)
@@ -861,6 +897,7 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
         await _wait_if_paused(task_id)
         if await _is_stopped(task_id):
             break
+        await _log_prompt(task_id, iteration, name, system, hist)
         raw = await call_model(agent["provider"], agent["model"], system, hist,
                                on_notice=notice, image=image)
         hist.append({"role": "assistant", "content": raw})
@@ -870,14 +907,25 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
         if thought:
             await emit(task_id, iteration, name, "agent_message", {"kind": "thought", "content": thought})
 
-        results = []
-        touched = False
-        for act in data.get("actions", []) or []:
+        async def _exec_one(act):
             tool = act.get("tool")
             await emit(task_id, iteration, name, "tool_call",
                        {"tool": tool, "input": {k: v for k, v in act.items() if k != "tool"}})
             out = await execute_tool(task_id, folder, web_enabled, act)
             await emit(task_id, iteration, name, "tool_result", {"tool": tool, "output": out[:1500]})
+            return tool, out
+
+        actions = data.get("actions", []) or []
+        # Lecture seule -> parallelisable (#15) ; mutations -> sequentiel (evite les races fichiers).
+        parallel = [a for a in actions if a.get("tool") in PARALLEL_SAFE_TOOLS]
+        sequential = [a for a in actions if a.get("tool") not in PARALLEL_SAFE_TOOLS]
+        results = []
+        touched = False
+        if parallel:
+            for tool, out in await asyncio.gather(*[_exec_one(a) for a in parallel]):
+                results.append("[" + str(tool) + "] " + out)
+        for act in sequential:
+            tool, out = await _exec_one(act)
             results.append("[" + str(tool) + "] " + out)
             if tool in ("write_file", "run_command", "run_tests"):
                 touched = True
@@ -942,6 +990,8 @@ async def _run_critic(task_id, iteration, critic_agent, instruction, producer_re
             + NL + NL + "Rapport du producteur :" + NL + (producer_report or "(aucun)")
             + NL + NL + "Fichiers produits :" + NL + files_blob
             + NL + NL + "Evalue de facon critique. Reponds en JSON.")
+    await _log_prompt(task_id, iteration, critic_agent["name"], CRITIC_SYSTEM,
+                      [{"role": "user", "content": user}])
     raw = await call_model(critic_agent["provider"], critic_agent["model"],
                            CRITIC_SYSTEM, [{"role": "user", "content": user}], on_notice=notice, image=image)
     data = _extract_json(raw) or {}
@@ -1056,6 +1106,7 @@ async def _run_task(task_id):
             iteration += 1
             await db_update_task(task_id, iteration=iteration)
             await emit(task_id, iteration, "chef", "turn_start", {"iteration": iteration})
+            await asyncio.to_thread(_snapshot, task_id, folder, iteration)  # #18 time-travel
 
             team = await db_list_agents(task_id)
             files = _list_files(folder)
@@ -1064,6 +1115,7 @@ async def _run_task(task_id):
                    + NL + "Fichiers du dossier : " + (", ".join(files) or "(aucun)")
                    + NL + "Prochaine action ? Reponds en JSON.")
             chef_messages.append({"role": "user", "content": ctx})
+            await _log_prompt(task_id, iteration, "chef", chef_system, chef_messages)
             raw = await call_model("claude", chef_model, chef_system, chef_messages, on_notice=notice)
             chef_messages.append({"role": "assistant", "content": raw})
 
@@ -1114,6 +1166,25 @@ async def _run_task(task_id):
                                            folder, web_enabled, worker_histories, notice, image)
                 chef_messages.append({"role": "user", "content":
                                       "Rapport de " + target + " : " + report[:2000]})
+                continue
+
+            if action == "parallel_assign":
+                assigns = decision.get("assignments", []) or []
+                coros, names = [], []
+                for a in assigns:
+                    ag = await db_get_agent(task_id, (a.get("agent") or "").strip())
+                    if ag:
+                        coros.append(_run_worker(task_id, iteration, ag, a.get("instruction", ""),
+                                                 folder, web_enabled, worker_histories, notice, image))
+                        names.append(ag["name"])
+                if not coros:
+                    chef_messages.append({"role": "user", "content":
+                                          "parallel_assign : aucun agent valide. Cree-les d'abord."})
+                    continue
+                reports = await asyncio.gather(*coros)
+                summary = NL.join(names[i] + " : " + reports[i][:600] for i in range(len(names)))
+                chef_messages.append({"role": "user", "content":
+                                      "Rapports paralleles :" + NL + summary})
                 continue
 
             if action == "challenge":
@@ -1481,6 +1552,70 @@ async def delete_task(task_id: int):
         shutil.rmtree(t["folder"], ignore_errors=True)
     await db_delete_task(task_id)
     return {"deleted": True}
+
+
+@router.get("/api/tasks/{task_id}/prompts")
+async def get_prompts(task_id: int, iteration: int = Query(None), agent: str = Query(None)):
+    q = "SELECT iteration, agent, payload FROM prompts WHERE task_id=?"
+    params = [task_id]
+    if iteration is not None:
+        q += " AND iteration=?"
+        params.append(iteration)
+    if agent:
+        q += " AND agent=?"
+        params.append(agent)
+    q += " ORDER BY id DESC LIMIT 1"
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(q, params) as cur:
+            row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Aucun prompt enregistre")
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        payload = {"raw": row["payload"]}
+    return {"iteration": row["iteration"], "agent": row["agent"], "prompt": payload}
+
+
+class RevertBody(BaseModel):
+    iteration: int
+
+
+@router.post("/api/tasks/{task_id}/revert")
+async def revert_task(task_id: int, body: RevertBody):
+    if task_id in running_tasks:
+        raise HTTPException(400, "Arrete la tache avant de revenir en arriere.")
+    t = await db_get_task(task_id)
+    if not t:
+        raise HTTPException(404, "Tache introuvable")
+    n = body.iteration
+    snap = PROJECTS / ".snapshots" / str(task_id) / ("iter_" + str(n))
+    folder = Path(t["folder"])
+
+    def _restore():
+        if not snap.exists():
+            return False
+        for child in folder.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink()
+        for item in snap.iterdir():
+            dst = folder / item.name
+            if item.is_dir():
+                shutil.copytree(item, dst)
+            else:
+                shutil.copy2(item, dst)
+        return True
+
+    restored = await asyncio.to_thread(_restore)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM messages WHERE task_id=? AND iteration>?", (task_id, n))
+        await db.execute("DELETE FROM prompts WHERE task_id=? AND iteration>?", (task_id, n))
+        await db.commit()
+    await db_update_task(task_id, iteration=n, status="stopped")
+    return {"reverted_to": n, "files_restored": restored}
 
 
 @router.get("/api/tasks/{task_id}/files")

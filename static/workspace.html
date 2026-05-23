@@ -94,6 +94,14 @@ textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
 .chat-bar { position: sticky; bottom: 0; display: flex; gap: 7px; background: var(--bg);
   padding: 10px 0; border-top: 1px solid var(--border); margin-top: 10px; }
 .chat-bar input { flex: 1; }
+.overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5);
+  z-index: 50; align-items: center; justify-content: center; }
+.overlay-box { background: var(--white); border-radius: var(--r); width: min(820px, 92vw);
+  max-height: 86vh; display: flex; flex-direction: column; box-shadow: var(--sh); }
+.overlay-head { display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 18px; border-bottom: 1px solid var(--border); }
+.overlay-box pre { margin: 0; padding: 16px; overflow: auto; white-space: pre-wrap;
+  word-break: break-word; font-family: ui-monospace, monospace; font-size: .78rem; }
 details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 
 .file-item { padding: 7px 10px; background: var(--white); border-radius: 7px; margin-bottom: 6px;
@@ -218,6 +226,17 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
     </div>
     <textarea id="file-edit" class="file-view" style="display:none;width:100%;height:50vh;color:#e6e6e6"
       spellcheck="false"></textarea>
+  </div>
+</div>
+
+<!-- Inspecteur de prompt (#18) -->
+<div id="prompt-overlay" class="overlay" onclick="if(event.target===this)closePrompt()">
+  <div class="overlay-box">
+    <div class="overlay-head">
+      <b id="prompt-title">Prompt</b>
+      <button class="btn btn-ghost btn-small" onclick="closePrompt()">Fermer</button>
+    </div>
+    <pre id="prompt-content"></pre>
   </div>
 </div>
 
@@ -362,7 +381,10 @@ function handleEvent(ev) {
   switch (ev.type) {
     case 'turn_start':
       document.getElementById('turn-info').textContent = 'Tour ' + ev.iteration;
-      feedAdd('<div class="msg turn">— Tour ' + ev.iteration + ' —</div>');
+      var it = ev.iteration;
+      feedAdd('<div class="msg turn">— Tour ' + it + ' — '
+        + '<a href="#" style="color:#9cf" onclick="showPrompt(' + it + ',&quot;chef&quot;);return false">prompt</a>'
+        + ' &middot; <a href="#" style="color:#fc9" onclick="revertTo(' + it + ');return false">revenir ici</a></div>');
       setActive('Chef');
       break;
     case 'chef':
@@ -507,6 +529,44 @@ async function saveCurrentFile() {
 function exportApp() {
   if (!taskId) return;
   window.open('/api/tasks/' + taskId + '/export', '_blank');
+}
+
+// ── Inspecteur de prompt + time-travel (#18) ────────────────────────────────────
+async function showPrompt(iteration, agent) {
+  try {
+    var d = await (await fetch('/api/tasks/' + taskId + '/prompts?iteration=' + iteration
+      + '&agent=' + encodeURIComponent(agent))).json();
+    var p = d.prompt || {};
+    var txt = 'SYSTEM:\n' + (p.system || '(vide)') + '\n\n=== HISTORIQUE ENVOYE A L\'API ===\n'
+      + (p.messages || []).map(function(m) {
+          var c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+          return '[' + m.role + ']\n' + c;
+        }).join('\n\n');
+    document.getElementById('prompt-title').textContent = 'Prompt — tour ' + d.iteration + ' (' + d.agent + ')';
+    document.getElementById('prompt-content').textContent = txt;
+    document.getElementById('prompt-overlay').style.display = 'flex';
+  } catch (e) { alert('Aucun prompt enregistre pour ce tour.'); }
+}
+
+function closePrompt() { document.getElementById('prompt-overlay').style.display = 'none'; }
+
+async function revertTo(iteration) {
+  if (!taskId) return;
+  if (!confirm('Revenir au tour ' + iteration + ' ? Les tours suivants ET les fichiers seront restaures a cet etat.')) return;
+  await fetch('/api/tasks/' + taskId + '/stop', {method: 'POST'});
+  var r = await fetch('/api/tasks/' + taskId + '/revert', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({iteration: iteration})
+  });
+  if (!r.ok) { alert('Retour impossible (la tache est-elle bien arretee ?).'); return; }
+  if (evtSource) evtSource.close();
+  document.getElementById('feed').innerHTML = '';
+  document.getElementById('team-list').innerHTML = '<p class="muted">Etat restaure au tour ' + iteration + '.</p>';
+  document.getElementById('agent-graph').innerHTML = '';
+  teamNames = {}; graphAgents = []; activeAgent = null;
+  connectStream();
+  refreshFiles();
+  setStatus('stopped');
 }
 
 // ── Graphe des agents (#11) ─────────────────────────────────────────────────────
