@@ -65,8 +65,9 @@ COMMAND_WHITELIST = {
     "ls", "cat", "echo", "pwd", "head", "tail", "wc",
     "node", "npm",
 }
-# Outils sans effet de bord -> executables en parallele (#15).
-PARALLEL_SAFE_TOOLS = {"web_search", "read_file", "search_knowledge", "mcp_call"}
+# Outils strictement passifs -> executables en parallele (#15).
+# mcp_call exclu : certains serveurs MCP mutent l'etat (filesystem, memory...).
+PARALLEL_SAFE_TOOLS = {"web_search", "read_file", "search_knowledge"}
 
 _client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -85,7 +86,8 @@ def sse(data: dict) -> str:
 
 # ── Base de donnees ─────────────────────────────────────────────────────────
 async def init_team_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        await db.execute("PRAGMA journal_mode=WAL")  # ecritures concurrentes (workers paralleles)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,7 +156,7 @@ async def init_team_db():
 
 
 async def db_create_task(objective, folder, max_iterations, max_agents, web_enabled, chef_model):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         cur = await db.execute(
             "INSERT INTO tasks (objective,folder,status,max_iterations,max_agents,web_enabled,chef_model,created_at)"
             " VALUES (?,?,?,?,?,?,?,?)",
@@ -166,7 +168,7 @@ async def db_create_task(objective, folder, max_iterations, max_agents, web_enab
 
 
 async def db_get_task(task_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)) as cur:
             row = await cur.fetchone()
@@ -174,7 +176,7 @@ async def db_get_task(task_id):
 
 
 async def db_list_tasks():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM tasks ORDER BY created_at DESC") as cur:
             return [dict(r) for r in await cur.fetchall()]
@@ -183,13 +185,13 @@ async def db_list_tasks():
 async def db_update_task(task_id, **kwargs):
     sets = ", ".join(k + "=?" for k in kwargs)
     vals = list(kwargs.values()) + [task_id]
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         await db.execute("UPDATE tasks SET " + sets + " WHERE id=?", vals)
         await db.commit()
 
 
 async def db_delete_task(task_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         await db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
         await db.execute("DELETE FROM task_agents WHERE task_id=?", (task_id,))
         await db.execute("DELETE FROM messages WHERE task_id=?", (task_id,))
@@ -197,7 +199,7 @@ async def db_delete_task(task_id):
 
 
 async def db_add_agent(task_id, name, role, provider, model, created_by):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         await db.execute(
             "INSERT INTO task_agents (task_id,name,role,provider,model,created_by,created_at)"
             " VALUES (?,?,?,?,?,?,?)",
@@ -207,14 +209,14 @@ async def db_add_agent(task_id, name, role, provider, model, created_by):
 
 
 async def db_list_agents(task_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM task_agents WHERE task_id=? ORDER BY id", (task_id,)) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
 
 async def db_get_agent(task_id, name):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM task_agents WHERE task_id=? AND name=?", (task_id, name)) as cur:
             row = await cur.fetchone()
@@ -222,7 +224,7 @@ async def db_get_agent(task_id, name):
 
 
 async def emit(task_id, iteration, agent, kind, payload: dict):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         await db.execute(
             "INSERT INTO messages (task_id,iteration,agent,kind,content,created_at) VALUES (?,?,?,?,?,?)",
             (task_id, iteration, agent, kind, json.dumps(payload, ensure_ascii=False),
@@ -233,11 +235,15 @@ async def emit(task_id, iteration, agent, kind, payload: dict):
 
 async def _log_prompt(task_id, iteration, agent, system, messages):
     payload = json.dumps({"system": system, "messages": messages}, ensure_ascii=False, default=str)[:50000]
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         await db.execute(
             "INSERT INTO prompts (task_id, iteration, agent, payload, created_at) VALUES (?,?,?,?,?)",
             (task_id, iteration, agent, payload, datetime.utcnow().isoformat()))
         await db.commit()
+
+
+_SNAPSHOT_IGNORE = shutil.ignore_patterns(
+    ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".git")
 
 
 def _snapshot(task_id, folder, iteration):
@@ -245,13 +251,13 @@ def _snapshot(task_id, folder, iteration):
     try:
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
-        shutil.copytree(folder, dest)
+        shutil.copytree(folder, dest, ignore=_SNAPSHOT_IGNORE)  # exclut les dossiers lourds
     except Exception as e:
         log.warning("snapshot iter %s echec: %s", iteration, e)
 
 
 async def db_messages_after(task_id, after_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM messages WHERE task_id=? AND id>? ORDER BY id", (task_id, after_id)
@@ -730,7 +736,7 @@ async def _save_knowledge(content):
     content = (content or "").strip()
     if not content:
         return "Rien a memoriser."
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         await db.execute("INSERT INTO knowledge (content, created_at) VALUES (?,?)",
                          (content[:4000], datetime.utcnow().isoformat()))
         await db.commit()
@@ -741,7 +747,7 @@ async def _search_knowledge(query):
     query = (query or "").strip()
     if not query:
         return "Requete vide."
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         db.row_factory = aiosqlite.Row
         rows = []
         if _KNOWLEDGE_FTS:
@@ -815,7 +821,7 @@ A CHAQUE TOUR, reponds UNIQUEMENT avec un objet JSON (aucun texte autour) decriv
 
 - Confier PLUSIEURS sous-taches EN PARALLELE (gagne du temps) :
   {{"thought":"...","action":"parallel_assign","assignments":[{{"agent":"DevA","instruction":"le frontend"}},{{"agent":"DevB","instruction":"le backend"}}]}}
-  IMPORTANT : n'utilise le parallele que si les agents travaillent sur des FICHIERS DISJOINTS (sinon risque de conflits).
+  IMPORTANT : agents DISTINCTS et FICHIERS DISJOINTS uniquement (sinon risque de conflits).
 
 - Lancer un CHALLENGE (verification croisee entre les trois modeles) :
   {{"thought":"...","action":"challenge","instruction":"consigne precise","rounds":2}}
@@ -881,9 +887,10 @@ async def _is_stopped(task_id) -> bool:
 
 # ── Moteur : un worker execute une sous-tache ───────────────────────────────
 async def _run_worker(task_id, iteration, agent, instruction, folder, web_enabled,
-                      worker_histories, notice, image=None) -> str:
+                      worker_histories, notice, image=None, custom_hist=None) -> str:
     name = agent["name"]
-    hist = worker_histories.setdefault(name, [])
+    # custom_hist : historique isole (assignations paralleles au meme agent) ; sinon partage.
+    hist = custom_hist if custom_hist is not None else worker_histories.setdefault(name, [])
     hist.append({"role": "user", "content":
                  "Mission du chef : " + instruction + NL + NL + "Reponds en JSON avec tes actions."})
     system = WORKER_SYSTEM.format(
@@ -1170,12 +1177,21 @@ async def _run_task(task_id):
 
             if action == "parallel_assign":
                 assigns = decision.get("assignments", []) or []
+                # Compter les doublons : un agent assigne plusieurs fois en parallele
+                # doit recevoir un historique CLONE par branche (evite l'entrelacement).
+                counts = {}
+                for a in assigns:
+                    nm = (a.get("agent") or "").strip()
+                    counts[nm] = counts.get(nm, 0) + 1
                 coros, names = [], []
                 for a in assigns:
-                    ag = await db_get_agent(task_id, (a.get("agent") or "").strip())
+                    nm = (a.get("agent") or "").strip()
+                    ag = await db_get_agent(task_id, nm)
                     if ag:
+                        hist = list(worker_histories.setdefault(nm, [])) if counts[nm] > 1 else None
                         coros.append(_run_worker(task_id, iteration, ag, a.get("instruction", ""),
-                                                 folder, web_enabled, worker_histories, notice, image))
+                                                 folder, web_enabled, worker_histories, notice, image,
+                                                 custom_hist=hist))
                         names.append(ag["name"])
                 if not coros:
                     chef_messages.append({"role": "user", "content":
@@ -1565,7 +1581,7 @@ async def get_prompts(task_id: int, iteration: int = Query(None), agent: str = Q
         q += " AND agent=?"
         params.append(agent)
     q += " ORDER BY id DESC LIMIT 1"
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(q, params) as cur:
             row = await cur.fetchone()
@@ -1582,6 +1598,9 @@ class RevertBody(BaseModel):
     iteration: int
 
 
+_REVERT_KEEP = {".venv", "venv", "node_modules"}  # deps lourdes, non versionnees -> conservees
+
+
 @router.post("/api/tasks/{task_id}/revert")
 async def revert_task(task_id: int, body: RevertBody):
     if task_id in running_tasks:
@@ -1589,28 +1608,39 @@ async def revert_task(task_id: int, body: RevertBody):
     t = await db_get_task(task_id)
     if not t:
         raise HTTPException(404, "Tache introuvable")
+    # Liberer les verrous fichiers (app lancee, serveurs MCP) avant de restaurer.
+    await _stop_launched(task_id)
+    await _stop_mcp(task_id)
     n = body.iteration
     snap = PROJECTS / ".snapshots" / str(task_id) / ("iter_" + str(n))
-    folder = Path(t["folder"])
+    if not snap.exists():
+        raise HTTPException(400, "Snapshot du tour " + str(n) + " inexistant.")
+    folder = Path(t["folder"]).resolve()
+    base = PROJECTS.resolve()
+    if folder != base and base not in folder.parents:
+        raise HTTPException(400, "Dossier de tache invalide.")
 
     def _restore():
-        if not snap.exists():
-            return False
         for child in folder.iterdir():
+            if child.name in _REVERT_KEEP:
+                continue  # conserver les dependances installees
             if child.is_dir():
                 shutil.rmtree(child, ignore_errors=True)
             else:
-                child.unlink()
+                try:
+                    child.unlink()
+                except Exception:
+                    pass
         for item in snap.iterdir():
             dst = folder / item.name
             if item.is_dir():
-                shutil.copytree(item, dst)
+                shutil.copytree(item, dst, ignore=_SNAPSHOT_IGNORE)
             else:
                 shutil.copy2(item, dst)
         return True
 
     restored = await asyncio.to_thread(_restore)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         await db.execute("DELETE FROM messages WHERE task_id=? AND iteration>?", (task_id, n))
         await db.execute("DELETE FROM prompts WHERE task_id=? AND iteration>?", (task_id, n))
         await db.commit()
