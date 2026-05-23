@@ -243,8 +243,12 @@ async def emit(task_id, iteration, agent, kind, payload: dict):
         await db.commit()
 
 
-async def _log_prompt(task_id, iteration, agent, system, messages):
-    payload = json.dumps({"system": system, "messages": messages}, ensure_ascii=False, default=str)[:50000]
+async def _log_prompt(task_id, iteration, agent, system, messages, image=None):
+    # Logge l'historique tel qu'envoye a l'API, image comprise (format Claude Vision),
+    # pour que l'inspecteur de prompt restitue fidelement ce qu'a vu le modele.
+    logged = _attach_image_claude(messages, image) if image else messages
+    cap = 300000 if image else 50000
+    payload = json.dumps({"system": system, "messages": logged}, ensure_ascii=False, default=str)[:cap]
     async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         await db.execute(
             "INSERT INTO prompts (task_id, iteration, agent, payload, created_at) VALUES (?,?,?,?,?)",
@@ -914,7 +918,7 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
         await _wait_if_paused(task_id)
         if await _is_stopped(task_id):
             break
-        await _log_prompt(task_id, iteration, name, system, hist)
+        await _log_prompt(task_id, iteration, name, system, hist, image)
         raw = await call_model(agent["provider"], agent["model"], system, hist,
                                on_notice=notice, image=image)
         hist.append({"role": "assistant", "content": raw})
@@ -1008,7 +1012,7 @@ async def _run_critic(task_id, iteration, critic_agent, instruction, producer_re
             + NL + NL + "Fichiers produits :" + NL + files_blob
             + NL + NL + "Evalue de facon critique. Reponds en JSON.")
     await _log_prompt(task_id, iteration, critic_agent["name"], CRITIC_SYSTEM,
-                      [{"role": "user", "content": user}])
+                      [{"role": "user", "content": user}], image)
     raw = await call_model(critic_agent["provider"], critic_agent["model"],
                            CRITIC_SYSTEM, [{"role": "user", "content": user}], on_notice=notice, image=image)
     data = _extract_json(raw) or {}
@@ -1597,10 +1601,11 @@ async def _build_ping(folder, py_exe):
     entry = next((n for n in WEB_ENTRYPOINTS if (base / n).exists()), None)
     if not entry:
         return {"name": "ping HTTP /", "ok": True, "log": "Pas d'app web Python (ignore)."}
-    # Empeche le reloader Flask/Werkzeug de forker un process enfant (zombie au kill).
+    # PYTHONUNBUFFERED : stdout non bufferise -> on lit l'URL de demarrage en temps reel.
+    # FLASK_DEBUG=0 : decourage le reloader. On NE met PAS WERKZEUG_RUN_MAIN (sinon Werkzeug
+    # cherche WERKZEUG_SERVER_FD -> KeyError fatale au demarrage).
     env = os.environ.copy()
-    env["WERKZEUG_RUN_MAIN"] = "true"
-    env["FLASK_RUN_FROM_CLI"] = "true"
+    env["PYTHONUNBUFFERED"] = "1"
     env["FLASK_DEBUG"] = "0"
     proc = None
     url = None
