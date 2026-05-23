@@ -434,7 +434,142 @@ async def web_search(query: str) -> str:
     return (NL.join(out) or "Aucun resultat.")[:3000]
 
 
-async def execute_tool(folder: str, web_enabled: bool, act: dict) -> str:
+# ── MCP : serveurs OFFICIELS uniquement (liste blanche) ──────────────────────
+# Verifie cote serveur : un agent ne peut activer qu'un serveur de cette liste
+# (serveurs de reference du projet Model Context Protocol).
+OFFICIAL_MCP = {
+    "filesystem": ["npx", "-y", "@modelcontextprotocol/server-filesystem"],
+    "memory": ["npx", "-y", "@modelcontextprotocol/server-memory"],
+    "sequentialthinking": ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
+    "everything": ["npx", "-y", "@modelcontextprotocol/server-everything"],
+    "fetch": ["uvx", "mcp-server-fetch"],
+    "git": ["uvx", "mcp-server-git"],
+    "time": ["uvx", "mcp-server-time"],
+}
+
+
+def _mcp_command(name, folder):
+    cmd = list(OFFICIAL_MCP[name])
+    if name == "filesystem":
+        cmd = cmd + [folder]               # cantonne l'acces au dossier de la tache
+    elif name == "git":
+        cmd = cmd + ["--repository", folder]
+    return cmd
+
+
+class MCPServer:
+    """Client MCP minimal (JSON-RPC 2.0 sur stdio, messages delimites par newline)."""
+
+    def __init__(self, name, command):
+        self.name = name
+        self.command = command
+        self.proc = None
+        self.tools = []
+        self._id = 0
+
+    async def _send(self, method, params=None, notification=False):
+        self._id += 1
+        msg = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        if not notification:
+            msg["id"] = self._id
+        self.proc.stdin.write((json.dumps(msg) + NL).encode("utf-8"))
+        await self.proc.stdin.drain()
+        if notification:
+            return None
+        want = self._id
+        while True:
+            line = await asyncio.wait_for(self.proc.stdout.readline(), timeout=30)
+            if not line:
+                raise RuntimeError("serveur MCP ferme")
+            try:
+                resp = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if resp.get("id") == want:
+                return resp
+
+    async def start(self):
+        self.proc = await asyncio.create_subprocess_exec(
+            *self.command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await self._send("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "orchestrateur", "version": "1.0"},
+        })
+        await self._send("notifications/initialized", notification=True)
+        resp = await self._send("tools/list", {})
+        self.tools = (resp.get("result") or {}).get("tools", [])
+
+    async def call(self, tool, arguments):
+        resp = await self._send("tools/call", {"name": tool, "arguments": arguments or {}})
+        if "error" in resp:
+            return "Erreur MCP : " + json.dumps(resp["error"], ensure_ascii=False)
+        result = resp.get("result", {})
+        parts = [c.get("text", "") for c in result.get("content", []) if c.get("type") == "text"]
+        return (NL.join(parts) or json.dumps(result, ensure_ascii=False))[:3000]
+
+    async def stop(self):
+        if self.proc and self.proc.returncode is None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+
+async def _tool_add_mcp(task_id, folder, server):
+    server = (server or "").strip()
+    if server not in OFFICIAL_MCP:
+        return ("Serveur MCP refuse : '" + server + "' n'est pas un serveur OFFICIEL. "
+                "Serveurs autorises : " + ", ".join(sorted(OFFICIAL_MCP)) + ".")
+    ctrl = running_tasks.get(task_id)
+    if ctrl is None:
+        return "Tache non active."
+    registry = ctrl.setdefault("mcp", {})
+    if server in registry:
+        return ("Serveur MCP '" + server + "' deja actif. Outils : "
+                + ", ".join(t.get("name", "") for t in registry[server].tools))
+    s = MCPServer(server, _mcp_command(server, folder))
+    try:
+        await asyncio.wait_for(s.start(), timeout=60)
+    except Exception as e:
+        return ("Echec demarrage MCP '" + server + "' : " + str(e)[:200]
+                + " (npx/uvx est-il installe ?)")
+    registry[server] = s
+    return ("Serveur MCP officiel '" + server + "' demarre. Outils : "
+            + ", ".join(t.get("name", "") for t in s.tools)
+            + ". Appelle-les avec mcp_call.")
+
+
+async def _tool_mcp_call(task_id, server, tool, arguments):
+    registry = (running_tasks.get(task_id) or {}).get("mcp", {})
+    s = registry.get((server or "").strip())
+    if not s:
+        return "Serveur MCP '" + str(server) + "' non demarre. Fais d'abord add_mcp."
+    try:
+        return await asyncio.wait_for(s.call(tool, arguments), timeout=60)
+    except Exception as e:
+        return "Erreur mcp_call : " + str(e)[:200]
+
+
+async def _stop_mcp(task_id):
+    ctrl = running_tasks.get(task_id)
+    if not ctrl:
+        return
+    for s in list(ctrl.get("mcp", {}).values()):
+        try:
+            await s.stop()
+        except Exception:
+            pass
+    ctrl["mcp"] = {}
+
+
+async def execute_tool(task_id: int, folder: str, web_enabled: bool, act: dict) -> str:
     tool = act.get("tool")
     try:
         if tool == "write_file":
@@ -455,6 +590,12 @@ async def execute_tool(folder: str, web_enabled: bool, act: dict) -> str:
             if not web_enabled:
                 return "Recherche web desactivee pour cette tache."
             return await web_search(act.get("query", ""))
+        if tool == "add_mcp":
+            return await _tool_add_mcp(task_id, folder, act.get("server", ""))
+        if tool == "mcp_call":
+            return await _tool_mcp_call(task_id, act.get("server", ""),
+                                        act.get("name") or act.get("tool_name") or "",
+                                        act.get("arguments") or {})
         return "Outil inconnu: " + str(tool)
     except Exception as e:
         return "Erreur outil " + str(tool) + ": " + str(e)
@@ -503,7 +644,9 @@ Reponds UNIQUEMENT avec un objet JSON decrivant tes actions pour avancer sur la 
     {{"tool":"read_file","path":"..."}},
     {{"tool":"run_command","cmd":"python script.py"}},
     {{"tool":"run_tests"}},
-    {{"tool":"web_search","query":"..."}}
+    {{"tool":"web_search","query":"..."}},
+    {{"tool":"add_mcp","server":"filesystem"}},
+    {{"tool":"mcp_call","server":"filesystem","name":"list_directory","arguments":{{}}}}
   ],
   "done": false,
   "report":"(quand done=true) resume clair de ce que tu as produit"}}
@@ -511,6 +654,9 @@ Reponds UNIQUEMENT avec un objet JSON decrivant tes actions pour avancer sur la 
 Regles :
 - Ecris tes livrables dans des fichiers (write_file), chemins relatifs au dossier de travail.
 - Commandes autorisees (run_command) : {whitelist}.
+- Tu peux installer des paquets Python via run_command (ex: "pip install requests").
+- Outils MCP OFFICIELS uniquement : active un serveur avec add_mcp (autorises : {mcp_servers}),
+  puis utilise ses outils via mcp_call. Tout serveur non officiel est refuse automatiquement.
 - Quand ta mission est accomplie : "done": true et un "report". Sinon "done": false avec des actions.
 - Un seul JSON par reponse, aucun texte autour."""
 
@@ -538,6 +684,7 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
         name=name, role=agent["role"],
         web=("oui" if web_enabled else "non"),
         whitelist=", ".join(sorted(COMMAND_WHITELIST)),
+        mcp_servers=", ".join(sorted(OFFICIAL_MCP)),
     )
     last_report = "(aucun rapport)"
     for _step in range(WORKER_MAX_STEPS):
@@ -558,7 +705,7 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
             tool = act.get("tool")
             await emit(task_id, iteration, name, "tool_call",
                        {"tool": tool, "input": {k: v for k, v in act.items() if k != "tool"}})
-            out = await execute_tool(folder, web_enabled, act)
+            out = await execute_tool(task_id, folder, web_enabled, act)
             await emit(task_id, iteration, name, "tool_result", {"tool": tool, "output": out[:1500]})
             results.append("[" + str(tool) + "] " + out)
             if tool in ("write_file", "run_command", "run_tests"):
@@ -823,6 +970,7 @@ async def _run_task(task_id):
         await emit(task_id, 0, "systeme", "error", {"msg": str(e)[:300]})
         await db_update_task(task_id, status="failed")
     finally:
+        await _stop_mcp(task_id)
         running_tasks.pop(task_id, None)
 
 
@@ -880,7 +1028,7 @@ async def start_task(task_id: int):
         return {"status": "already_running"}
     pause = asyncio.Event()
     pause.set()  # set = en marche ; clear = en pause
-    running_tasks[task_id] = {"pause": pause, "step": False, "inbox": []}
+    running_tasks[task_id] = {"pause": pause, "step": False, "inbox": [], "mcp": {}}
     coro = _run_task(task_id)
     running_tasks[task_id]["task"] = asyncio.create_task(coro)
     return {"status": "running"}
@@ -929,6 +1077,7 @@ async def stop_task(task_id: int):
     if ctrl:
         ctrl["pause"].set()  # debloque la boucle pour qu'elle constate l'arret
     await _stop_launched(task_id)
+    await _stop_mcp(task_id)
     await emit(task_id, 0, "systeme", "stopped", {})
     return {"status": "stopped"}
 
