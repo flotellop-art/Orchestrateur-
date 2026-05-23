@@ -52,6 +52,7 @@ def _default_model(provider: str) -> str:
 MAX_AGENTS_CEILING = 8
 MAX_ITER_CEILING = 40
 WORKER_MAX_STEPS = 6
+MAX_TOKENS = 16000  # sortie max par appel : assez large pour ecrire des fichiers entiers
 
 COMMAND_WHITELIST = {
     "python", "python3", "pip", "pip3", "pytest",
@@ -211,7 +212,7 @@ def _gemini_available() -> bool:
 async def _call_claude(model, system, messages) -> str:
     resp = await _client.messages.create(
         model=model or DEFAULT_CLAUDE,
-        max_tokens=2048,
+        max_tokens=MAX_TOKENS,
         system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         messages=messages,
     )
@@ -226,7 +227,10 @@ async def _call_gemini(model, system, messages) -> str:
         {"role": ("user" if m["role"] == "user" else "model"), "parts": [m["content"]]}
         for m in messages
     ]
-    resp = await asyncio.to_thread(gm.generate_content, contents)
+    resp = await asyncio.to_thread(
+        gm.generate_content, contents,
+        generation_config={"max_output_tokens": MAX_TOKENS},
+    )
     return resp.text or ""
 
 
