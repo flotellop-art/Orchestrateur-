@@ -1182,7 +1182,39 @@ async def _run_challenge(task_id, iteration, instruction, folder, web_enabled, r
 
 
 # ── Moteur : la boucle du chef ───────────────────────────────────────────────
-async def _run_task(task_id):
+async def _resume_context(task_id, folder):
+    """Reconstruit un resume du travail deja fait (depuis la DB + les fichiers) pour reprendre une tache."""
+    msgs = await db_messages_after(task_id, 0)
+    decisions, results = [], []
+    for m in msgs:
+        try:
+            c = json.loads(m["content"])
+        except Exception:
+            continue
+        if m["kind"] == "chef" and c.get("decision"):
+            line = "tour " + str(m["iteration"]) + " : " + str(c.get("decision"))
+            if c.get("instruction"):
+                line += " — " + str(c["instruction"])[:120]
+            decisions.append(line)
+        elif m["kind"] == "agent_message" and c.get("kind") == "result":
+            results.append(str(m["agent"]) + " : " + str(c.get("content", ""))[:150])
+    agents = await db_list_agents(task_id)
+    files = _list_files(folder)
+    parts = ["Tu REPRENDS une tache qui a ete interrompue (souvent coupee en plein milieu)."]
+    if agents:
+        parts.append("Ton equipe existe DEJA (ne les recree pas) : "
+                     + ", ".join(a["name"] + " (" + a["role"] + ")" for a in agents))
+    if decisions:
+        parts.append("Tes decisions passees :" + NL + NL.join("- " + d for d in decisions[-15:]))
+    if results:
+        parts.append("Derniers resultats d'agents :" + NL + NL.join("- " + r for r in results[-10:]))
+    parts.append("Fichiers deja produits : " + (", ".join(files[:80]) or "(aucun)"))
+    parts.append("Relis les fichiers au besoin (read_file). NE REFAIS PAS le travail deja fait : "
+                 "reprends la ou ca s'est arrete et avance vers l'objectif. Prochaine action en JSON.")
+    return (NL + NL).join(parts)
+
+
+async def _run_task(task_id, resume=False):
     try:
         task = await db_get_task(task_id)
         folder = task["folder"]
@@ -1209,11 +1241,19 @@ async def _run_task(task_id):
             start = ("Une maquette de design a ete fournie par l'utilisateur ; elle est transmise aux agents "
                      "qui produisent l'UI (demande-leur de s'en inspirer fidelement : couleurs, structure, composants). "
                      + start)
-        chef_messages = [{"role": "user", "content": start}]
         worker_histories: dict[str, list] = {}
+        if resume:
+            iteration = int(task.get("iteration") or 0)
+            ceiling = COMPANY_MAX_ITER if company else MAX_ITER_CEILING
+            max_iter = min(max(max_iter, iteration + 20), ceiling)  # garantit du budget pour continuer
+            chef_messages = [{"role": "user", "content": await _resume_context(task_id, folder)}]
+            await emit(task_id, iteration, "systeme", "info",
+                       {"msg": "Reprise de la tache au tour " + str(iteration) + " (contexte reconstruit)."})
+        else:
+            chef_messages = [{"role": "user", "content": start}]
+            iteration = 0
 
         await db_update_task(task_id, status="running")
-        iteration = 0
         while iteration < max_iter:
             await _wait_if_paused(task_id)
             if await _is_stopped(task_id):
@@ -1423,6 +1463,13 @@ async def create_task(body: TaskCreate):
     return {"id": task_id, "folder": folder}
 
 
+def _spawn_loop(task_id, resume=False):
+    pause = asyncio.Event()
+    pause.set()  # set = en marche ; clear = en pause
+    running_tasks[task_id] = {"pause": pause, "step": False, "inbox": [], "mcp": {}}
+    running_tasks[task_id]["task"] = asyncio.create_task(_run_task(task_id, resume=resume))
+
+
 @router.post("/api/tasks/{task_id}/start")
 async def start_task(task_id: int):
     t = await db_get_task(task_id)
@@ -1430,12 +1477,22 @@ async def start_task(task_id: int):
         raise HTTPException(404, "Tache introuvable")
     if task_id in running_tasks:
         return {"status": "already_running"}
-    pause = asyncio.Event()
-    pause.set()  # set = en marche ; clear = en pause
-    running_tasks[task_id] = {"pause": pause, "step": False, "inbox": [], "mcp": {}}
-    coro = _run_task(task_id)
-    running_tasks[task_id]["task"] = asyncio.create_task(coro)
+    _spawn_loop(task_id, resume=False)
     return {"status": "running"}
+
+
+@router.post("/api/tasks/{task_id}/restart")
+async def restart_task(task_id: int):
+    """Reprend une tache terminee/arretee/echouee la ou elle s'etait arretee (contexte reconstruit)."""
+    t = await db_get_task(task_id)
+    if not t:
+        raise HTTPException(404, "Tache introuvable")
+    if task_id in running_tasks:
+        return {"status": "already_running"}
+    if t["status"] not in ("failed", "stopped", "done", "idle"):
+        raise HTTPException(400, "La tache n'est pas dans un etat reprenable (" + str(t["status"]) + ").")
+    _spawn_loop(task_id, resume=True)
+    return {"status": "running", "resumed": True}
 
 
 @router.post("/api/tasks/{task_id}/pause")
