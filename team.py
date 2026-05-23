@@ -59,6 +59,10 @@ MAX_AGENTS_CEILING = 8
 MAX_ITER_CEILING = 40
 WORKER_MAX_STEPS = 6
 MAX_TOKENS = 16000  # sortie max par appel : assez large pour ecrire des fichiers entiers
+# Mode entreprise (autopilote d'audit de depot) : plafonds etendus.
+COMPANY_MAX_AGENTS = 24
+COMPANY_MAX_ITER = 300
+COMPANY_WORKER_STEPS = 40
 
 COMMAND_WHITELIST = {
     "python", "python3", "pip", "pip3", "pytest",
@@ -99,6 +103,8 @@ async def init_team_db():
                 max_agents    INTEGER DEFAULT 4,
                 web_enabled   INTEGER DEFAULT 0,
                 chef_model    TEXT DEFAULT 'claude-sonnet-4-6',
+                company_mode  INTEGER DEFAULT 0,
+                target_path   TEXT,
                 created_at    TEXT
             )
         """)
@@ -125,11 +131,14 @@ async def init_team_db():
                 created_at TEXT
             )
         """)
-        # Migration douce : colonne image pour les taches existantes.
-        try:
-            await db.execute("ALTER TABLE tasks ADD COLUMN image_path TEXT")
-        except Exception:
-            pass
+        # Migration douce : colonnes ajoutees pour les taches existantes.
+        for ddl in ("ALTER TABLE tasks ADD COLUMN image_path TEXT",
+                    "ALTER TABLE tasks ADD COLUMN company_mode INTEGER DEFAULT 0",
+                    "ALTER TABLE tasks ADD COLUMN target_path TEXT"):
+            try:
+                await db.execute(ddl)
+            except Exception:
+                pass
         # Prompts envoyes a l'API, pour l'inspecteur (#18).
         await db.execute("""
             CREATE TABLE IF NOT EXISTS prompts (
@@ -165,13 +174,15 @@ async def init_team_db():
         await db.commit()
 
 
-async def db_create_task(objective, folder, max_iterations, max_agents, web_enabled, chef_model):
+async def db_create_task(objective, folder, max_iterations, max_agents, web_enabled, chef_model,
+                         company_mode=False, target_path=None):
     async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         cur = await db.execute(
-            "INSERT INTO tasks (objective,folder,status,max_iterations,max_agents,web_enabled,chef_model,created_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO tasks (objective,folder,status,max_iterations,max_agents,web_enabled,chef_model,"
+            "company_mode,target_path,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (objective, folder, "idle", max_iterations, max_agents,
-             1 if web_enabled else 0, chef_model, datetime.utcnow().isoformat()),
+             1 if web_enabled else 0, chef_model,
+             1 if company_mode else 0, target_path, datetime.utcnow().isoformat()),
         )
         await db.commit()
         return cur.lastrowid
@@ -513,6 +524,38 @@ def _list_files(folder: str) -> list[str]:
     return out[:200]
 
 
+# Repertoires ignores lors de la lecture/listing du depot cible (mode entreprise).
+_TARGET_IGNORE = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
+                  "dist", "build", ".next", ".cache"}
+
+
+def _target_file(target_path: str, rel: str):
+    """Resolution sure d'un fichier DANS le depot cible (lecture seule). None si hors/inexistant."""
+    if not target_path:
+        return None
+    base = Path(target_path).resolve()
+    try:
+        p = (base / (rel or "")).resolve()
+    except Exception:
+        return None
+    if p != base and base not in p.parents:
+        return None
+    return p if p.is_file() else None
+
+
+def _list_target_files(target_path: str) -> list[str]:
+    base = Path(target_path) if target_path else None
+    if not base or not base.exists():
+        return []
+    out = []
+    for p in sorted(base.rglob("*")):
+        if p.is_file() and not any(part in _TARGET_IGNORE for part in p.relative_to(base).parts):
+            out.append(str(p.relative_to(base)))
+        if len(out) >= 400:
+            break
+    return out
+
+
 async def _run_cmd(folder: str, cmd: str, timeout: int = 60) -> str:
     try:
         parts = shlex.split(cmd or "")
@@ -790,10 +833,18 @@ async def execute_tool(task_id: int, folder: str, web_enabled: bool, act: dict) 
             p.write_text(act.get("content", ""), encoding="utf-8")
             return "Fichier ecrit: " + str(act.get("path"))
         if tool == "read_file":
-            p = _safe_path(folder, act.get("path", ""))
-            if not p.exists():
-                return "Introuvable: " + str(act.get("path"))
-            return p.read_text(encoding="utf-8", errors="replace")[:5000]
+            rel = act.get("path", "")
+            p = _safe_path(folder, rel)
+            if p.exists():
+                return p.read_text(encoding="utf-8", errors="replace")[:5000]
+            # Fallback lecture seule sur le depot cible (mode entreprise).
+            t = await db_get_task(task_id)
+            if t and t.get("company_mode") and t.get("target_path"):
+                tp = _target_file(t["target_path"], rel)
+                if tp:
+                    return ("[depot cible, lecture seule] "
+                            + tp.read_text(encoding="utf-8", errors="replace")[:5000])
+            return "Introuvable: " + str(rel)
         if tool == "run_command":
             return await _run_cmd(folder, act.get("cmd", ""))
         if tool == "run_tests":
@@ -854,6 +905,43 @@ Regles :
 - Pour un livrable important ou sensible aux erreurs, prefere "challenge" a un simple "assign_task" afin que les deux modeles se confrontent.
 - Quand le travail est valide, utilise "finish"."""
 
+
+# Prompt du "CEO" en mode entreprise tech (autopilote d'audit de depot externe).
+COMPANY_CHEF_SYSTEM = """Tu es le PDG/CTO d'une ENTREPRISE TECH autonome (une entite a part entiere,
+distincte du projet que tu traites). Tu diriges une equipe d'agents comme une vraie boite.
+
+CLIENT / PREMIER PROJET : le depot situe en LECTURE SEULE a :
+{target_path}
+
+MISSION (nord) : {objective}
+Personne ne t'a donne de liste de taches : c'est a TOI de trouver quoi faire. Analyse le depot, puis
+propose et realise : correction de bugs, nouvelles features, ameliorations front-end et back-end,
+securite, performance, UX, qualite. Vise l'excellence (faire mieux que la concurrence) sans jamais
+casser la securite.
+
+REGLES ABSOLUES :
+- Tu NE MODIFIES JAMAIS le depot d'origine (lecture seule). Les agents le LISENT (read_file) pour
+  l'auditer, mais ecrivent UNIQUEMENT dans le sous-dossier "delivery/" du dossier de travail.
+- Tu NE POUSSES PAS sur GitHub et tu NE MERGES PAS. C'est Claude Code qui verifiera et donnera son aval.
+- Tu peux tester tes correctifs dans une sandbox locale (copie dans delivery/), pas sur l'original.
+
+LIVRABLES attendus dans delivery/ :
+- delivery/audit_report.md : analyse du depot (architecture, problemes, risques securite, dette).
+- delivery/backlog.md : idees PRIORISEES que TU as trouvees (bugs, features, front, back), avec impact/effort.
+- delivery/patches/ ou delivery/<domaine>/ : le code propose (correctifs, nouvelles features), teste localement.
+- delivery/HANDOFF.md : resume pour Claude Code (quoi a verifier/appliquer, fichiers concernes, comment tester).
+
+Tu peux creer jusqu'a {max_agents} agents (analystes, dev front, dev back, QA, securite, recherche...).
+A CHAQUE TOUR, reponds UNIQUEMENT avec un objet JSON (aucun texte autour) :
+- {{"thought":"...","action":"create_agent","name":"NomCourt","role":"role","provider":"claude"}}  (provider: claude|gemini|openai)
+- {{"thought":"...","action":"assign_task","agent":"Nom","instruction":"consigne precise"}}
+- {{"thought":"...","action":"parallel_assign","assignments":[{{"agent":"A","instruction":"..."}},{{"agent":"B","instruction":"..."}}]}}  (agents distincts, fichiers disjoints)
+- {{"thought":"...","action":"challenge","instruction":"...","rounds":2}}  (verification croisee 3 modeles)
+- {{"thought":"...","action":"finish","final":"resume des livrables dans delivery/ + chemin a transmettre a Claude Code"}}
+
+Regles : un seul JSON par tour ; cree un agent avant de lui assigner une tache ; rappelle a chaque
+agent d'ecrire UNIQUEMENT dans delivery/ ; quand le travail est livre, "finish"."""
+
 WORKER_SYSTEM = """Tu es l'agent << {name} >>. Ton role : {role}.
 Tu travailles dans un dossier de travail partage avec ton equipe. Recherche web disponible : {web}.
 
@@ -913,8 +1001,16 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
         whitelist=", ".join(sorted(COMMAND_WHITELIST)),
         mcp_servers=", ".join(sorted(OFFICIAL_MCP)),
     )
+    # Mode entreprise : lire le depot cible (lecture seule), ecrire UNIQUEMENT dans delivery/.
+    _t = await db_get_task(task_id)
+    company = bool(_t and _t.get("company_mode"))
+    if company:
+        system += (NL + "MODE ENTREPRISE : le depot d'origine est en LECTURE SEULE (read_file le voit). "
+                   "Tu ecris (write_file) UNIQUEMENT dans 'delivery/...'. Ne tente jamais d'ecrire hors du "
+                   "dossier de travail. Teste tes correctifs dans delivery/ avant de livrer.")
+    max_steps = COMPANY_WORKER_STEPS if company else WORKER_MAX_STEPS
     last_report = "(aucun rapport)"
-    for _step in range(WORKER_MAX_STEPS):
+    for _step in range(max_steps):
         await _wait_if_paused(task_id)
         if await _is_stopped(task_id):
             break
@@ -1097,11 +1193,17 @@ async def _run_task(task_id):
         web_enabled = bool(task["web_enabled"])
         chef_model = task["chef_model"]
         image = _load_image(task.get("image_path"))
+        company = bool(task.get("company_mode"))
+        target_path = task.get("target_path")
 
         async def notice(msg):
             await emit(task_id, 0, "systeme", "info", {"msg": msg})
 
-        chef_system = CHEF_SYSTEM.format(objective=objective, max_agents=max_agents)
+        if company:
+            chef_system = COMPANY_CHEF_SYSTEM.format(
+                objective=objective, max_agents=max_agents, target_path=target_path or "(non defini)")
+        else:
+            chef_system = CHEF_SYSTEM.format(objective=objective, max_agents=max_agents)
         start = "Demarre. Quelle est ta premiere action (create_agent, assign_task ou finish) ? Reponds en JSON."
         if image:
             start = ("Une maquette de design a ete fournie par l'utilisateur ; elle est transmise aux agents "
@@ -1266,6 +1368,8 @@ class TaskCreate(BaseModel):
     max_iterations: int = 15
     max_agents: int = 4
     image: Optional[str] = None  # data URL (data:image/...;base64,...) d'une maquette
+    company_mode: bool = False   # mode entreprise tech (audit d'un depot externe en lecture seule)
+    target_path: Optional[str] = None  # chemin local du depot a auditer (lecture seule)
 
 
 router = APIRouter()
@@ -1281,13 +1385,24 @@ async def create_task(body: TaskCreate):
     objective = body.objective.strip()
     if not objective:
         raise HTTPException(400, "Objectif manquant")
-    max_iter = max(1, min(body.max_iterations, MAX_ITER_CEILING))
-    max_agents = max(1, min(body.max_agents, MAX_AGENTS_CEILING))
+    company = bool(body.company_mode)
+    iter_ceiling = COMPANY_MAX_ITER if company else MAX_ITER_CEILING
+    agents_ceiling = COMPANY_MAX_AGENTS if company else MAX_AGENTS_CEILING
+    max_iter = max(1, min(body.max_iterations, iter_ceiling))
+    max_agents = max(1, min(body.max_agents, agents_ceiling))
+    target_path = None
+    if company:
+        if not body.target_path or not Path(body.target_path).exists():
+            raise HTTPException(400, "Mode entreprise : 'target_path' (depot a auditer) introuvable.")
+        target_path = str(Path(body.target_path).resolve())
     folder = str(PROJECTS / ("task_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S")
                              + "_" + uuid.uuid4().hex[:6]))
     Path(folder).mkdir(parents=True, exist_ok=True)
+    if company:
+        (Path(folder) / "delivery").mkdir(exist_ok=True)  # tout ce que produit la boite va ici
     task_id = await db_create_task(objective, folder, max_iter, max_agents,
-                                   body.web_enabled, body.chef_model or DEFAULT_CLAUDE)
+                                   body.web_enabled, body.chef_model or DEFAULT_CLAUDE,
+                                   company_mode=company, target_path=target_path)
     # Amorcage optionnel d'agents par l'utilisateur
     for a in body.agents:
         name = (a.name or "").strip()
@@ -1824,7 +1939,12 @@ async def task_files(task_id: int):
     t = await db_get_task(task_id)
     if not t:
         raise HTTPException(404, "Tache introuvable")
-    return {"files": _list_files(t["folder"])}
+    local = _list_files(t["folder"])
+    if t.get("company_mode") and t.get("target_path"):
+        # Vue virtuelle unifiee : fichiers du depot cible + fichiers locaux (livraison).
+        merged = set(local) | set(_list_target_files(t["target_path"]))
+        return {"files": sorted(merged)}
+    return {"files": local}
 
 
 @router.get("/api/tasks/{task_id}/file")
@@ -1836,9 +1956,15 @@ async def task_file(task_id: int, path: str = Query(...)):
         p = _safe_path(t["folder"], path)
     except ValueError:
         raise HTTPException(400, "Chemin invalide")
-    if not p.exists() or not p.is_file():
-        raise HTTPException(404, "Fichier introuvable")
-    return {"path": path, "content": p.read_text(encoding="utf-8", errors="replace")[:50000]}
+    if p.exists() and p.is_file():
+        return {"path": path, "content": p.read_text(encoding="utf-8", errors="replace")[:50000]}
+    # Fallback lecture seule sur le depot cible (mode entreprise).
+    if t.get("company_mode") and t.get("target_path"):
+        tp = _target_file(t["target_path"], path)
+        if tp:
+            return {"path": path, "source": "target",
+                    "content": tp.read_text(encoding="utf-8", errors="replace")[:50000]}
+    raise HTTPException(404, "Fichier introuvable")
 
 
 @router.get("/api/tasks/{task_id}/stream")

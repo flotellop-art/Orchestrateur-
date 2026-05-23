@@ -163,6 +163,17 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
       <input type="checkbox" id="web-enabled" checked>
       <label for="web-enabled">Autoriser la recherche web</label>
     </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="company-mode" onchange="toggleCompany()">
+      <label for="company-mode" style="color:var(--purple)">Mode Entreprise Tech (audit d'un depot, lecture seule)</label>
+    </div>
+    <div id="company-box" style="display:none;margin-top:10px;border-left:3px solid var(--purple);padding-left:12px">
+      <label for="target-path">Chemin local du depot a auditer (ex : C:\\Users\\Tellop\\Arty)</label>
+      <input type="text" id="target-path" placeholder="C:\\chemin\\vers\\le\\depot">
+      <p class="muted">L'entreprise lit ce depot en lecture seule et ecrit ses livrables dans un dossier
+        <b>delivery/</b> local (elle ne pousse jamais, ne merge pas). Limites etendues (jusqu'a 24 agents / 300 tours).</p>
+    </div>
   </div>
 
   <div class="card">
@@ -252,6 +263,22 @@ var currentFile = null;       // fichier ouvert dans l'editeur (#13)
 var graphAgents = [];         // noms d'agents pour le graphe (#11)
 var activeAgent = null;
 
+// ── Mode Entreprise Tech ────────────────────────────────────────────────────────
+function toggleCompany() {
+  var on = document.getElementById('company-mode').checked;
+  document.getElementById('company-box').style.display = on ? 'block' : 'none';
+  var mi = document.getElementById('max-iter'), ma = document.getElementById('max-agents');
+  if (on) {
+    mi.max = 300; ma.max = 24;
+    if (parseInt(mi.value) < 50) mi.value = 100;
+    if (parseInt(ma.value) < 6) ma.value = 8;
+  } else {
+    mi.max = 40; ma.max = 8;
+    if (parseInt(mi.value) > 40) mi.value = 15;
+    if (parseInt(ma.value) > 8) ma.value = 4;
+  }
+}
+
 // ── Maquette de design (#17) ──────────────────────────────────────────────────
 function previewDesign() {
   var f = document.getElementById('design-image').files[0];
@@ -305,6 +332,9 @@ async function launch() {
   errEl.textContent = '';
   if (!objective) { errEl.textContent = 'Indiquez un objectif.'; return; }
 
+  var company = document.getElementById('company-mode').checked;
+  var targetPath = document.getElementById('target-path').value.trim();
+  if (company && !targetPath) { errEl.textContent = 'Mode entreprise : indiquez le chemin du depot a auditer.'; return; }
   var body = {
     objective: objective,
     chef_model: document.getElementById('chef-model').value,
@@ -312,7 +342,9 @@ async function launch() {
     web_enabled: document.getElementById('web-enabled').checked,
     max_iterations: parseInt(document.getElementById('max-iter').value) || 15,
     max_agents: parseInt(document.getElementById('max-agents').value) || 4,
-    image: designImageData
+    image: designImageData,
+    company_mode: company,
+    target_path: company ? targetPath : null
   };
 
   document.getElementById('btn-launch').disabled = true;
@@ -351,6 +383,20 @@ function startLive() {
   setStatus('running');
   connectStream();
   refreshFiles();
+  showCompanyInfo();
+}
+
+async function showCompanyInfo() {
+  if (!taskId) return;
+  try {
+    var t = await (await fetch('/api/tasks/' + taskId)).json();
+    if (!t.company_mode) return;
+    document.getElementById('result-area').innerHTML =
+      '<div class="msg" style="border-left:4px solid var(--purple)"><div class="who" style="color:var(--purple)">'
+      + 'Mode Entreprise Tech</div>'
+      + '<div><b>Depot cible (lecture seule) :</b> ' + esc(t.target_path || '?') + '</div>'
+      + '<div><b>Livraison (a transmettre a Claude Code) :</b> ' + esc(t.folder) + '\\delivery</div></div>';
+  } catch (e) {}
 }
 
 // Ctrl+S enregistre le fichier en cours d'edition
@@ -716,6 +762,8 @@ function newTask() {
   document.getElementById('btn-launch').disabled = false;
   document.getElementById('status-badge').style.display = 'none';
   document.getElementById('turn-info').textContent = '';
+  var cm = document.getElementById('company-mode');
+  if (cm) { cm.checked = false; toggleCompany(); }
 }
 </script>
 </body>
