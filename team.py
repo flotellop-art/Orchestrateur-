@@ -422,6 +422,11 @@ A CHAQUE TOUR, reponds UNIQUEMENT avec un objet JSON (aucun texte autour) decriv
 - Confier une sous-tache a un agent existant :
   {{"thought":"...","action":"assign_task","agent":"NomDeLAgent","instruction":"consigne precise et autonome"}}
 
+- Lancer un CHALLENGE (verification croisee entre les deux modeles) :
+  {{"thought":"...","action":"challenge","instruction":"consigne precise","rounds":2}}
+  Un Producteur (Claude) realise le travail, puis un Critique (Gemini) cherche les erreurs et conteste ;
+  le Producteur corrige sur plusieurs tours. Utilise-le pour les livrables importants ou sensibles aux erreurs.
+
 - Terminer (objectif atteint) :
   {{"thought":"...","action":"finish","final":"resume du resultat livre"}}
 
@@ -430,6 +435,7 @@ Regles :
 - Un seul JSON, une seule action par tour.
 - Cree un agent AVANT de lui assigner une tache.
 - Les agents ecrivent leurs livrables dans des fichiers du dossier partage.
+- Pour un livrable important ou sensible aux erreurs, prefere "challenge" a un simple "assign_task" afin que les deux modeles se confrontent.
 - Quand le travail est valide, utilise "finish"."""
 
 WORKER_SYSTEM = """Tu es l'agent << {name} >>. Ton role : {role}.
@@ -518,6 +524,100 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
             hist.append({"role": "user", "content":
                          "Aucune action executee. Propose des actions, ou termine avec done:true + report."})
     return last_report
+
+
+# ── Moteur : challenge (critique croisee entre les deux modeles) ─────────────
+CRITIC_SYSTEM = """Tu es un CRITIQUE adversarial. Ton seul but : trouver les ERREURS, oublis,
+cas limites non geres, et ecarts par rapport a la consigne dans le travail d'un autre agent
+(qui tourne sur un modele different du tien). Ne sois pas complaisant.
+
+Tu recois la consigne, le rapport du producteur et le contenu des fichiers produits.
+Reponds UNIQUEMENT avec un objet JSON :
+{"verdict":"approved" ou "needs_changes",
+ "issues":["probleme concret et verifiable 1","probleme 2"],
+ "comment":"synthese courte de ton evaluation"}
+
+N'approuve ("approved") que si le travail repond vraiment a la consigne sans erreur visible.
+Sinon "needs_changes" avec des points precis et actionnables."""
+
+
+async def _ensure_agent(task_id, name, role, provider, model, iteration):
+    existing = await db_get_agent(task_id, name)
+    if existing:
+        return existing
+    await db_add_agent(task_id, name, role, provider, model, "chef")
+    await emit(task_id, iteration, "chef", "agent_created",
+               {"name": name, "role": role, "model": provider + ":" + model})
+    return await db_get_agent(task_id, name)
+
+
+async def _run_critic(task_id, iteration, critic_agent, instruction, producer_report, folder, notice):
+    name = critic_agent["name"]
+    parts, budget = [], 0
+    for f in _list_files(folder):
+        try:
+            content = _safe_path(folder, f).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        snippet = content[:1500]
+        budget += len(snippet)
+        parts.append("### " + f + NL + snippet)
+        if budget > 8000:
+            break
+    files_blob = (NL + NL).join(parts) or "(aucun fichier)"
+    user = ("Consigne de la sous-tache :" + NL + instruction
+            + NL + NL + "Rapport du producteur :" + NL + (producer_report or "(aucun)")
+            + NL + NL + "Fichiers produits :" + NL + files_blob
+            + NL + NL + "Evalue de facon critique. Reponds en JSON.")
+    raw = await call_model(critic_agent["provider"], critic_agent["model"],
+                           CRITIC_SYSTEM, [{"role": "user", "content": user}], on_notice=notice)
+    data = _extract_json(raw) or {}
+    verdict = "approved" if data.get("verdict") == "approved" else "needs_changes"
+    issues = data.get("issues") or []
+    comment = data.get("comment", "")
+    await emit(task_id, iteration, name, "critique",
+               {"verdict": verdict, "issues": issues, "comment": comment})
+    return verdict, issues, comment
+
+
+async def _run_challenge(task_id, iteration, instruction, folder, web_enabled, rounds,
+                         worker_histories, notice,
+                         producer_provider="claude", critic_provider="gemini"):
+    rounds = max(1, min(int(rounds or 2), 4))
+    prod = await _ensure_agent(
+        task_id, "Producteur", "produit et corrige la solution",
+        producer_provider, DEFAULT_GEMINI if producer_provider == "gemini" else DEFAULT_CLAUDE, iteration)
+    crit = await _ensure_agent(
+        task_id, "Critique", "cherche les erreurs et conteste le travail",
+        critic_provider, DEFAULT_GEMINI if critic_provider == "gemini" else DEFAULT_CLAUDE, iteration)
+
+    last_issues, last_comment, final_report = [], "", ""
+    for r in range(1, rounds + 1):
+        await _wait_if_paused(task_id)
+        if await _is_stopped(task_id):
+            break
+        await emit(task_id, iteration, "chef", "challenge_round", {"round": r, "total": rounds})
+
+        prod_instruction = instruction
+        if last_issues:
+            prod_instruction = (instruction + NL + NL
+                                + "Le critique a souleve ces points, corrige-les :" + NL
+                                + NL.join("- " + str(i) for i in last_issues))
+        final_report = await _run_worker(task_id, iteration, prod, prod_instruction,
+                                         folder, web_enabled, worker_histories, notice)
+
+        await _wait_if_paused(task_id)
+        if await _is_stopped(task_id):
+            break
+        verdict, last_issues, last_comment = await _run_critic(
+            task_id, iteration, crit, instruction, final_report, folder, notice)
+        if verdict == "approved":
+            return ("Challenge approuve au round " + str(r) + "/" + str(rounds)
+                    + ". Resultat : " + final_report[:800])
+    return ("Challenge termine apres " + str(rounds) + " round(s) sans approbation finale. "
+            + "Dernier avis : " + (last_comment or "n/a")
+            + ". Points restants : " + ("; ".join(str(i) for i in last_issues) if last_issues else "aucun")
+            + ". Resultat : " + final_report[:800])
 
 
 # ── Moteur : la boucle du chef ───────────────────────────────────────────────
@@ -610,8 +710,23 @@ async def _run_task(task_id):
                                       "Rapport de " + target + " : " + report[:2000]})
                 continue
 
+            if action == "challenge":
+                instruction = decision.get("instruction", "")
+                if not instruction:
+                    chef_messages.append({"role": "user", "content":
+                                          "challenge requiert un champ 'instruction'."})
+                    continue
+                report = await _run_challenge(
+                    task_id, iteration, instruction, folder, web_enabled,
+                    decision.get("rounds", 2), worker_histories, notice,
+                    decision.get("producer_provider", "claude"),
+                    decision.get("critic_provider", "gemini"))
+                chef_messages.append({"role": "user", "content":
+                                      "Resultat du challenge : " + report[:2000]})
+                continue
+
             chef_messages.append({"role": "user", "content":
-                                  "Action non reconnue. Utilise create_agent, assign_task ou finish."})
+                                  "Action non reconnue. Utilise create_agent, assign_task, challenge ou finish."})
 
         if not await _is_stopped(task_id):
             await emit(task_id, iteration, "chef", "done",

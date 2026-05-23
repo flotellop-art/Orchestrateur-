@@ -88,6 +88,7 @@ textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
   font-size: .8rem; padding: 7px; }
 .msg pre { white-space: pre-wrap; word-break: break-word; margin-top: 6px;
   background: rgba(0,0,0,.04); padding: 8px; border-radius: 6px; max-height: 240px; overflow: auto; }
+.msg ul { margin: 6px 0 0 18px; font-size: .85rem; line-height: 1.5; }
 details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 
 .file-item { padding: 7px 10px; background: var(--white); border-radius: 7px; margin-bottom: 6px;
@@ -316,6 +317,19 @@ function handleEvent(ev) {
     case 'tool_result':
       feedAdd('<div class="msg tool"><details><summary>' + esc(ev.tool)
         + ' : resultat</summary><pre>' + esc(ev.output) + '</pre></details></div>');
+      break;
+    case 'challenge_round':
+      feedAdd('<div class="msg turn" style="background:var(--purple)">Challenge &mdash; round '
+        + ev.round + '/' + ev.total + '</div>');
+      break;
+    case 'critique':
+      var ok = ev.verdict === 'approved';
+      var col = ok ? 'var(--green)' : 'var(--red)';
+      var issues = (ev.issues && ev.issues.length)
+        ? '<ul>' + ev.issues.map(function(i){ return '<li>' + esc(i) + '</li>'; }).join('') + '</ul>' : '';
+      feedAdd('<div class="msg" style="border-left:4px solid ' + col + '"><div class="who" style="color:'
+        + col + '">' + esc(ev.agent) + ' &middot; ' + (ok ? 'approuve' : 'corrections demandees')
+        + '</div><div>' + esc(ev.comment) + '</div>' + issues + '</div>');
       break;
     case 'files_changed':
       renderFiles(ev.list);
