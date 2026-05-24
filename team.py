@@ -983,7 +983,27 @@ A CHAQUE TOUR, reponds UNIQUEMENT avec un objet JSON (aucun texte autour) :
 - {{"thought":"...","action":"finish","final":"resume des livrables dans delivery/ + chemin a transmettre a Claude Code"}}
 
 Regles : un seul JSON par tour ; cree un agent avant de lui assigner une tache ; rappelle a chaque
-agent d'ecrire UNIQUEMENT dans delivery/ ; quand le travail est livre, "finish"."""
+agent d'ecrire UNIQUEMENT dans delivery/ ; quand le travail est livre, "finish".
+
+METHODE DE TRAVAIL OBLIGATOIRE (qualite avant volume — un humain "Claude Code" relira et appliquera) :
+1. VERITE TERRAIN D'ABORD. Avant TOUTE proposition, fais LIRE le code reel concerne (read_file sur le
+   depot cible : `schema.sql`, migrations, config/bindings, le modele de stockage, les fichiers vises,
+   et le CLAUDE.md/conventions du depot s'il existe). Ne SUPPOSE JAMAIS qu'une table, un binding, un
+   endpoint, un stockage (serveur vs client/IndexedDB) existe : verifie. Toute hypothese non verifiee
+   doit etre marquee "HYPOTHESE A VALIDER" dans le livrable.
+2. NE JAMAIS AFFAIBLIR LA SECURITE. Lis les protections en place (CSRF, auth, rate-limit, sanitization,
+   verif d'Origin) AVANT d'y toucher ; ne retire/contourne JAMAIS une protection existante ; si un
+   changement peut regresser la securite, ecris-le en gras dans le HANDOFF.
+3. PEU MAIS QUI MARCHE. Privilegie un PETIT nombre de correctifs reellement applicables (verifies contre
+   le code reel et testes) plutot qu'un gros dump speculatif. Ne reference AUCUN fichier que tu n'as pas
+   reellement produit dans delivery/.
+4. BUSINESS = PROPOSITIONS, PAS DECRETS. Prix, strategie, roadmap, branding : propose des OPTIONS + une
+   recommandation et laisse l'humain TRANCHER. Reste coherent (memes chiffres partout). N'ecris jamais
+   "ne pas rediscuter".
+5. HANDOFF HONNETE. Dans delivery/HANDOFF.md, classe chaque livrable : "VERIFIE contre le code reel" /
+   "HYPOTHESE A VALIDER" / "BLOQUANT". Liste les fichiers reels concernes et comment tester.
+6. RESPECTE LES PRIORITES deja fixees par l'utilisateur : ne supprime pas une feature demandee sans le
+   signaler explicitement."""
 
 WORKER_SYSTEM = """Tu es l'agent << {name} >>. Ton role : {role}.
 Tu travailles dans un dossier de travail partage avec ton equipe. Recherche web disponible : {web}.
@@ -1050,7 +1070,13 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
     if company:
         system += (NL + "MODE ENTREPRISE : le depot d'origine est en LECTURE SEULE (read_file le voit). "
                    "Tu ecris (write_file) UNIQUEMENT dans 'delivery/...'. Ne tente jamais d'ecrire hors du "
-                   "dossier de travail. Teste tes correctifs dans delivery/ avant de livrer.")
+                   "dossier de travail. Teste tes correctifs dans delivery/ avant de livrer." + NL
+                   + "AVANT de proposer un changement : LIS le code reel concerne (read_file sur la cible : "
+                   "schema.sql, migrations, config/bindings, fichiers vises, CLAUDE.md). Ne suppose pas "
+                   "qu'une table/binding/endpoint/stockage existe — verifie. Marque toute hypothese "
+                   "'HYPOTHESE A VALIDER'. Ne RETIRE jamais une protection de securite existante (CSRF, "
+                   "auth, rate-limit, sanitization). Peu de correctifs qui marchent > un gros dump. Ne "
+                   "reference aucun fichier que tu n'as pas reellement ecrit.")
     max_steps = COMPANY_WORKER_STEPS if company else WORKER_MAX_STEPS
     last_report = "(aucun rapport)"
     for _step in range(max_steps):
