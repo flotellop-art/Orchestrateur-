@@ -558,6 +558,20 @@ def _list_target_files(target_path: str) -> list[str]:
     return out
 
 
+def _rmtree_force(path):
+    """Suppression robuste (Windows) : retire le flag lecture seule des fichiers .git puis reessaie."""
+    import stat
+
+    def _onerror(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+    shutil.rmtree(path, onerror=_onerror)
+    return not Path(path).exists()
+
+
 async def _clone_repo(url, token=None):
     """Clone un depot GitHub en LECTURE SEULE dans un cache local, et renvoie son chemin.
     Le token (depot prive) sert au clone puis est scrubbe (remote supprime) ; jamais stocke/log."""
@@ -569,7 +583,10 @@ async def _clone_repo(url, token=None):
     dest = PROJECTS / ".repos" / name
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
-        await asyncio.to_thread(shutil.rmtree, str(dest), True)  # re-clone propre
+        ok = await asyncio.to_thread(_rmtree_force, str(dest))  # re-clone propre (gere .git read-only Windows)
+        if not ok and dest.exists():
+            # dernier recours : cloner dans un dossier voisin unique
+            dest = PROJECTS / ".repos" / (name + "_" + uuid.uuid4().hex[:6])
     auth_url = url.replace("https://", "https://" + token + "@", 1) if token else url
     proc = await asyncio.create_subprocess_exec(
         "git", "clone", "--depth", "1", auth_url, str(dest),
