@@ -1283,6 +1283,41 @@ async def _resume_context(task_id, folder):
     return (NL + NL).join(parts)
 
 
+def _company_sanity(folder):
+    """Verifie la coherence de la livraison : liste reelle des fichiers de delivery/ et
+    references 'delivery/...' citees dans les .md mais absentes du disque (fichiers fantomes)."""
+    base = Path(folder)
+    delivery = base / "delivery"
+    if not delivery.exists():
+        return None
+    actual = sorted(str(p.relative_to(base)).replace("\\", "/")
+                    for p in delivery.rglob("*") if p.is_file() and p.name != "_MANIFEST.md")
+    actual_set = set(actual)
+    referenced = set()
+    for md in delivery.rglob("*.md"):
+        try:
+            txt = md.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for ref in re.findall(r"delivery/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+", txt):
+            referenced.add(ref.replace("\\", "/"))
+    missing = sorted(r for r in referenced if r not in actual_set)
+    return {"files": actual, "missing": missing}
+
+
+def _write_manifest(folder, sanity):
+    lines = ["# Manifest de livraison (genere automatiquement)", "",
+             str(len(sanity["files"])) + " fichier(s) reellement presents dans delivery/ :", ""]
+    lines += ["- " + f for f in sanity["files"]]
+    if sanity["missing"]:
+        lines += ["", "## ATTENTION : references absentes du disque (fichiers fantomes)", ""]
+        lines += ["- " + m for m in sanity["missing"]]
+    try:
+        (Path(folder) / "delivery" / "_MANIFEST.md").write_text(NL.join(lines), encoding="utf-8")
+    except Exception as e:
+        log.warning("manifest non ecrit: %s", e)
+
+
 async def _run_task(task_id, resume=False):
     try:
         task = await db_get_task(task_id)
@@ -1360,6 +1395,17 @@ async def _run_task(task_id, resume=False):
 
             if action == "finish" or decision.get("done"):
                 final = decision.get("final") or thought or "Objectif traite."
+                if company:
+                    sanity = await asyncio.to_thread(_company_sanity, folder)
+                    if sanity:
+                        await asyncio.to_thread(_write_manifest, folder, sanity)
+                        note = ("Livraison : " + str(len(sanity["files"])) + " fichier(s) dans delivery/ "
+                                "(manifest : delivery/_MANIFEST.md).")
+                        if sanity["missing"]:
+                            note += (" ATTENTION : reference(s) ABSENTE(S) du disque -> "
+                                     + ", ".join(sanity["missing"][:15]))
+                        await emit(task_id, iteration, "systeme", "info", {"msg": note})
+                        final = final + NL + note
                 await emit(task_id, iteration, "chef", "done", {"summary": final})
                 await db_update_task(task_id, status="done")
                 return
