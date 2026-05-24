@@ -4,6 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Espace de travail multi-agents</title>
+<link rel="manifest" href="/static/manifest.webmanifest">
+<meta name="theme-color" content="#1a1a2e">
+<link rel="icon" href="/static/icon-app.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icon-app.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Orchestrateur">
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
@@ -261,6 +267,12 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 </div>
 
 <script>
+// Enregistre le service worker (rend l'app installable en PWA, et garde l'UI hors-ligne).
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('/sw.js').catch(function () {});
+  });
+}
 var taskId = null;
 var evtSource = null;
 var seedCount = 0;

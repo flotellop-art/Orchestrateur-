@@ -1541,6 +1541,13 @@ async def workspace_page():
     return FileResponse(STATIC / "workspace.html", headers={"Cache-Control": "no-store"})
 
 
+@router.get("/sw.js")
+async def service_worker():
+    # Servi a la racine pour que la portee du service worker couvre tout le site ("/").
+    return FileResponse(STATIC / "sw.js", media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+
 @router.post("/api/tasks")
 async def create_task(body: TaskCreate):
     objective = body.objective.strip()

@@ -1,0 +1,16 @@
+{
+  "name": "Orchestrateur multi-agents",
+  "short_name": "Orchestrateur",
+  "description": "Hub d'agents IA autonomes (equipe, challenge, mode entreprise).",
+  "start_url": "/workspace",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#1a1a2e",
+  "theme_color": "#1a1a2e",
+  "lang": "fr",
+  "icons": [
+    {"src": "/static/icon-app.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"},
+    {"src": "/static/icon-app.png", "sizes": "256x256", "type": "image/png", "purpose": "any"}
+  ]
+}
