@@ -57,6 +57,25 @@ def _default_model(provider: str) -> str:
     return {"gemini": DEFAULT_GEMINI, "openai": DEFAULT_OPENAI}.get(provider, DEFAULT_WORKER_CLAUDE)
 
 
+# Tarifs estimatifs ($ par million de tokens : entree, sortie) — AJUSTABLES selon ta facturation.
+# Sert au suivi du cout et au plafond de budget ; un modele inconnu utilise PRICE_DEFAULT.
+PRICING = {
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+    "gpt-5.5": (5.0, 30.0),
+    "gemini-3.5-flash": (0.30, 2.50),
+    "gemini-3.5-pro": (2.50, 10.0),
+}
+PRICE_DEFAULT = (5.0, 25.0)
+
+
+def _usage_cost(usage: dict) -> float:
+    pin, pout = PRICING.get(usage.get("model"), PRICE_DEFAULT)
+    return (usage.get("input", 0) / 1e6) * pin + (usage.get("output", 0) / 1e6) * pout
+
+
 MAX_AGENTS_CEILING = 8
 MAX_ITER_CEILING = 40
 WORKER_MAX_STEPS = 6
@@ -82,6 +101,9 @@ running_tasks: dict[int, dict] = {}
 # task_id -> {"proc": Process, "url": str|None, "output": list}
 launched_apps: dict[int, dict] = {}
 _KNOWLEDGE_FTS = True  # FTS5 disponible pour la memoire long terme ?
+# Cache des recherches web (requete normalisee -> resultat). Borne pour ne pas grossir sans fin.
+_web_cache: dict[str, str] = {}
+_WEB_CACHE_MAX = 256
 
 NL = chr(10)
 
@@ -107,6 +129,8 @@ async def init_team_db():
                 chef_model    TEXT DEFAULT 'claude-sonnet-4-6',
                 company_mode  INTEGER DEFAULT 0,
                 target_path   TEXT,
+                total_cost_usd REAL DEFAULT 0,
+                max_cost_usd  REAL DEFAULT 0,
                 created_at    TEXT
             )
         """)
@@ -136,7 +160,9 @@ async def init_team_db():
         # Migration douce : colonnes ajoutees pour les taches existantes.
         for ddl in ("ALTER TABLE tasks ADD COLUMN image_path TEXT",
                     "ALTER TABLE tasks ADD COLUMN company_mode INTEGER DEFAULT 0",
-                    "ALTER TABLE tasks ADD COLUMN target_path TEXT"):
+                    "ALTER TABLE tasks ADD COLUMN target_path TEXT",
+                    "ALTER TABLE tasks ADD COLUMN total_cost_usd REAL DEFAULT 0",
+                    "ALTER TABLE tasks ADD COLUMN max_cost_usd REAL DEFAULT 0"):
             try:
                 await db.execute(ddl)
             except Exception:
@@ -177,14 +203,14 @@ async def init_team_db():
 
 
 async def db_create_task(objective, folder, max_iterations, max_agents, web_enabled, chef_model,
-                         company_mode=False, target_path=None):
+                         company_mode=False, target_path=None, max_cost_usd=0.0):
     async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         cur = await db.execute(
             "INSERT INTO tasks (objective,folder,status,max_iterations,max_agents,web_enabled,chef_model,"
-            "company_mode,target_path,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "company_mode,target_path,max_cost_usd,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (objective, folder, "idle", max_iterations, max_agents,
              1 if web_enabled else 0, chef_model,
-             1 if company_mode else 0, target_path, datetime.utcnow().isoformat()),
+             1 if company_mode else 0, target_path, max_cost_usd, datetime.utcnow().isoformat()),
         )
         await db.commit()
         return cur.lastrowid
@@ -351,17 +377,24 @@ def _gemini_available() -> bool:
     return bool(os.getenv("GEMINI_API_KEY"))
 
 
-async def _claude_request(model, system, messages, image=None) -> str:
+async def _claude_request(model, system, messages, image=None):
     resp = await _client.messages.create(
         model=model,
         max_tokens=MAX_TOKENS,
         system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         messages=_attach_image_claude(messages, image),
     )
-    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    u = resp.usage
+    usage = {"model": model,
+             "input": ((getattr(u, "input_tokens", 0) or 0)
+                       + (getattr(u, "cache_creation_input_tokens", 0) or 0)
+                       + (getattr(u, "cache_read_input_tokens", 0) or 0)),
+             "output": getattr(u, "output_tokens", 0) or 0}
+    return text, usage
 
 
-async def _call_claude(model, system, messages, on_notice=None, image=None) -> str:
+async def _call_claude(model, system, messages, on_notice=None, image=None):
     target = model or DEFAULT_CLAUDE
     try:
         return await _claude_request(target, system, messages, image)
@@ -375,7 +408,7 @@ async def _call_claude(model, system, messages, on_notice=None, image=None) -> s
         return await _claude_request(STABLE_CLAUDE, system, messages, image)
 
 
-async def _call_gemini(model, system, messages, image=None) -> str:
+async def _call_gemini(model, system, messages, image=None):
     from google import genai  # nouveau paquet google-genai, importe a la demande
     from google.genai import types
     client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -399,14 +432,18 @@ async def _call_gemini(model, system, messages, image=None) -> str:
             max_output_tokens=MAX_TOKENS,
         ),
     )
-    return resp.text or ""
+    um = getattr(resp, "usage_metadata", None)
+    usage = {"model": model or DEFAULT_GEMINI,
+             "input": getattr(um, "prompt_token_count", 0) or 0,
+             "output": getattr(um, "candidates_token_count", 0) or 0}
+    return (resp.text or ""), usage
 
 
 def _openai_available() -> bool:
     return bool(os.getenv("OPENAI_API_KEY"))
 
 
-async def _call_openai(model, system, messages, image=None) -> str:
+async def _call_openai(model, system, messages, image=None):
     from openai import AsyncOpenAI  # importe a la demande
     oai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     msgs = [{"role": "system", "content": system}]
@@ -415,41 +452,68 @@ async def _call_openai(model, system, messages, image=None) -> str:
         msgs.append({"role": role, "content": m["content"]})
     msgs = msgs[:1] + _attach_image_openai(msgs[1:], image)
     resp = await oai.chat.completions.create(model=model or DEFAULT_OPENAI, messages=msgs)
-    return resp.choices[0].message.content or ""
+    u = getattr(resp, "usage", None)
+    usage = {"model": model or DEFAULT_OPENAI,
+             "input": getattr(u, "prompt_tokens", 0) or 0,
+             "output": getattr(u, "completion_tokens", 0) or 0}
+    return (resp.choices[0].message.content or ""), usage
 
 
-async def call_model(provider, model, system, messages, on_notice=None, image=None) -> str:
+async def _account_cost(task_id, usage, on_notice=None):
+    """Accumule cout + tokens d'un appel sur la tache, persiste, emet un evenement, applique le plafond."""
+    ctrl = running_tasks.get(task_id)
+    if ctrl is None or not usage:
+        return
+    ctrl["cost"] = ctrl.get("cost", 0.0) + _usage_cost(usage)
+    ctrl["in_tok"] = ctrl.get("in_tok", 0) + usage.get("input", 0)
+    ctrl["out_tok"] = ctrl.get("out_tok", 0) + usage.get("output", 0)
+    total = ctrl["cost"]
+    await db_update_task(task_id, total_cost_usd=round(total, 6))
+    await emit(task_id, 0, "systeme", "cost",
+               {"cost": round(total, 4), "in": ctrl["in_tok"], "out": ctrl["out_tok"]})
+    cap = ctrl.get("max_cost", 0) or 0
+    if cap > 0 and total >= cap and not ctrl.get("over_budget"):
+        ctrl["over_budget"] = True
+        if on_notice:
+            await on_notice("Budget atteint (%.2f $ >= %.2f $) -> arret de la tache." % (total, cap))
+
+
+async def call_model(provider, model, system, messages, on_notice=None, image=None, task_id=None) -> str:
     log.info("[modele] appel %s (%s)%s", provider, model or _default_model(provider),
              " +image" if image else "")
     if provider == "gemini":
         if not _gemini_available():
             if on_notice:
                 await on_notice("Gemini indisponible (GEMINI_API_KEY manquante) -> repli sur Claude.")
-            return await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice, image)
-        try:
-            out = await _call_gemini(model, system, messages, image)
-            log.info("[modele] Gemini OK (%d caracteres)", len(out))
-            return out
-        except Exception as e:
-            log.warning("[modele] Gemini erreur: %s", e)
-            if on_notice:
-                await on_notice("Erreur Gemini (" + str(e)[:120] + ") -> repli sur Claude.")
-            return await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice, image)
-    if provider == "openai":
+            text, usage = await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice, image)
+        else:
+            try:
+                text, usage = await _call_gemini(model, system, messages, image)
+                log.info("[modele] Gemini OK (%d caracteres)", len(text))
+            except Exception as e:
+                log.warning("[modele] Gemini erreur: %s", e)
+                if on_notice:
+                    await on_notice("Erreur Gemini (" + str(e)[:120] + ") -> repli sur Claude.")
+                text, usage = await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice, image)
+    elif provider == "openai":
         if not _openai_available():
             if on_notice:
                 await on_notice("OpenAI indisponible (OPENAI_API_KEY manquante) -> repli sur Claude.")
-            return await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice, image)
-        try:
-            out = await _call_openai(model, system, messages, image)
-            log.info("[modele] OpenAI OK (%d caracteres)", len(out))
-            return out
-        except Exception as e:
-            log.warning("[modele] OpenAI erreur: %s", e)
-            if on_notice:
-                await on_notice("Erreur OpenAI (" + str(e)[:120] + ") -> repli sur Claude.")
-            return await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice, image)
-    return await _call_claude(model or DEFAULT_CLAUDE, system, messages, on_notice, image)
+            text, usage = await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice, image)
+        else:
+            try:
+                text, usage = await _call_openai(model, system, messages, image)
+                log.info("[modele] OpenAI OK (%d caracteres)", len(text))
+            except Exception as e:
+                log.warning("[modele] OpenAI erreur: %s", e)
+                if on_notice:
+                    await on_notice("Erreur OpenAI (" + str(e)[:120] + ") -> repli sur Claude.")
+                text, usage = await _call_claude(DEFAULT_CLAUDE, system, messages, on_notice, image)
+    else:
+        text, usage = await _call_claude(model or DEFAULT_CLAUDE, system, messages, on_notice, image)
+    if task_id is not None:
+        await _account_cost(task_id, usage, on_notice)
+    return text
 
 
 # ── Extraction JSON (calque de repair_json d'orchestrator.py) ────────────────
@@ -665,6 +729,10 @@ async def _run_pytest(folder: str, timeout: int = 120) -> str:
 
 
 async def web_search(query: str) -> str:
+    # Cache : une meme requete (a la casse/espaces pres) ne repaye pas un appel SDK.
+    key = " ".join((query or "").lower().split())
+    if key and key in _web_cache:
+        return _web_cache[key] + NL + "(resultat en cache)"
     try:
         from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions, ResultMessage
     except ImportError:
@@ -685,7 +753,12 @@ async def web_search(query: str) -> str:
                 out.append(msg.result)
     except Exception as e:
         return "Erreur recherche web: " + str(e)[:200]
-    return (NL.join(out) or "Aucun resultat.")[:3000]
+    result = (NL.join(out) or "Aucun resultat.")[:3000]
+    if key and not result.startswith("Erreur"):
+        if len(_web_cache) >= _WEB_CACHE_MAX:
+            _web_cache.pop(next(iter(_web_cache)), None)  # evince la plus ancienne entree
+        _web_cache[key] = result
+    return result
 
 
 # ── MCP : serveurs OFFICIELS uniquement (liste blanche) ──────────────────────
@@ -1104,9 +1177,12 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
         await _wait_if_paused(task_id)
         if await _is_stopped(task_id):
             break
+        _c = running_tasks.get(task_id)
+        if _c and _c.get("over_budget"):
+            return last_report  # plafond budget atteint : on rend la main au chef
         await _log_prompt(task_id, iteration, name, system, hist, image)
         raw = await call_model(agent["provider"], agent["model"], system, hist,
-                               on_notice=notice, image=image)
+                               on_notice=notice, image=image, task_id=task_id)
         hist.append({"role": "assistant", "content": raw})
         data = _extract_json(raw) or {}
 
@@ -1200,7 +1276,8 @@ async def _run_critic(task_id, iteration, critic_agent, instruction, producer_re
     await _log_prompt(task_id, iteration, critic_agent["name"], CRITIC_SYSTEM,
                       [{"role": "user", "content": user}], image)
     raw = await call_model(critic_agent["provider"], critic_agent["model"],
-                           CRITIC_SYSTEM, [{"role": "user", "content": user}], on_notice=notice, image=image)
+                           CRITIC_SYSTEM, [{"role": "user", "content": user}],
+                           on_notice=notice, image=image, task_id=task_id)
     data = _extract_json(raw) or {}
     verdict = "approved" if data.get("verdict") == "approved" else "needs_changes"
     issues = data.get("issues") or []
@@ -1353,6 +1430,15 @@ async def _run_task(task_id, resume=False):
         company = bool(task.get("company_mode"))
         target_path = task.get("target_path")
 
+        # Maitrise du cout : plafond USD par tache + cumul (repris du total persiste).
+        ctrl0 = running_tasks.get(task_id)
+        if ctrl0 is not None:
+            ctrl0["max_cost"] = float(task.get("max_cost_usd") or 0)
+            ctrl0["cost"] = float(task.get("total_cost_usd") or 0) if resume else 0.0
+            ctrl0.setdefault("in_tok", 0)
+            ctrl0.setdefault("out_tok", 0)
+            ctrl0["over_budget"] = False
+
         async def notice(msg):
             await emit(task_id, 0, "systeme", "info", {"msg": msg})
 
@@ -1385,6 +1471,13 @@ async def _run_task(task_id, resume=False):
                 break
 
             ctrl = running_tasks.get(task_id)
+            if ctrl and ctrl.get("over_budget"):
+                msg = ("Budget maximal atteint (%.2f $ depenses). Arret de la tache. "
+                       "Augmente le plafond puis reprends si besoin." % ctrl.get("cost", 0.0))
+                await emit(task_id, iteration, "systeme", "info", {"msg": msg})
+                await emit(task_id, iteration, "chef", "done", {"summary": msg})
+                await db_update_task(task_id, status="stopped")
+                return
             if ctrl and ctrl.get("inbox"):
                 pending, ctrl["inbox"] = ctrl["inbox"], []
                 for um in pending:
@@ -1404,7 +1497,8 @@ async def _run_task(task_id, resume=False):
                    + NL + "Prochaine action ? Reponds en JSON.")
             chef_messages.append({"role": "user", "content": ctx})
             await _log_prompt(task_id, iteration, "chef", chef_system, chef_messages)
-            raw = await call_model("claude", chef_model, chef_system, chef_messages, on_notice=notice)
+            raw = await call_model("claude", chef_model, chef_system, chef_messages,
+                                   on_notice=notice, task_id=task_id)
             chef_messages.append({"role": "assistant", "content": raw})
 
             decision = _extract_json(raw) or {}
@@ -1548,6 +1642,7 @@ class TaskCreate(BaseModel):
     target_path: Optional[str] = None  # chemin local du depot a auditer (lecture seule)
     target_repo_url: Optional[str] = None  # URL GitHub a cloner localement (lecture seule)
     github_token: Optional[str] = None  # token pour depot prive (utilise pour le clone, jamais stocke)
+    max_cost_usd: float = 0  # plafond de cout par tache en USD (0 = pas de plafond)
 
 
 router = APIRouter()
@@ -1594,7 +1689,8 @@ async def create_task(body: TaskCreate):
         (Path(folder) / "delivery").mkdir(exist_ok=True)  # tout ce que produit la boite va ici
     task_id = await db_create_task(objective, folder, max_iter, max_agents,
                                    body.web_enabled, body.chef_model or DEFAULT_CLAUDE,
-                                   company_mode=company, target_path=target_path)
+                                   company_mode=company, target_path=target_path,
+                                   max_cost_usd=max(0.0, float(body.max_cost_usd or 0)))
     # Amorcage optionnel d'agents par l'utilisateur
     for a in body.agents:
         name = (a.name or "").strip()
@@ -1633,8 +1729,12 @@ async def start_task(task_id: int):
     return {"status": "running"}
 
 
+class RestartBody(BaseModel):
+    max_cost_usd: Optional[float] = None  # nouveau plafond de cout (None = inchange)
+
+
 @router.post("/api/tasks/{task_id}/restart")
-async def restart_task(task_id: int):
+async def restart_task(task_id: int, body: Optional[RestartBody] = None):
     """Reprend une tache terminee/arretee/echouee la ou elle s'etait arretee (contexte reconstruit)."""
     t = await db_get_task(task_id)
     if not t:
@@ -1643,6 +1743,8 @@ async def restart_task(task_id: int):
         return {"status": "already_running"}
     if t["status"] not in ("failed", "stopped", "done", "idle"):
         raise HTTPException(400, "La tache n'est pas dans un etat reprenable (" + str(t["status"]) + ").")
+    if body and body.max_cost_usd is not None:
+        await db_update_task(task_id, max_cost_usd=max(0.0, float(body.max_cost_usd)))
     _spawn_loop(task_id, resume=True)
     return {"status": "running", "resumed": True}
 
