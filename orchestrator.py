@@ -22,6 +22,7 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import team
+from auth_middleware import add_auth_middleware
 
 load_dotenv()
 
@@ -391,10 +392,18 @@ async def lifespan(app):
     log.info("App Creator arrete.")
 
 app = FastAPI(title="App Creator", lifespan=lifespan)
+# Protection par cle API : ACTIVE uniquement si API_SECRET_KEY est defini (.env).
+# Sans cle -> no-op total, l'app demarre comme avant (aucun risque de blocage).
+add_auth_middleware(app)
 app.include_router(team.router)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
+@app.get("/health")
+async def health_check():
+    # Endpoint public (jamais protege) : verif d'etat (Electron, supervision).
+    return {"status": "ok"}
+
 @app.get("/api/stats")
 async def stats():
     apps = await db_list()

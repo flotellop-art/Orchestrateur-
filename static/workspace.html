@@ -267,6 +267,33 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 </div>
 
 <script>
+// Si une cle API est definie (page /control -> Reglages, stockee dans localStorage),
+// on l'attache automatiquement a toutes les requetes. Transparent si aucune cle.
+(function () {
+  function key() { try { return localStorage.getItem('ORCH_API_KEY') || ''; } catch (e) { return ''; } }
+  var _fetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    var k = key();
+    if (k) {
+      init = init || {};
+      var h = new Headers(init.headers || (input && input.headers) || {});
+      if (!h.has('X-API-Key')) h.set('X-API-Key', k);
+      init.headers = h;
+    }
+    return _fetch(input, init);
+  };
+  var _ES = window.EventSource;
+  if (_ES) {
+    window.EventSource = function (url, cfg) {
+      var k = key();
+      if (k && typeof url === 'string' && url.indexOf('api_key=') < 0) {
+        url += (url.indexOf('?') < 0 ? '?' : '&') + 'api_key=' + encodeURIComponent(k);
+      }
+      return new _ES(url, cfg);
+    };
+    window.EventSource.prototype = _ES.prototype;
+  }
+})();
 // Enregistre le service worker (rend l'app installable en PWA, et garde l'UI hors-ligne).
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', function () {
