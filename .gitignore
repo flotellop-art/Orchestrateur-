@@ -33,6 +33,11 @@ Thumbs.db
 *.sqlite
 projects/
 _archives/
+chat_workspace/
+
+# Python
+__pycache__/
+*.pyc
 
 # Claude Code worktrees
 .claude/worktrees/

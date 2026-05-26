@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 import team
 from auth_middleware import add_auth_middleware
+from patches.security.cors_config import add_cors_middleware
 
 load_dotenv()
 
@@ -69,7 +70,16 @@ async def db_create(description, folder, port):
         await db.commit()
         return cur.lastrowid
 
+# Colonnes modifiables de `apps` : empeche l'injection d'un nom de colonne
+# arbitraire via les kwargs (les noms ne sont jamais parametrables en SQL).
+_APPS_COLUMNS_ALLOWED = frozenset({
+    "name", "description", "folder", "status", "port", "error",
+})
+
 async def db_update(app_id, **kwargs):
+    invalid = set(kwargs) - _APPS_COLUMNS_ALLOWED
+    if invalid:
+        raise ValueError("Colonnes non autorisees pour UPDATE apps : " + ", ".join(sorted(invalid)))
     sets = ", ".join(k + "=?" for k in kwargs)
     vals = list(kwargs.values()) + [app_id]
     async with aiosqlite.connect(DB_PATH) as db:
@@ -395,6 +405,9 @@ app = FastAPI(title="App Creator", lifespan=lifespan)
 # Protection par cle API : ACTIVE uniquement si API_SECRET_KEY est defini (.env).
 # Sans cle -> no-op total, l'app demarre comme avant (aucun risque de blocage).
 add_auth_middleware(app)
+# CORS restreint a localhost (configurable via CORS_ALLOWED_ORIGINS) ; l'UI etant
+# servie en meme origine, cela n'affecte pas son fonctionnement.
+add_cors_middleware(app)
 app.include_router(team.router)
 
 

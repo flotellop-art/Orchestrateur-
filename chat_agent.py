@@ -28,6 +28,28 @@ conversations: dict[str, list] = {}
 pending_actions: dict[str, dict] = {}
 STATIC_DIR = Path(__file__).parent / "static"
 
+# Les outils fichier du chat sont confines a ce dossier (anti path-traversal).
+WORKSPACE_DIR = Path(__file__).parent / "chat_workspace"
+WORKSPACE_DIR.mkdir(exist_ok=True)
+
+# Sandbox d'execution de commandes (liste blanche + pas de shell=True).
+from patches.security.sandbox_commands import safe_run_command_sync, CommandForbiddenError
+
+
+def _safe_chat_path(path: str) -> Path:
+    """Resout `path` en l'empechant de sortir de WORKSPACE_DIR (path traversal)."""
+    if not path or not isinstance(path, str):
+        raise ValueError("Chemin vide ou invalide.")
+    if "\x00" in path:
+        raise ValueError("Caractere NULL dans le chemin.")
+    base = WORKSPACE_DIR.resolve()
+    target = (base / path).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        raise ValueError("Chemin hors de l'espace de travail autorise : " + path)
+    return target
+
 TOOLS = [
     {"name": "get_current_time", "description": "Retourne la date et l heure actuelles.", "input_schema": {"type": "object", "properties": {}, "required": []}},
     {"name": "send_email", "description": "Envoie un email. Action irreversible - necessite confirmation.", "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}, "required": ["to", "subject", "body"]}},
@@ -73,32 +95,38 @@ async def execute_tool(tool_name: str, tool_input: dict) -> str:
     elif tool_name == "read_file":
         path = tool_input.get("path", "")
         try:
-            p = Path(path)
+            p = _safe_chat_path(path)
             if not p.exists():
                 return "Fichier introuvable: " + path
             c = p.read_text(encoding="utf-8", errors="replace")
             if len(c) > 5000:
                 c = c[:5000] + "... (tronque)"
             return "Contenu de " + path + ":" + NL + c
+        except ValueError as e:
+            return "Acces refuse: " + str(e)
         except Exception as e:
             return "Erreur: " + str(e)
     elif tool_name == "write_file":
         path = tool_input.get("path", "")
         content = tool_input.get("content", "")
         try:
-            p = Path(path)
+            p = _safe_chat_path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
             return "Fichier ecrit: " + path
+        except ValueError as e:
+            return "Acces refuse: " + str(e)
         except Exception as e:
             return "Erreur: " + str(e)
     elif tool_name == "run_command":
         cmd = tool_input.get("cmd", "").strip()
-        if not any(cmd.startswith(w) for w in COMMAND_WHITELIST):
-            return "Commande refusee: " + cmd
         try:
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-            return (r.stdout or r.stderr or "(vide)").strip()[:2000]
+            # Sandbox : pas de shell=True, blocage des meta-caracteres et des
+            # commandes hors liste blanche (rm, curl, pip install, python -c, ...).
+            rc, out, err = safe_run_command_sync(cmd, cwd=str(WORKSPACE_DIR), timeout=30)
+            return (out or err or "(vide)").strip()[:2000]
+        except CommandForbiddenError as e:
+            return "Commande refusee: " + str(e)
         except Exception as e:
             return "Erreur: " + str(e)
     return "Outil inconnu: " + tool_name

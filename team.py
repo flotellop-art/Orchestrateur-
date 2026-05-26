@@ -205,7 +205,19 @@ async def db_list_tasks():
             return [dict(r) for r in await cur.fetchall()]
 
 
+# Colonnes modifiables de `tasks` : bloque l'injection d'un nom de colonne
+# arbitraire (le nom de colonne ne peut pas etre un parametre SQL lie).
+# Inclut total_cost_usd/max_cost_usd (suivi du cout) pour rester compatible.
+_TASKS_COLUMNS_ALLOWED = frozenset({
+    "objective", "folder", "status", "iteration", "max_iterations", "max_agents",
+    "web_enabled", "chef_model", "company_mode", "target_path", "image_path",
+    "total_cost_usd", "max_cost_usd",
+})
+
 async def db_update_task(task_id, **kwargs):
+    invalid = set(kwargs) - _TASKS_COLUMNS_ALLOWED
+    if invalid:
+        raise ValueError("Colonnes non autorisees pour UPDATE tasks : " + ", ".join(sorted(invalid)))
     sets = ", ".join(k + "=?" for k in kwargs)
     vals = list(kwargs.values()) + [task_id]
     async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
