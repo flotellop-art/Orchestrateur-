@@ -22,6 +22,7 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import team
+import managed_agents  # pont vers les Agents geres Anthropic
 
 load_dotenv()
 
@@ -392,6 +393,7 @@ async def lifespan(app):
 
 app = FastAPI(title="App Creator", lifespan=lifespan)
 app.include_router(team.router)
+app.include_router(managed_agents.router)  # GET /api/managed-agents + /environment
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
