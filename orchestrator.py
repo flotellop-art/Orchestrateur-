@@ -381,6 +381,8 @@ async def creation_pipeline(app_id, description, folder, port):
 async def lifespan(app):
     await init_db()
     await team.init_team_db()
+    import memory
+    await memory.init_memory_db()
     log.info("App Creator demarre.")
     yield
     for proc in running_servers.values():
@@ -392,6 +394,9 @@ async def lifespan(app):
 
 app = FastAPI(title="App Creator", lifespan=lifespan)
 app.include_router(team.router)
+import memory as _memory_mod
+if _memory_mod.router is not None:
+    app.include_router(_memory_mod.router)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -479,6 +484,16 @@ async def delete_app(app_id: int):
 @app.get("/")
 async def index():
     content = (STATIC / "index.html").read_bytes()
+    return Response(
+        content=content,
+        media_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
+
+@app.get("/memory")
+async def memory_page():
+    # URL conviviale pour la page de gestion des notes (= /static/memory.html).
+    content = (STATIC / "memory.html").read_bytes()
     return Response(
         content=content,
         media_type="text/html",

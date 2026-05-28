@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memoire — Notes utilisateur</title>
+<style>
+  :root {
+    --bg: #f8f9fa; --white: #fff; --dark: #1a1a2e; --orange: #e8825a;
+    --orange-d: #c96840; --green: #27ae60; --red: #e74c3c; --grey: #6c757d;
+    --border: #dee2e6; --sh: 0 4px 20px rgba(0,0,0,.08); --r: 12px;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, 'Segoe UI', sans-serif;
+         background: var(--bg); color: var(--dark); min-height: 100vh; }
+  header { background: var(--dark); color: #fff; padding: 16px 28px;
+           display: flex; align-items: center; justify-content: space-between; }
+  header h1 { font-size: 1.15rem; font-weight: 700; }
+  header h1 span { color: var(--orange); }
+  header .status { font-size: .82rem; color: #aaa; }
+  header .status.ok { color: #6fc785; }
+  main { max-width: 820px; margin: 36px auto 0; padding: 0 20px 60px; }
+  h2 { font-size: 1.5rem; margin-bottom: 6px; }
+  h2 span { color: var(--orange); }
+  p.sub { color: var(--grey); margin-bottom: 24px; line-height: 1.6; }
+  .card { background: var(--white); border-radius: var(--r); box-shadow: var(--sh);
+          padding: 24px; margin-bottom: 18px; }
+  label { display: block; font-weight: 600; font-size: .85rem; margin-bottom: 6px; }
+  textarea { width: 100%; border: 2px solid var(--border); border-radius: 9px;
+             padding: 11px; font-size: .95rem; font-family: inherit; outline: none;
+             min-height: 90px; line-height: 1.5; resize: vertical;
+             transition: border-color .15s; }
+  textarea:focus { border-color: var(--orange); }
+  .btn { border: none; border-radius: 9px; padding: 11px 22px; font-size: .92rem;
+         font-weight: 700; cursor: pointer; transition: background .15s; }
+  .btn-primary { background: var(--orange); color: #fff; margin-top: 12px; }
+  .btn-primary:hover { background: var(--orange-d); }
+  .btn-ghost { background: #f0f0f0; color: var(--dark); font-size: .8rem;
+               padding: 6px 12px; }
+  .btn-ghost:hover { background: #e4e4e4; }
+  .btn-danger { background: transparent; color: var(--red); font-weight: 600;
+                font-size: .8rem; padding: 6px 10px; }
+  .btn-danger:hover { background: #fdedec; }
+  .note {
+    background: var(--white); border-radius: 9px; padding: 12px 15px;
+    margin-bottom: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.05);
+    border-left: 3px solid var(--orange);
+    display: flex; align-items: flex-start; gap: 12px;
+  }
+  .note-content { flex: 1; line-height: 1.5; word-break: break-word; }
+  .note-meta { font-size: .72rem; color: var(--grey); margin-top: 4px;
+               font-family: ui-monospace, monospace; }
+  .empty { color: var(--grey); font-style: italic; text-align: center;
+           padding: 30px 10px; }
+  .toast { position: fixed; bottom: 20px; right: 20px; padding: 12px 18px;
+           background: var(--dark); color: #fff; border-radius: 8px;
+           box-shadow: var(--sh); transform: translateY(40px); opacity: 0;
+           transition: transform .25s, opacity .25s; pointer-events: none;
+           font-size: .9rem; }
+  .toast.show { transform: translateY(0); opacity: 1; }
+  .toast.err { background: var(--red); }
+  nav-links { display: flex; gap: 14px; font-size: .85rem; }
+  a { color: var(--orange); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Memoire <span>Arty</span></h1>
+  <div>
+    <a href="/workspace" style="color:#aaa;margin-right:14px">&larr; Espace agents</a>
+    <span class="status" id="status">verification...</span>
+  </div>
+</header>
+
+<main>
+  <h2>Tes <span>notes</span> persistantes</h2>
+  <p class="sub">
+    Les preferences et regles que tu ecris ici sont injectees dans le contexte du chef
+    a chaque nouvelle tache. Exemples : <em>&laquo; toujours utiliser Tailwind &raquo;</em>,
+    <em>&laquo; preferer Python a Node &raquo;</em>, <em>&laquo; ne jamais commiter sans tests &raquo;</em>.
+  </p>
+
+  <div class="card">
+    <label for="content">Nouvelle note</label>
+    <textarea id="content" placeholder="Une regle, une preference, un fait projet a garder en tete..."></textarea>
+    <button class="btn btn-primary" id="add">Ajouter a la memoire</button>
+  </div>
+
+  <h3 style="font-size:.95rem;color:var(--grey);text-transform:uppercase;letter-spacing:.06em;margin:24px 4px 12px">
+    Notes enregistrees (<span id="count">0</span>)
+  </h3>
+  <div id="list"><p class="empty">Chargement...</p></div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+function $(s) { return document.querySelector(s); }
+function esc(s) { return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function toast(msg, err) {
+  const t = $('#toast'); t.textContent = msg;
+  t.classList.toggle('err', !!err);
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2400);
+}
+function key() { try { return localStorage.getItem('ORCH_API_KEY')||''; } catch(e) { return ''; } }
+async function api(path, opts) {
+  opts = opts || {};
+  const k = key();
+  if (k) {
+    opts.headers = Object.assign({}, opts.headers || {}, { 'X-API-Key': k });
+  }
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    const d = await r.json().catch(()=>({detail:r.statusText}));
+    throw new Error(d.detail || r.statusText);
+  }
+  return r.json();
+}
+async function refresh() {
+  try {
+    const d = await api('/api/memory/notes');
+    const notes = d.notes || [];
+    $('#count').textContent = notes.length;
+    const list = $('#list');
+    if (!notes.length) {
+      list.innerHTML = '<p class="empty">Aucune note pour l\'instant. Ajoute-en une ci-dessus.</p>';
+      return;
+    }
+    list.innerHTML = notes.map(n => (
+      '<div class="note">'+
+      '<div class="note-content">'+esc(n.content)+
+      '<div class="note-meta">'+esc(n.created_at||'')+'</div>'+
+      '</div>'+
+      '<button class="btn btn-danger" data-id="'+n.id+'">Supprimer</button>'+
+      '</div>'
+    )).join('');
+    list.querySelectorAll('button.btn-danger').forEach(b => {
+      b.onclick = async () => {
+        if (!confirm('Supprimer cette note ?')) return;
+        try {
+          await api('/api/memory/notes/' + b.dataset.id, { method: 'DELETE' });
+          toast('Note supprimee.');
+          refresh();
+        } catch (e) { toast(e.message, true); }
+      };
+    });
+  } catch (e) {
+    $('#list').innerHTML = '<p class="empty" style="color:var(--red)">'+esc(e.message)+'</p>';
+  }
+}
+async function add() {
+  const content = $('#content').value.trim();
+  if (content.length < 3) { toast('Note trop courte.', true); return; }
+  try {
+    const r = await api('/api/memory/notes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    });
+    $('#content').value = '';
+    toast(r.embedded ? 'Note ajoutee + indexee.' : 'Note ajoutee (recherche en mode texte).');
+    refresh();
+  } catch (e) { toast(e.message, true); }
+}
+async function checkStatus() {
+  try {
+    const s = await api('/api/memory/status');
+    const el = $('#status');
+    if (s.embeddings) {
+      el.textContent = 'Recherche semantique active (' + s.embed_model + ')';
+      el.classList.add('ok');
+    } else {
+      el.textContent = 'Recherche texte (definir OPENAI_API_KEY pour activer la semantique)';
+    }
+  } catch (e) {
+    $('#status').textContent = 'Hors-ligne';
+  }
+}
+$('#add').onclick = add;
+$('#content').addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') add();
+});
+checkStatus();
+refresh();
+</script>
+
+</body>
+</html>
