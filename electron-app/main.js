@@ -3,6 +3,7 @@ const path=require('path');
 const{spawn}=require('child_process');
 const http=require('http');
 const fs=require('fs');
+const security=require('./electron_hardening');
 
 const PORT=8000,BASE='http://127.0.0.1:8000',TITLE='Multi-Agent Orchestrator';
 let win=null,splash=null,tray=null,srv=null,quitting=false,relaunching=false;
@@ -45,7 +46,7 @@ async function startServer(){
 function stopServer(){if(srv){srv.kill('SIGTERM');srv=null;}}
 
 function createSplash(){
-  splash=new BrowserWindow({width:460,height:280,frame:false,alwaysOnTop:true,resizable:false,center:true,backgroundColor:'#2b2b2b',webPreferences:{nodeIntegration:false}});
+  splash=new BrowserWindow({width:460,height:280,frame:false,alwaysOnTop:true,resizable:false,center:true,backgroundColor:'#2b2b2b',webPreferences:{nodeIntegration:false,contextIsolation:true,sandbox:true}});
   splash.loadURL('data:text/html;charset=utf-8,'+encodeURIComponent('<!DOCTYPE html><html><head><meta charset=UTF-8><style>*{margin:0;padding:0;box-sizing:border-box}body{background:#2b2b2b;color:#fff;font-family:-apple-system,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:20px;-webkit-app-region:drag}h1{font-size:1.5rem}h1 span{color:#E8825A}.ld{width:36px;height:36px;border:3px solid #444;border-top-color:#E8825A;border-radius:50%;animation:s .8s linear infinite}@keyframes s{to{transform:rotate(360deg)}}.st{color:#888;font-size:.8rem}</style></head><body><h1>Multi-Agent <span>Orchestrator</span></h1><div class=ld></div><p class=st>Demarrage du serveur...</p></body></html>'));
 }
 
@@ -57,21 +58,21 @@ function buildMenu(){
       {label:'Tableau de bord',accelerator:'CmdOrCtrl+1',click:()=>win&&win.loadURL(BASE)},
       {label:'Chat',accelerator:'CmdOrCtrl+2',click:()=>win&&win.loadURL(BASE+'/chat')},
       {type:'separator'},
-      {label:'Ouvrir dans navigateur',click:()=>shell.openExternal(BASE)}
+      {label:'Ouvrir dans navigateur',click:()=>security.safeOpenExternal(BASE)}
     ]},
-    {label:'Aide',submenu:[{label:'Documentation',click:()=>shell.openExternal('https://docs.anthropic.com')}]}
+    {label:'Aide',submenu:[{label:'Documentation',click:()=>security.safeOpenExternal('https://docs.anthropic.com')}]}
   ]));
 }
 
 function createWin(){
   win=new BrowserWindow({width:1280,height:800,minWidth:800,minHeight:600,show:false,title:TITLE,backgroundColor:'#f7f7f7',
-    webPreferences:{preload:path.join(__dirname,'preload.js'),nodeIntegration:false,contextIsolation:true}});
+    webPreferences:security.getSecureWebPreferences()});
+  security.attachSecurityHooks(win);
   buildMenu();
   win.webContents.session.clearCache().then(()=>win.loadURL(BASE));
   win.once('ready-to-show',()=>{if(splash&&!splash.isDestroyed()){splash.close();splash=null;}win.show();win.focus();});
   win.on('close',e=>{if(!quitting){e.preventDefault();win.hide();}});
   win.on('closed',()=>{win=null;});
-  win.webContents.setWindowOpenHandler(({url})=>{shell.openExternal(url);return{action:'deny'};});
   win.webContents.on('did-fail-load',()=>{if(!quitting)win.loadURL('data:text/html,<body style="font-family:sans-serif;text-align:center;padding:40px"><h2>Connexion echouee</h2><br><button onclick="location.reload()">Reessayer</button></body>');});
 }
 
@@ -103,7 +104,7 @@ ipcMain.handle('select-folder', async () => {
   return result.canceled ? null : result.filePaths[0];
 });
 
-ipcMain.handle('open-external', (event, url) => { shell.openExternal(url); });
+ipcMain.handle('open-external', (event, url) => { security.safeOpenExternal(url); });
 
 ipcMain.handle('get-server-url',()=>BASE);
 ipcMain.handle('get-version',()=>app.getVersion());
@@ -112,6 +113,7 @@ ipcMain.on('quit',()=>quit());
 app.whenReady().then(async()=>{
   if(!app.requestSingleInstanceLock()){app.quit();return;}
   app.on('second-instance',()=>show());
+  security.setupSecureSession();
   createSplash();
   const ok=await startServer();
   if(!ok){
