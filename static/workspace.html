@@ -133,7 +133,8 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 
 <header>
   <h1>Equipe d'<span>agents</span> autonomes</h1>
-  <div><span class="turn" id="turn-info"></span> <span class="badge" id="status-badge" style="display:none"></span></div>
+  <div><span class="turn" id="turn-info"></span> <span class="badge" id="status-badge" style="display:none"></span>
+    <span class="turn" id="cost-info" style="display:none"></span></div>
 </header>
 
 <!-- Configuration -->
@@ -163,6 +164,10 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
       <div>
         <label for="max-iter">Nombre max de tours</label>
         <input type="number" id="max-iter" value="15" min="1" max="40">
+      </div>
+      <div>
+        <label for="max-cost">Budget max ($, 0 = illimite)</label>
+        <input type="number" id="max-cost" value="0" min="0" step="0.5">
       </div>
     </div>
 
@@ -371,6 +376,7 @@ async function launch() {
     web_enabled: document.getElementById('web-enabled').checked,
     max_iterations: parseInt(document.getElementById('max-iter').value) || 15,
     max_agents: parseInt(document.getElementById('max-agents').value) || 4,
+    max_cost_usd: parseFloat(document.getElementById('max-cost').value) || 0,
     image: designImageData,
     company_mode: company,
     target_path: company ? (targetPath || null) : null,
@@ -512,6 +518,12 @@ function handleEvent(ev) {
     case 'user_message':
       feedAdd('<div class="msg user"><div class="who">Vous</div><div>' + esc(ev.content) + '</div></div>');
       break;
+    case 'cost':
+      var ci = document.getElementById('cost-info');
+      ci.style.display = '';
+      ci.textContent = '~' + (ev.cost || 0).toFixed(2) + ' $  (' + (ev.in || 0)
+        + ' in / ' + (ev.out || 0) + ' out tok)';
+      break;
     case 'info':
       feedAdd('<div class="msg sys">' + esc(ev.msg) + '</div>');
       break;
@@ -570,7 +582,19 @@ async function ctrl(action) {
 
 async function restartTask() {
   if (!taskId) return;
-  var r = await fetch('/api/tasks/' + taskId + '/restart', {method: 'POST'});
+  // Si la tache avait un budget, proposer de le relever (utile apres un arret pour budget atteint).
+  var opts = {method: 'POST'};
+  try {
+    var t = await (await fetch('/api/tasks/' + taskId)).json();
+    if (t && t.max_cost_usd && t.max_cost_usd > 0) {
+      var ans = prompt('Nouveau budget max en $ (vide = garder ' + t.max_cost_usd + ' $) :', '');
+      if (ans !== null && ans.trim() !== '') {
+        opts.headers = {'Content-Type': 'application/json'};
+        opts.body = JSON.stringify({max_cost_usd: parseFloat(ans) || 0});
+      }
+    }
+  } catch(e) {}
+  var r = await fetch('/api/tasks/' + taskId + '/restart', opts);
   if (!r.ok) {
     var d = await r.json();
     feedAdd('<div class="msg err">Reprise impossible : ' + esc(d.detail || '') + '</div>');
