@@ -133,8 +133,11 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 
 <header>
   <h1>Equipe d'<span>agents</span> autonomes</h1>
-  <div><span class="turn" id="turn-info"></span> <span class="badge" id="status-badge" style="display:none"></span>
-    <span class="turn" id="cost-info" style="display:none"></span></div>
+  <div style="display:flex;align-items:center;gap:16px">
+    <span class="turn" id="turn-info"></span> <span class="badge" id="status-badge" style="display:none"></span>
+    <span class="turn" id="cost-info" style="display:none"></span>
+    <a href="/memory" style="color:var(--orange);text-decoration:none;font-weight:600;font-size:.82rem">Gérer la mémoire →</a>
+  </div>
 </header>
 
 <!-- Configuration -->

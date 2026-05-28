@@ -395,6 +395,8 @@ async def lifespan(app):
     await init_db()
     await team.init_team_db()
     await api_control.init_control_db()
+    import memory
+    await memory.init_memory_db()
     log.info("App Creator demarre.")
     yield
     for proc in running_servers.values():
@@ -417,6 +419,9 @@ app.include_router(team.router)
 # prioritaire ; control.html sait lire ce format.
 app.include_router(api_control.router)
 app.include_router(managed_agents.router)  # GET /api/managed-agents + /environment
+import memory as _memory_mod
+if _memory_mod.router is not None:
+    app.include_router(_memory_mod.router)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -519,6 +524,16 @@ async def index():
 async def control_center():
     # URL conviviale pour le centre de controle (= /static/control.html).
     content = (STATIC / "control.html").read_bytes()
+    return Response(
+        content=content,
+        media_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
+
+@app.get("/memory")
+async def memory_page():
+    # URL conviviale pour la page de gestion des notes (= /static/memory.html).
+    content = (STATIC / "memory.html").read_bytes()
     return Response(
         content=content,
         media_type="text/html",

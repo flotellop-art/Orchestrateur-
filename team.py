@@ -938,42 +938,42 @@ async def _stop_mcp(task_id):
 
 
 # ── Memoire long terme partagee (#12) ────────────────────────────────────────
-async def _save_knowledge(content):
+async def _save_knowledge(content, agent_name=None):
+    """Memorise une lecon. Si un agent l'appelle, range dans son namespace ; sinon _shared."""
+    import memory
     content = (content or "").strip()
     if not content:
         return "Rien a memoriser."
-    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
-        await db.execute("INSERT INTO knowledge (content, created_at) VALUES (?,?)",
-                         (content[:4000], datetime.utcnow().isoformat()))
-        await db.commit()
-    return "Connaissance memorisee (disponible pour les taches futures)."
+    ns = memory.role_namespace(agent_name) if agent_name else "_shared"
+    src = ("agent:" + agent_name) if agent_name else "chef"
+    rid = await memory.remember(content[:4000], namespace=ns, source=src)
+    return ("Memorise dans " + ns + " (id #" + str(rid) + ", reutilisable par les futures taches).") \
+        if rid else "Memorisation refusee."
 
 
-async def _search_knowledge(query):
+async def _search_knowledge(query, agent_name=None):
+    """Cherche dans (namespace de l'agent + _shared + _user).
+    Semantique si embeddings dispo (OPENAI_API_KEY), sinon LIKE."""
+    import memory
     query = (query or "").strip()
     if not query:
         return "Requete vide."
-    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
-        db.row_factory = aiosqlite.Row
-        rows = []
-        if _KNOWLEDGE_FTS:
-            try:
-                cur = await db.execute(
-                    "SELECT content FROM knowledge WHERE knowledge MATCH ? ORDER BY rank LIMIT 5", (query,))
-                rows = await cur.fetchall()
-            except Exception:
-                rows = []
-        if not rows:  # repli LIKE (FTS absent ou requete rejetee)
-            cur = await db.execute(
-                "SELECT content FROM knowledge WHERE content LIKE ? ORDER BY rowid DESC LIMIT 5",
-                ("%" + query + "%",))
-            rows = await cur.fetchall()
-    if not rows:
+    namespaces = ["_shared", "_user"]
+    if agent_name:
+        namespaces.insert(0, memory.role_namespace(agent_name))
+    results = await memory.recall(query, namespaces=namespaces, k=5)
+    if not results:
         return "Aucune connaissance trouvee."
-    return NL.join("- " + r["content"] for r in rows)
+    lines = []
+    for r in results:
+        prefix = "[" + str(r.get("namespace", "?")) + "] "
+        score = " (~" + str(r.get("score", "")) + ")" if r.get("score") is not None else ""
+        lines.append("- " + prefix + r["content"] + score)
+    return NL.join(lines)
 
 
-async def execute_tool(task_id: int, folder: str, web_enabled: bool, act: dict) -> str:
+async def execute_tool(task_id: int, folder: str, web_enabled: bool, act: dict,
+                       agent_name: Optional[str] = None) -> str:
     tool = act.get("tool")
     try:
         if tool == "write_file":
@@ -1009,9 +1009,9 @@ async def execute_tool(task_id: int, folder: str, web_enabled: bool, act: dict) 
                                         act.get("name") or act.get("tool_name") or "",
                                         act.get("arguments") or {})
         if tool == "save_knowledge":
-            return await _save_knowledge(act.get("content", ""))
+            return await _save_knowledge(act.get("content", ""), agent_name=agent_name)
         if tool == "search_knowledge":
-            return await _search_knowledge(act.get("query", ""))
+            return await _search_knowledge(act.get("query", ""), agent_name=agent_name)
         return "Outil inconnu: " + str(tool)
     except Exception as e:
         return "Erreur outil " + str(tool) + ": " + str(e)
@@ -1146,8 +1146,11 @@ Regles :
   puis utilise ses outils via mcp_call. Tout serveur non officiel est refuse automatiquement.
   fetch/git/time s'installent tout seuls (Python) ; filesystem/memory/sequentialthinking/everything
   necessitent Node.js. Tu peux aussi installer des paquets toi-meme via run_command (pip install ...).
-- Memoire partagee entre TOUTES les taches : search_knowledge(query) pour retrouver des lecons passees
-  (consulte-la en debut de mission), save_knowledge(content) pour enregistrer une astuce reutilisable.
+- Memoire persistante : search_knowledge(query) cherche dans (TON namespace de role + lecons
+  partagees + notes utilisateur). save_knowledge(content) ENREGISTRE une astuce dans TON namespace
+  de role -- elle te servira (ainsi qu'aux futurs agents du meme role) sur les taches a venir.
+  Consulte la memoire AU DEBUT de chaque mission, et enregistre une lecon AVANT de finir si tu as
+  appris quelque chose de generalisable.
 - Quand ta mission est accomplie : "done": true et un "report". Sinon "done": false avec des actions.
 - Un seul JSON par reponse, aucun texte autour."""
 
@@ -1214,7 +1217,7 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
             tool = act.get("tool")
             await emit(task_id, iteration, name, "tool_call",
                        {"tool": tool, "input": {k: v for k, v in act.items() if k != "tool"}})
-            out = await execute_tool(task_id, folder, web_enabled, act)
+            out = await execute_tool(task_id, folder, web_enabled, act, agent_name=name)
             await emit(task_id, iteration, name, "tool_result", {"tool": tool, "output": out[:1500]})
             return tool, out
 
@@ -1473,6 +1476,24 @@ async def _run_task(task_id, resume=False):
                      "qui produisent l'UI (demande-leur de s'en inspirer fidelement : couleurs, structure, composants). "
                      + start)
 
+        # Memoire : notes utilisateur + leçons partagees les plus pertinentes pour cet objectif
+        try:
+            import memory as _mem
+            user_notes = await _mem.list_namespace("_user", limit=20)
+            shared_hits = await _mem.recall(objective, namespaces=["_shared"], k=5)
+        except Exception as e:
+            log.info("[memoire] indispo (%s)", e)
+            user_notes, shared_hits = [], []
+        memory_block = ""
+        if user_notes:
+            memory_block += (NL + "Notes utilisateur PERSISTANTES (a respecter) :" + NL
+                             + NL.join("- " + n["content"] for n in user_notes[:20]))
+        if shared_hits:
+            memory_block += (NL + NL + "Lecons utiles deja apprises sur des taches passees :" + NL
+                             + NL.join("- " + h["content"] for h in shared_hits[:5]))
+        if memory_block:
+            start = start + NL + memory_block
+
         # Agents Anthropic geres disponibles sur le compte : le chef peut leur deleguer
         # via "assign_managed_agent". Echec de listing -> on continue sans (fonctionne pareil).
         managed_block = ""
@@ -1555,6 +1576,23 @@ async def _run_task(task_id, resume=False):
                                      + ", ".join(sanity["missing"][:15]))
                         await emit(task_id, iteration, "systeme", "info", {"msg": note})
                         final = final + NL + note
+                # Auto-resume : tirer 1-3 lecons reutilisables et les ranger dans la memoire partagee
+                try:
+                    import memory as _mem
+                    msgs = await db_messages_after(task_id, 0)
+                    blob = NL.join(
+                        (m["agent"] + ": " + (json.loads(m["content"]).get("content")
+                                              or json.loads(m["content"]).get("summary")
+                                              or json.loads(m["content"]).get("instruction")
+                                              or "")) if m["content"] and m["content"].startswith("{") else ""
+                        for m in msgs if m["kind"] in ("agent_message", "chef", "done")
+                    )
+                    n_saved = await _mem.summarize_and_save(task_id, objective, blob, _client)
+                    if n_saved:
+                        await emit(task_id, iteration, "systeme", "info",
+                                   {"msg": str(n_saved) + " lecon(s) memorisee(s) pour les futures taches."})
+                except Exception as e:
+                    log.info("[memoire] auto-resume KO : %s", e)
                 await emit(task_id, iteration, "chef", "done", {"summary": final})
                 await db_update_task(task_id, status="done")
                 return
