@@ -22,6 +22,7 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import team
+import api_control
 
 load_dotenv()
 
@@ -381,6 +382,7 @@ async def creation_pipeline(app_id, description, folder, port):
 async def lifespan(app):
     await init_db()
     await team.init_team_db()
+    await api_control.init_control_db()
     log.info("App Creator demarre.")
     yield
     for proc in running_servers.values():
@@ -392,6 +394,10 @@ async def lifespan(app):
 
 app = FastAPI(title="App Creator", lifespan=lifespan)
 app.include_router(team.router)
+# Centre de controle : endpoints d'agregation/monitoring/SSE (chemins nouveaux).
+# Inclus APRES team.router : pour GET /api/tasks, la route de team (liste) reste
+# prioritaire ; control.html sait lire ce format.
+app.include_router(api_control.router)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -479,6 +485,16 @@ async def delete_app(app_id: int):
 @app.get("/")
 async def index():
     content = (STATIC / "index.html").read_bytes()
+    return Response(
+        content=content,
+        media_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
+
+@app.get("/control")
+async def control_center():
+    # URL conviviale pour le centre de controle (= /static/control.html).
+    content = (STATIC / "control.html").read_bytes()
     return Response(
         content=content,
         media_type="text/html",
