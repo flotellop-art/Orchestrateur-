@@ -33,6 +33,7 @@ Thumbs.db
 *.sqlite
 projects/
 _archives/
+chat_workspace/
 
 # Claude Code worktrees
 .claude/worktrees/
