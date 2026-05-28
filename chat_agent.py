@@ -134,7 +134,7 @@ async def _run_loop(session_id: str, messages: list) -> AsyncGenerator[str, None
         tool_use_data: dict = {}
         try:
             async with _get_client().messages.stream(
-                model="claude-opus-4-6",
+                model="claude-opus-4-8",
                 max_tokens=4096,
                 system=SYSTEM_PROMPT,
                 tools=TOOLS,

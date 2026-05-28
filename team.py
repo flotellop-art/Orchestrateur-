@@ -45,7 +45,7 @@ PROJECTS.mkdir(exist_ok=True)
 # Modeles par defaut par provider (verifies via recherche web, mai 2026).
 # Gemini 3.5 Pro n'est pas encore dispo (prevu juin 2026) -> tier Flash, stable.
 # Un identifiant errone n'est pas bloquant : le provider retombe sur Claude (voir call_model).
-DEFAULT_CLAUDE = "claude-opus-4-7"          # chef (planification/securite) + repli generique
+DEFAULT_CLAUDE = "claude-opus-4-8"          # chef (planification/securite) + repli generique
 DEFAULT_WORKER_CLAUDE = "claude-sonnet-4-6"  # agents/workers par defaut (moins cher, le chef peut surclasser)
 DEFAULT_GEMINI = "gemini-3.5-flash"
 DEFAULT_OPENAI = "gpt-5.5"
@@ -943,7 +943,7 @@ A CHAQUE TOUR, reponds UNIQUEMENT avec un objet JSON (aucun texte autour) decriv
   {{"thought":"...","action":"create_agent","name":"NomCourt","role":"role / specialite","provider":"claude"}}
   ("provider" peut etre "claude", "gemini" ou "openai")
   Par defaut les agents tournent sur un modele economique (Claude Sonnet). Pour une tache complexe,
-  tu peux ajouter "model":"claude-opus-4-7" afin de surclasser cet agent.
+  tu peux ajouter "model":"claude-opus-4-8" afin de surclasser cet agent.
 
 - Confier une sous-tache a un agent existant :
   {{"thought":"...","action":"assign_task","agent":"NomDeLAgent","instruction":"consigne precise et autonome"}}
@@ -997,7 +997,7 @@ LIVRABLES attendus dans delivery/ :
 
 Tu peux creer jusqu'a {max_agents} agents (analystes, dev front, dev back, QA, securite, recherche...).
 A CHAQUE TOUR, reponds UNIQUEMENT avec un objet JSON (aucun texte autour) :
-- {{"thought":"...","action":"create_agent","name":"NomCourt","role":"role","provider":"claude"}}  (provider: claude|gemini|openai ; agents en modele economique par defaut, ajoute "model":"claude-opus-4-7" pour surclasser une tache complexe)
+- {{"thought":"...","action":"create_agent","name":"NomCourt","role":"role","provider":"claude"}}  (provider: claude|gemini|openai ; agents en modele economique par defaut, ajoute "model":"claude-opus-4-8" pour surclasser une tache complexe)
 - {{"thought":"...","action":"assign_task","agent":"Nom","instruction":"consigne precise"}}
 - {{"thought":"...","action":"parallel_assign","assignments":[{{"agent":"A","instruction":"..."}},{{"agent":"B","instruction":"..."}}]}}  (agents distincts, fichiers disjoints)
 - {{"thought":"...","action":"challenge","instruction":"...","rounds":2}}  (verification croisee 3 modeles)

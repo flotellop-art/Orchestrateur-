@@ -47,12 +47,15 @@ DB_PATH = Path(__file__).parent / "apps.db"
 # ── Table des prix approximatifs par modèle ($/1 000 tokens) ─────────────────
 # Source : tarifs publics mai 2026 — à mettre à jour si nécessaire.
 _PRICE_PER_1K: dict[str, dict[str, float]] = {
-    # Claude
-    "claude-opus-4-7":       {"input": 0.015,   "output": 0.075},
-    "claude-opus-4-5":       {"input": 0.015,   "output": 0.075},
+    # Claude — tarifs Anthropic verifies (mai 2026)
+    "claude-opus-4-8":       {"input": 0.005,   "output": 0.025},   # NOUVEAU phare
+    "claude-opus-4-7":       {"input": 0.005,   "output": 0.025},   # (etait 0.015/0.075 par erreur)
+    "claude-opus-4-6":       {"input": 0.005,   "output": 0.025},
+    "claude-opus-4-5":       {"input": 0.005,   "output": 0.025},   # (etait 0.015/0.075 par erreur)
+    "claude-opus-4-1":       {"input": 0.015,   "output": 0.075},   # ancien tarif Opus haut
     "claude-sonnet-4-6":     {"input": 0.003,   "output": 0.015},
     "claude-sonnet-4-5":     {"input": 0.003,   "output": 0.015},
-    "claude-haiku-4-5":      {"input": 0.00025, "output": 0.00125},
+    "claude-haiku-4-5":      {"input": 0.001,   "output": 0.005},   # (etait 4x trop bas)
     "claude-3-5-sonnet":     {"input": 0.003,   "output": 0.015},
     "claude-3-haiku":        {"input": 0.00025, "output": 0.00125},
     # OpenAI
@@ -65,7 +68,7 @@ _PRICE_PER_1K: dict[str, dict[str, float]] = {
     "gemini-2.0-flash":      {"input": 0.000075, "output": 0.0003},
     "gemini-1.5-pro":        {"input": 0.00125,  "output": 0.005},
 }
-_PRICE_DEFAULT = {"input": 0.003, "output": 0.015}  # fallback générique
+_PRICE_DEFAULT = {"input": 0.003, "output": 0.015}  # fallback (= tarif Sonnet)
 
 
 def _price(model: str, input_tokens: int, output_tokens: int) -> float:
