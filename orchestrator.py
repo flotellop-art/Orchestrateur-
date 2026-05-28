@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 import team
 import api_control
+import managed_agents  # pont vers les Agents geres Anthropic
 from auth_middleware import add_auth_middleware
 from patches.security.cors_config import add_cors_middleware
 
@@ -415,6 +416,7 @@ app.include_router(team.router)
 # Inclus APRES team.router : pour GET /api/tasks, la route de team (liste) reste
 # prioritaire ; control.html sait lire ce format.
 app.include_router(api_control.router)
+app.include_router(managed_agents.router)  # GET /api/managed-agents + /environment
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────

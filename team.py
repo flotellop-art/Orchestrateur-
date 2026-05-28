@@ -33,6 +33,8 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+import managed_agents  # pont vers les Agents geres Anthropic (delegation depuis le chef)
+
 load_dotenv(Path(__file__).parent / ".env", override=False)
 log = logging.getLogger(__name__)
 
@@ -1043,6 +1045,12 @@ A CHAQUE TOUR, reponds UNIQUEMENT avec un objet JSON (aucun texte autour) decriv
   le critiquent chacun de leur cote ; il n'est valide que si les deux critiques approuvent, sinon il
   corrige sur plusieurs tours. Utilise-le pour les livrables importants ou sensibles aux erreurs.
 
+- Deleguer a un AGENT ANTHROPIC GERE (heberge cote Anthropic, identifie par son `agent_id`) :
+  {{"thought":"...","action":"assign_managed_agent","agent_id":"agent_...","instruction":"consigne autonome"}}
+  La liste des agents disponibles t'est fournie dans le contexte (champ "Agents Anthropic geres").
+  Utilise-les quand l'un d'eux a deja le role/contexte recherche (ex. un "Watcher" pour la veille).
+  Le retour est UN TEXTE seulement (lecture) -- l'agent gere ne touche pas a tes fichiers locaux.
+
 - Terminer (objectif atteint) :
   {{"thought":"...","action":"finish","final":"resume du resultat livre"}}
 
@@ -1464,6 +1472,20 @@ async def _run_task(task_id, resume=False):
             start = ("Une maquette de design a ete fournie par l'utilisateur ; elle est transmise aux agents "
                      "qui produisent l'UI (demande-leur de s'en inspirer fidelement : couleurs, structure, composants). "
                      + start)
+
+        # Agents Anthropic geres disponibles sur le compte : le chef peut leur deleguer
+        # via "assign_managed_agent". Echec de listing -> on continue sans (fonctionne pareil).
+        managed_block = ""
+        try:
+            managed = await managed_agents.list_agents()
+            actives = [a for a in managed if (a.get("status") or "").lower() in ("actif", "active", "")]
+            if actives:
+                lines = [a["id"] + " — " + (a.get("name") or "") for a in actives[:60]]
+                managed_block = (NL + "Agents Anthropic geres disponibles (action 'assign_managed_agent') :"
+                                 + NL + NL.join("- " + l for l in lines))
+        except Exception as e:
+            log.info("[managed-agents] listing indisponible (%s) — le chef tournera sans.", e)
+
         worker_histories: dict[str, list] = {}
         if resume:
             iteration = int(task.get("iteration") or 0)
@@ -1473,7 +1495,7 @@ async def _run_task(task_id, resume=False):
             await emit(task_id, iteration, "systeme", "info",
                        {"msg": "Reprise de la tache au tour " + str(iteration) + " (contexte reconstruit)."})
         else:
-            chef_messages = [{"role": "user", "content": start}]
+            chef_messages = [{"role": "user", "content": start + managed_block}]
             iteration = 0
 
         await db_update_task(task_id, status="running")
@@ -1573,6 +1595,36 @@ async def _run_task(task_id, resume=False):
                                       "Rapport de " + target + " : " + report[:2000]})
                 continue
 
+            if action == "assign_managed_agent":
+                agent_id = (decision.get("agent_id") or "").strip()
+                instruction = decision.get("instruction", "") or ""
+                if not agent_id or not agent_id.startswith("agent_"):
+                    chef_messages.append({"role": "user", "content":
+                                          "assign_managed_agent : champ 'agent_id' manquant ou invalide (doit etre 'agent_...')."})
+                    continue
+                label = (decision.get("name") or agent_id)
+                await emit(task_id, iteration, label, "agent_message",
+                           {"kind": "thought",
+                            "content": "Delegation a l'agent gere Anthropic " + agent_id + "..."})
+
+                async def _on_text(t, _l=label, _it=iteration):
+                    await emit(task_id, _it, _l, "agent_message", {"kind": "result", "content": t})
+
+                try:
+                    res = await managed_agents.run_session(agent_id, instruction, on_text=_on_text)
+                    text = res.get("text") or "(reponse vide)"
+                    chef_messages.append({"role": "user", "content":
+                                          "Rapport de l'agent gere " + agent_id + " (statut="
+                                          + str(res.get("status")) + ", stop_reason="
+                                          + str(res.get("stop_reason")) + ") :" + NL + text[:3000]})
+                except Exception as e:
+                    log.warning("[managed-agents] erreur session %s : %s", agent_id, e)
+                    await notice("Agent gere " + agent_id + " : erreur " + str(e)[:200])
+                    chef_messages.append({"role": "user", "content":
+                                          "assign_managed_agent a echoue (" + str(e)[:200]
+                                          + "). Essaie un autre agent ou une autre action."})
+                continue
+
             if action == "parallel_assign":
                 assigns = decision.get("assignments", []) or []
                 # Compter les doublons : un agent assigne plusieurs fois en parallele
@@ -1617,7 +1669,8 @@ async def _run_task(task_id, resume=False):
                 continue
 
             chef_messages.append({"role": "user", "content":
-                                  "Action non reconnue. Utilise create_agent, assign_task, challenge ou finish."})
+                                  "Action non reconnue. Utilise create_agent, assign_task, "
+                                  "parallel_assign, challenge, assign_managed_agent ou finish."})
 
         if not await _is_stopped(task_id):
             await emit(task_id, iteration, "chef", "done",
