@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -64,10 +64,10 @@ async def init_db():
 
 async def db_create(description, folder, port):
     async with aiosqlite.connect(DB_PATH) as db:
-        name_val = "app-" + datetime.utcnow().strftime("%H%M%S")
+        name_val = "app-" + datetime.now(timezone.utc).strftime("%H%M%S")
         cur = await db.execute(
             "INSERT INTO apps (name,description,folder,status,port,created_at) VALUES (?,?,?,?,?,?)",
-            (name_val, description, folder, "creating", port, datetime.utcnow().isoformat())
+            (name_val, description, folder, "creating", port, datetime.now(timezone.utc).isoformat())
         )
         await db.commit()
         return cur.lastrowid
@@ -447,12 +447,17 @@ async def list_apps():
 @app.post("/api/create")
 async def create_app(request: Request):
     body = await request.json()
-    description = body.get("description", "").strip()
+    description = body.get("description", "")
+    if not isinstance(description, str):
+        raise HTTPException(400, "Description invalide")
+    description = description.strip()
     if not description:
         raise HTTPException(400, "Description manquante")
+    if len(description) > 5000:
+        raise HTTPException(400, "Description trop longue (max 5000 caractères)")
 
     port   = await find_free_port(3000)
-    folder = str(PROJECTS / "app_{}".format(datetime.utcnow().strftime("%Y%m%d_%H%M%S")))
+    folder = str(PROJECTS / "app_{}".format(datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")))
     app_id = await db_create(description, folder, port)
 
     async def stream():
@@ -544,4 +549,16 @@ app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("orchestrator:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+    # Sécurité : loopback par défaut. Le serveur exécute du code généré par IA et
+    # l'auth est opt-in (auth_middleware) — l'exposer sur le réseau sans clé = RCE
+    # non authentifiée. Pour exposer (ORCH_HOST≠loopback), une API_SECRET_KEY est
+    # alors OBLIGATOIRE, sinon on refuse de démarrer.
+    host = os.getenv("ORCH_HOST", "127.0.0.1")
+    _loopback = {"127.0.0.1", "localhost", "::1", ""}
+    if host not in _loopback and not os.getenv("API_SECRET_KEY", "").strip():
+        raise SystemExit(
+            "REFUS DE DÉMARRER : ORCH_HOST=%s expose le serveur sur le réseau "
+            "sans authentification. Définissez API_SECRET_KEY (.env) ou laissez "
+            "ORCH_HOST=127.0.0.1." % host
+        )
+    uvicorn.run("orchestrator:app", host=host, port=int(os.getenv("PORT", "8000")), reload=False)
