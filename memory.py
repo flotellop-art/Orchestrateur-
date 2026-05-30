@@ -134,7 +134,7 @@ async def remember(content: str, namespace: str = "_shared",
         cur = await db.execute(
             "INSERT INTO knowledge_v2 (content, namespace, source, embedding, created_at) "
             "VALUES (?,?,?,?,?)",
-            (content, namespace, source, blob, datetime.utcnow().isoformat()),
+            (content, namespace, source, blob, datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
         return cur.lastrowid

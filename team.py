@@ -212,7 +212,7 @@ async def db_create_task(objective, folder, max_iterations, max_agents, web_enab
             "company_mode,target_path,max_cost_usd,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (objective, folder, "idle", max_iterations, max_agents,
              1 if web_enabled else 0, chef_model,
-             1 if company_mode else 0, target_path, max_cost_usd, datetime.utcnow().isoformat()),
+             1 if company_mode else 0, target_path, max_cost_usd, datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
         return cur.lastrowid
@@ -266,7 +266,7 @@ async def db_add_agent(task_id, name, role, provider, model, created_by):
         await db.execute(
             "INSERT INTO task_agents (task_id,name,role,provider,model,created_by,created_at)"
             " VALUES (?,?,?,?,?,?,?)",
-            (task_id, name, role, provider, model, created_by, datetime.utcnow().isoformat()),
+            (task_id, name, role, provider, model, created_by, datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
 
@@ -291,7 +291,7 @@ async def emit(task_id, iteration, agent, kind, payload: dict):
         await db.execute(
             "INSERT INTO messages (task_id,iteration,agent,kind,content,created_at) VALUES (?,?,?,?,?,?)",
             (task_id, iteration, agent, kind, json.dumps(payload, ensure_ascii=False),
-             datetime.utcnow().isoformat()),
+             datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
 
@@ -305,7 +305,7 @@ async def _log_prompt(task_id, iteration, agent, system, messages, image=None):
     async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         await db.execute(
             "INSERT INTO prompts (task_id, iteration, agent, payload, created_at) VALUES (?,?,?,?,?)",
-            (task_id, iteration, agent, payload, datetime.utcnow().isoformat()))
+            (task_id, iteration, agent, payload, datetime.now(timezone.utc).isoformat()))
         await db.commit()
 
 
@@ -483,6 +483,19 @@ async def _account_cost(task_id, usage, on_notice=None):
     ctrl["out_tok"] = ctrl.get("out_tok", 0) + usage.get("output", 0)
     total = ctrl["cost"]
     await db_update_task(task_id, total_cost_usd=round(total, 6))
+    # Alimente la table token_usage du centre de contrôle (dashboard monitoring).
+    # Défensif : ne jamais casser la boucle agent si l'enregistrement échoue.
+    try:
+        import api_control
+        await api_control.record_token_usage(
+            provider=str(usage.get("model", ""))[:20],
+            model=str(usage.get("model", "")),
+            input_tokens=int(usage.get("input", 0) or 0),
+            output_tokens=int(usage.get("output", 0) or 0),
+            task_id=task_id,
+        )
+    except Exception as exc:
+        log.warning("[team] record_token_usage ignoré : %s", exc)
     await emit(task_id, 0, "systeme", "cost",
                {"cost": round(total, 4), "in": ctrl["in_tok"], "out": ctrl["out_tok"]})
     cap = ctrl.get("max_cost", 0) or 0
@@ -1785,7 +1798,7 @@ async def create_task(body: TaskCreate):
         else:
             raise HTTPException(400, "Mode entreprise : fournis une URL GitHub (target_repo_url) "
                                      "OU un chemin local existant (target_path).")
-    folder = str(PROJECTS / ("task_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    folder = str(PROJECTS / ("task_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                              + "_" + uuid.uuid4().hex[:6]))
     Path(folder).mkdir(parents=True, exist_ok=True)
     if company:
@@ -2211,7 +2224,7 @@ async def _run_build(task_id, folder):
     report = json.dumps(steps, ensure_ascii=False)
     async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         await db.execute("INSERT INTO builds (task_id, status, report, created_at) VALUES (?,?,?,?)",
-                         (task_id, status, report, datetime.utcnow().isoformat()))
+                         (task_id, status, report, datetime.now(timezone.utc).isoformat()))
         await db.commit()
     return {"status": status, "steps": steps}
 
