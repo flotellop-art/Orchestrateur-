@@ -422,6 +422,56 @@ async def _call_claude(model, system, messages, on_notice=None, image=None):
         return await _claude_request(STABLE_CLAUDE, system, messages, image)
 
 
+# ── Tool use NATIF + pensee adaptative (chef + workers Claude) ────────────────
+def _usage_from_response(resp, model):
+    # Construit le dict usage a partir d'une reponse Claude (memes champs que _claude_request).
+    u = resp.usage
+    return {"model": model,
+            "input": ((getattr(u, "input_tokens", 0) or 0)
+                      + (getattr(u, "cache_creation_input_tokens", 0) or 0)
+                      + (getattr(u, "cache_read_input_tokens", 0) or 0)),
+            "output": getattr(u, "output_tokens", 0) or 0}
+
+
+async def _claude_request_native(model, system, messages, tools, image=None):
+    # Appel non-streaming avec outils natifs + pensee adaptative (resume).
+    kwargs = dict(
+        model=model,
+        max_tokens=MAX_TOKENS,
+        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        messages=_attach_image_claude(messages, image),
+        tools=tools,
+        thinking={"type": "adaptive", "display": "summarized"},
+    )
+    try:
+        resp = await _client.messages.create(**kwargs)
+    except anthropic.BadRequestError as e:
+        # Repli gracieux : les anciens modeles ne supportent pas la pensee adaptative.
+        msg = str(getattr(e, "message", "") or e).lower()
+        if "thinking" in msg or "adaptive" in msg:
+            kwargs.pop("thinking", None)
+            resp = await _client.messages.create(**kwargs)
+        else:
+            raise
+    return resp, _usage_from_response(resp, model)
+
+
+async def _call_claude_native(model, system, messages, tools, on_notice=None, image=None):
+    # Mirroir de _call_claude pour le mode natif : repli sur STABLE_CLAUDE en cas d'erreur.
+    # Rejouer des blocs de pensee produits par un autre modele Claude est accepte par l'API.
+    target = model or DEFAULT_CLAUDE
+    try:
+        return await _claude_request_native(target, system, messages, tools, image)
+    except Exception as e:
+        if target == STABLE_CLAUDE:
+            raise  # le modele de repli a aussi echoue : on remonte l'erreur
+        log.warning("[modele] Claude natif %s erreur: %s -> repli %s", target, e, STABLE_CLAUDE)
+        if on_notice:
+            await on_notice("Erreur Claude " + target + " (" + str(e)[:100]
+                            + ") -> repli sur " + STABLE_CLAUDE + ".")
+        return await _claude_request_native(STABLE_CLAUDE, system, messages, tools, image)
+
+
 async def _call_gemini(model, system, messages, image=None):
     from google import genai  # nouveau paquet google-genai, importe a la demande
     from google.genai import types
@@ -1046,6 +1096,127 @@ async def execute_tool(task_id: int, folder: str, web_enabled: bool, act: dict,
         return "Erreur outil " + str(tool) + ": " + str(e)
 
 
+# ── Outils natifs du chef (tool use Anthropic) ───────────────────────────────
+# Schemas stricts : additionalProperties=False + required explicites. Le chef AGIT
+# en appelant ces outils ; plus aucun protocole JSON maison.
+CHEF_TOOLS = [
+    {
+        "name": "create_agent",
+        "description": ("Cree un agent de l'equipe avec un nom court et un role. Par defaut les agents "
+                        "tournent sur un modele economique (Claude Sonnet). Pour une tache complexe, "
+                        "passe \"model\":\"claude-opus-4-8\" afin de surclasser cet agent. Cree un agent "
+                        "AVANT de lui assigner une tache."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Nom court et unique de l'agent."},
+                "role": {"type": "string", "description": "Role / specialite (ex: chercheur, dev back, QA)."},
+                "provider": {"type": "string", "enum": ["claude", "gemini", "openai"],
+                             "description": "Fournisseur du modele (par defaut claude)."},
+                "model": {"type": "string",
+                          "description": "Identifiant du modele (optionnel ; claude-opus-4-8 pour surclasser)."},
+            },
+            "required": ["name", "role"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "assign_task",
+        "description": ("Confie une sous-tache precise et autonome a un agent EXISTANT. L'agent ecrit ses "
+                        "livrables dans des fichiers du dossier partage."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "description": "Nom de l'agent existant a qui confier la tache."},
+                "instruction": {"type": "string", "description": "Consigne precise et autonome."},
+            },
+            "required": ["agent", "instruction"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "parallel_assign",
+        "description": ("Confie plusieurs sous-taches EN PARALLELE pour gagner du temps. Utilise des agents "
+                        "DISTINCTS et des FICHIERS DISJOINTS uniquement (sinon risque de conflits)."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "assignments": {
+                    "type": "array",
+                    "description": "Liste d'assignations (agents distincts, fichiers disjoints).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string", "description": "Nom de l'agent existant."},
+                            "instruction": {"type": "string", "description": "Consigne precise et autonome."},
+                        },
+                        "required": ["agent", "instruction"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["assignments"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "challenge",
+        "description": ("Verification croisee adversariale entre modeles, pour les livrables importants ou "
+                        "sensibles aux erreurs. Un Producteur (Claude par defaut) realise le travail, puis "
+                        "les autres modeles (Gemini et ChatGPT) le critiquent ; il n'est valide que si tous "
+                        "approuvent, sinon il corrige sur plusieurs tours."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "instruction": {"type": "string", "description": "Consigne precise du livrable a produire."},
+                "rounds": {"type": "integer", "description": "Nombre de tours de correction (optionnel, defaut 2)."},
+                "producer_provider": {"type": "string", "enum": ["claude", "gemini", "openai"],
+                                      "description": "Fournisseur du Producteur (optionnel, defaut claude)."},
+                "critic_providers": {"type": "array", "items": {"type": "string"},
+                                     "description": "Fournisseurs des critiques (optionnel)."},
+            },
+            "required": ["instruction"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "assign_managed_agent",
+        "description": ("Delegue a un AGENT ANTHROPIC GERE (heberge cote Anthropic) liste dans le contexte "
+                        "(champ \"Agents Anthropic geres\"), identifie par son agent_id. Utilise-le quand l'un "
+                        "d'eux a deja le role/contexte recherche. Le retour est UN TEXTE seulement -- l'agent "
+                        "gere ne touche pas a tes fichiers locaux."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "Identifiant de l'agent gere (agent_...)."},
+                "instruction": {"type": "string", "description": "Consigne autonome pour l'agent gere."},
+            },
+            "required": ["agent_id", "instruction"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "finish",
+        "description": ("Appelle cet outil quand l'objectif est atteint, avec un resume de ce qui a ete "
+                        "livre."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "final": {"type": "string", "description": "Resume du resultat livre."},
+            },
+            "required": ["final"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+
 # ── Prompts systeme ─────────────────────────────────────────────────────────
 CHEF_SYSTEM = """Tu es le CHEF d'une equipe d'agents IA autonomes.
 
@@ -1053,43 +1224,17 @@ OBJECTIF GLOBAL (fixe par l'utilisateur) :
 {objective}
 
 Tu construis et diriges l'equipe toi-meme. Tu peux creer jusqu'a {max_agents} agents.
-A CHAQUE TOUR, reponds UNIQUEMENT avec un objet JSON (aucun texte autour) decrivant ta PROCHAINE action :
-
-- Creer un agent :
-  {{"thought":"...","action":"create_agent","name":"NomCourt","role":"role / specialite","provider":"claude"}}
-  ("provider" peut etre "claude", "gemini" ou "openai")
-  Par defaut les agents tournent sur un modele economique (Claude Sonnet). Pour une tache complexe,
-  tu peux ajouter "model":"claude-opus-4-8" afin de surclasser cet agent.
-
-- Confier une sous-tache a un agent existant :
-  {{"thought":"...","action":"assign_task","agent":"NomDeLAgent","instruction":"consigne precise et autonome"}}
-
-- Confier PLUSIEURS sous-taches EN PARALLELE (gagne du temps) :
-  {{"thought":"...","action":"parallel_assign","assignments":[{{"agent":"DevA","instruction":"le frontend"}},{{"agent":"DevB","instruction":"le backend"}}]}}
-  IMPORTANT : agents DISTINCTS et FICHIERS DISJOINTS uniquement (sinon risque de conflits).
-
-- Lancer un CHALLENGE (verification croisee entre les trois modeles) :
-  {{"thought":"...","action":"challenge","instruction":"consigne precise","rounds":2}}
-  Un Producteur (Claude par defaut) realise le travail, puis les DEUX autres modeles (Gemini et ChatGPT)
-  le critiquent chacun de leur cote ; il n'est valide que si les deux critiques approuvent, sinon il
-  corrige sur plusieurs tours. Utilise-le pour les livrables importants ou sensibles aux erreurs.
-
-- Deleguer a un AGENT ANTHROPIC GERE (heberge cote Anthropic, identifie par son `agent_id`) :
-  {{"thought":"...","action":"assign_managed_agent","agent_id":"agent_...","instruction":"consigne autonome"}}
-  La liste des agents disponibles t'est fournie dans le contexte (champ "Agents Anthropic geres").
-  Utilise-les quand l'un d'eux a deja le role/contexte recherche (ex. un "Watcher" pour la veille).
-  Le retour est UN TEXTE seulement (lecture) -- l'agent gere ne touche pas a tes fichiers locaux.
-
-- Terminer (objectif atteint) :
-  {{"thought":"...","action":"finish","final":"resume du resultat livre"}}
+Tu AGIS en appelant tes outils (create_agent, assign_task, parallel_assign, challenge,
+assign_managed_agent, finish). Pense d'abord, puis declenche l'outil adapte a ta prochaine action.
 
 Regles :
 - Decompose l'objectif, cree les roles utiles (ex: chercheur, codeur, redacteur, critique), delegue, fais iterer puis termine.
-- Un seul JSON, une seule action par tour.
 - Cree un agent AVANT de lui assigner une tache.
 - Les agents ecrivent leurs livrables dans des fichiers du dossier partage.
-- Pour un livrable important ou sensible aux erreurs, prefere "challenge" a un simple "assign_task" afin que les deux modeles se confrontent.
-- Quand le travail est valide, utilise "finish"."""
+- Pour confier plusieurs sous-taches d'un coup, utilise parallel_assign avec des agents DISTINCTS et des FICHIERS DISJOINTS.
+- Pour un livrable important ou sensible aux erreurs, prefere challenge a un simple assign_task afin que les modeles se confrontent.
+- Tu peux deleguer a un agent Anthropic gere (assign_managed_agent) quand l'un d'eux a deja le role/contexte recherche.
+- Quand le travail est valide, appelle finish avec un resume du resultat livre."""
 
 
 # Prompt du "CEO" en mode entreprise tech (autopilote d'audit de depot externe).
@@ -1118,15 +1263,11 @@ LIVRABLES attendus dans delivery/ :
 - delivery/HANDOFF.md : resume pour Claude Code (quoi a verifier/appliquer, fichiers concernes, comment tester).
 
 Tu peux creer jusqu'a {max_agents} agents (analystes, dev front, dev back, QA, securite, recherche...).
-A CHAQUE TOUR, reponds UNIQUEMENT avec un objet JSON (aucun texte autour) :
-- {{"thought":"...","action":"create_agent","name":"NomCourt","role":"role","provider":"claude"}}  (provider: claude|gemini|openai ; agents en modele economique par defaut, ajoute "model":"claude-opus-4-8" pour surclasser une tache complexe)
-- {{"thought":"...","action":"assign_task","agent":"Nom","instruction":"consigne precise"}}
-- {{"thought":"...","action":"parallel_assign","assignments":[{{"agent":"A","instruction":"..."}},{{"agent":"B","instruction":"..."}}]}}  (agents distincts, fichiers disjoints)
-- {{"thought":"...","action":"challenge","instruction":"...","rounds":2}}  (verification croisee 3 modeles)
-- {{"thought":"...","action":"finish","final":"resume des livrables dans delivery/ + chemin a transmettre a Claude Code"}}
-
-Regles : un seul JSON par tour ; cree un agent avant de lui assigner une tache ; rappelle a chaque
-agent d'ecrire UNIQUEMENT dans delivery/ ; quand le travail est livre, "finish".
+Tu AGIS en appelant tes outils (create_agent, assign_task, parallel_assign, challenge,
+assign_managed_agent, finish). Cree un agent avant de lui assigner une tache ; rappelle a chaque agent
+d'ecrire UNIQUEMENT dans delivery/ ; pour parallel_assign garde des agents distincts et des fichiers
+disjoints ; utilise challenge (verification croisee) pour les livrables sensibles ; quand le travail
+est livre, appelle finish avec un resume des livrables dans delivery/ et le chemin a transmettre a Claude Code.
 
 METHODE DE TRAVAIL OBLIGATOIRE (qualite avant volume — un humain "Claude Code" relira et appliquera) :
 1. VERITE TERRAIN D'ABORD. Avant TOUTE proposition, fais LIRE le code reel concerne (read_file sur le
@@ -1184,6 +1325,162 @@ Regles :
 - Un seul JSON par reponse, aucun texte autour."""
 
 
+# ── Outils natifs des workers Claude (tool use Anthropic) ────────────────────
+# Schemas stricts (additionalProperties=False) SAUF mcp_call dont les "arguments" sont
+# un objet libre : strict requiert additionalProperties=false partout, donc on n'active
+# PAS strict sur mcp_call uniquement.
+WORKER_TOOLS = [
+    {
+        "name": "write_file",
+        "description": ("Ecrit un livrable dans un fichier du dossier de travail. Utilise des chemins "
+                        "RELATIFS. C'est ainsi que tu produis tes resultats."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Chemin relatif du fichier a ecrire."},
+                "content": {"type": "string", "description": "Contenu complet du fichier."},
+            },
+            "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "read_file",
+        "description": ("Lit un fichier du dossier de travail (ou, en mode entreprise, du depot cible en "
+                        "lecture seule). Utilise-le pour consulter le code reel avant d'agir."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Chemin relatif du fichier a lire."},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "run_command",
+        "description": ("Execute une commande autorisee dans le dossier de travail (ex: lancer un script, "
+                        "installer un paquet Python avec pip)."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cmd": {"type": "string", "description": "Commande a executer (premier mot en liste blanche)."},
+            },
+            "required": ["cmd"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "run_tests",
+        "description": "Lance la suite de tests (pytest) sur le dossier de travail.",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "web_search",
+        "description": ("Recherche sur le web. Utilise-le quand l'information n'est pas dans le dossier de "
+                        "travail et que la recherche web est activee pour cette tache."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Requete de recherche."},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "add_mcp",
+        "description": ("Active un serveur MCP OFFICIEL (fetch, git, time, filesystem, memory, "
+                        "sequentialthinking, everything), puis appelle ses outils via mcp_call. Tout serveur "
+                        "non officiel est refuse."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "server": {"type": "string", "description": "Nom du serveur MCP officiel a activer."},
+            },
+            "required": ["server"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "mcp_call",
+        "description": ("Appelle un outil d'un serveur MCP deja active avec add_mcp. Les arguments sont un "
+                        "objet libre propre a l'outil appele."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "server": {"type": "string", "description": "Nom du serveur MCP actif."},
+                "name": {"type": "string", "description": "Nom de l'outil MCP a appeler."},
+                "arguments": {"type": "object", "description": "Arguments de l'outil.",
+                              "additionalProperties": True},
+            },
+            "required": ["server", "name"],
+        },
+    },
+    {
+        "name": "save_knowledge",
+        "description": ("ENREGISTRE une astuce reutilisable dans TON namespace de role -- elle te servira "
+                        "(ainsi qu'aux futurs agents du meme role) sur les taches a venir. Enregistre une "
+                        "lecon AVANT de finir si tu as appris quelque chose de generalisable."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Lecon ou astuce a memoriser."},
+            },
+            "required": ["content"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "search_knowledge",
+        "description": ("Cherche dans la memoire persistante (TON namespace de role + lecons partagees + "
+                        "notes utilisateur). Consulte la memoire AU DEBUT de chaque mission."),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Requete de recherche dans la memoire."},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+WORKER_SYSTEM_NATIVE = """Tu es l'agent << {name} >>. Ton role : {role}.
+Tu travailles dans un dossier de travail partage avec ton equipe. Recherche web disponible : {web}.
+
+Agis en appelant tes outils. Quand ta mission est accomplie, n'appelle plus d'outils et redige ton
+rapport final en texte.
+
+Regles :
+- Ecris tes livrables dans des fichiers (write_file), chemins relatifs au dossier de travail.
+- Commandes autorisees (run_command) : {whitelist}.
+- Tu peux installer des paquets Python via run_command (ex: "pip install requests").
+- Outils MCP OFFICIELS uniquement : active un serveur avec add_mcp (autorises : {mcp_servers}),
+  puis utilise ses outils via mcp_call. Tout serveur non officiel est refuse automatiquement.
+  fetch/git/time s'installent tout seuls (Python) ; filesystem/memory/sequentialthinking/everything
+  necessitent Node.js. Tu peux aussi installer des paquets toi-meme via run_command (pip install ...).
+- Memoire persistante : search_knowledge(query) cherche dans (TON namespace de role + lecons
+  partagees + notes utilisateur). save_knowledge(content) ENREGISTRE une astuce dans TON namespace
+  de role -- elle te servira (ainsi qu'aux futurs agents du meme role) sur les taches a venir.
+  Consulte la memoire AU DEBUT de chaque mission, et enregistre une lecon AVANT de finir si tu as
+  appris quelque chose de generalisable."""
+
+
 # ── Controle de la boucle ────────────────────────────────────────────────────
 async def _wait_if_paused(task_id):
     ctrl = running_tasks.get(task_id)
@@ -1197,8 +1494,112 @@ async def _is_stopped(task_id) -> bool:
 
 
 # ── Moteur : un worker execute une sous-tache ───────────────────────────────
+def _company_addendum(system):
+    # Addendum du mode entreprise, ajoute au prompt systeme des workers (natif et legacy).
+    return (system + NL + "MODE ENTREPRISE : le depot d'origine est en LECTURE SEULE (read_file le voit). "
+            "Tu ecris (write_file) UNIQUEMENT dans 'delivery/...'. Ne tente jamais d'ecrire hors du "
+            "dossier de travail. Teste tes correctifs dans delivery/ avant de livrer." + NL
+            + "AVANT de proposer un changement : LIS le code reel concerne (read_file sur la cible : "
+            "schema.sql, migrations, config/bindings, fichiers vises, CLAUDE.md). Ne suppose pas "
+            "qu'une table/binding/endpoint/stockage existe — verifie. Marque toute hypothese "
+            "'HYPOTHESE A VALIDER'. Ne RETIRE jamais une protection de securite existante (CSRF, "
+            "auth, rate-limit, sanitization). Peu de correctifs qui marchent > un gros dump. Ne "
+            "reference aucun fichier que tu n'as pas reellement ecrit.")
+
+
 async def _run_worker(task_id, iteration, agent, instruction, folder, web_enabled,
                       worker_histories, notice, image=None, custom_hist=None) -> str:
+    # Aiguillage : provider claude -> boucle native (tool use Anthropic) ;
+    # gemini/openai -> boucle legacy (protocole JSON via call_model).
+    if agent["provider"] != "claude":
+        return await _run_worker_legacy(task_id, iteration, agent, instruction, folder, web_enabled,
+                                        worker_histories, notice, image=image, custom_hist=custom_hist)
+    name = agent["name"]
+    hist = custom_hist if custom_hist is not None else worker_histories.setdefault(name, [])
+    hist.append({"role": "user", "content": "Mission du chef : " + instruction})
+    system = WORKER_SYSTEM_NATIVE.format(
+        name=name, role=agent["role"],
+        web=("oui" if web_enabled else "non"),
+        whitelist=", ".join(sorted(COMMAND_WHITELIST)),
+        mcp_servers=", ".join(sorted(OFFICIAL_MCP)),
+    )
+    _t = await db_get_task(task_id)
+    company = bool(_t and _t.get("company_mode"))
+    if company:
+        system = _company_addendum(system)
+    max_steps = COMPANY_WORKER_STEPS if company else WORKER_MAX_STEPS
+    last_report = "(aucun rapport)"
+    for _step in range(max_steps):
+        await _wait_if_paused(task_id)
+        if await _is_stopped(task_id):
+            break
+        _c = running_tasks.get(task_id)
+        if _c and _c.get("over_budget"):
+            return last_report  # plafond budget atteint : on rend la main au chef
+        await _log_prompt(task_id, iteration, name, system, hist, image)
+        resp, usage = await _call_claude_native(
+            agent["model"] or DEFAULT_WORKER_CLAUDE, system, hist, WORKER_TOOLS,
+            on_notice=notice, image=image)
+        await _account_cost(task_id, usage, notice)
+        # On rejoue le contenu brut (blocs SDK : thinking/text/tool_use echoes a l'identique).
+        hist.append({"role": "assistant", "content": resp.content})
+
+        thinking_text = "".join(getattr(b, "thinking", "") for b in resp.content
+                                if getattr(b, "type", "") == "thinking")
+        text = "".join(getattr(b, "text", "") for b in resp.content
+                       if getattr(b, "type", "") == "text")
+        tool_uses = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
+
+        # Pensee (ou narration accompagnant des appels d'outils) -> visible dans l'UI.
+        thought = thinking_text or (text if tool_uses else "")
+        if thought:
+            await emit(task_id, iteration, name, "agent_message",
+                       {"kind": "thought", "content": thought[:2000]})
+
+        if not tool_uses:
+            # Plus d'outil appele : la mission est terminee, le rapport est le texte final.
+            last_report = text or thinking_text or "Termine."
+            await emit(task_id, iteration, name, "agent_message",
+                       {"kind": "result", "content": last_report})
+            return last_report
+
+        async def _exec_one(tu):
+            tool = tu.name
+            act = {"tool": tool, **tu.input}
+            await emit(task_id, iteration, name, "tool_call", {"tool": tool, "input": tu.input})
+            out = await execute_tool(task_id, folder, web_enabled, act, agent_name=name)
+            await emit(task_id, iteration, name, "tool_result", {"tool": tool, "output": out[:1500]})
+            return tu.id, tool, out
+
+        # Lecture seule -> parallelisable (#15) ; mutations -> sequentiel (evite les races fichiers).
+        parallel = [tu for tu in tool_uses if tu.name in PARALLEL_SAFE_TOOLS]
+        sequential = [tu for tu in tool_uses if tu.name not in PARALLEL_SAFE_TOOLS]
+        outputs = {}  # tool_use_id -> sortie texte
+        touched = False
+        if parallel:
+            for tu_id, _tool, out in await asyncio.gather(*[_exec_one(tu) for tu in parallel]):
+                outputs[tu_id] = out
+        for tu in sequential:
+            tu_id, tool, out = await _exec_one(tu)
+            outputs[tu_id] = out
+            if tool in ("write_file", "run_command", "run_tests"):
+                touched = True
+        if touched:
+            await emit(task_id, iteration, name, "files_changed", {"list": _list_files(folder)})
+
+        # Un tool_result par tool_use, dans l'ORDRE d'origine des tool_use.
+        tool_results = [{"type": "tool_result", "tool_use_id": tu.id,
+                         "content": outputs.get(tu.id, "")} for tu in tool_uses]
+        hist.append({"role": "user", "content": tool_results})
+    # Boucle epuisee : rendre le dernier texte connu, apres avoir emis un resultat s'il y a lieu.
+    if last_report and last_report != "(aucun rapport)":
+        await emit(task_id, iteration, name, "agent_message",
+                   {"kind": "result", "content": last_report})
+    return last_report
+
+
+async def _run_worker_legacy(task_id, iteration, agent, instruction, folder, web_enabled,
+                             worker_histories, notice, image=None, custom_hist=None) -> str:
     name = agent["name"]
     # custom_hist : historique isole (assignations paralleles au meme agent) ; sinon partage.
     hist = custom_hist if custom_hist is not None else worker_histories.setdefault(name, [])
@@ -1214,15 +1615,7 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
     _t = await db_get_task(task_id)
     company = bool(_t and _t.get("company_mode"))
     if company:
-        system += (NL + "MODE ENTREPRISE : le depot d'origine est en LECTURE SEULE (read_file le voit). "
-                   "Tu ecris (write_file) UNIQUEMENT dans 'delivery/...'. Ne tente jamais d'ecrire hors du "
-                   "dossier de travail. Teste tes correctifs dans delivery/ avant de livrer." + NL
-                   + "AVANT de proposer un changement : LIS le code reel concerne (read_file sur la cible : "
-                   "schema.sql, migrations, config/bindings, fichiers vises, CLAUDE.md). Ne suppose pas "
-                   "qu'une table/binding/endpoint/stockage existe — verifie. Marque toute hypothese "
-                   "'HYPOTHESE A VALIDER'. Ne RETIRE jamais une protection de securite existante (CSRF, "
-                   "auth, rate-limit, sanitization). Peu de correctifs qui marchent > un gros dump. Ne "
-                   "reference aucun fichier que tu n'as pas reellement ecrit.")
+        system = _company_addendum(system)
     max_steps = COMPANY_WORKER_STEPS if company else WORKER_MAX_STEPS
     last_report = "(aucun rapport)"
     for _step in range(max_steps):
@@ -1429,7 +1822,7 @@ async def _resume_context(task_id, folder):
         parts.append("Derniers resultats d'agents :" + NL + NL.join("- " + r for r in results[-10:]))
     parts.append("Fichiers deja produits : " + (", ".join(files[:80]) or "(aucun)"))
     parts.append("Relis les fichiers au besoin (read_file). NE REFAIS PAS le travail deja fait : "
-                 "reprends la ou ca s'est arrete et avance vers l'objectif. Prochaine action en JSON.")
+                 "reprends la ou ca s'est arrete et avance vers l'objectif. Appelle un de tes outils.")
     return (NL + NL).join(parts)
 
 
@@ -1499,7 +1892,7 @@ async def _run_task(task_id, resume=False):
                 objective=objective, max_agents=max_agents, target_path=target_path or "(non defini)")
         else:
             chef_system = CHEF_SYSTEM.format(objective=objective, max_agents=max_agents)
-        start = "Demarre. Quelle est ta premiere action (create_agent, assign_task ou finish) ? Reponds en JSON."
+        start = "Demarre. Quelle est ta premiere action ? Appelle un de tes outils (create_agent, assign_task ou finish)."
         if image:
             start = ("Une maquette de design a ete fournie par l'utilisateur ; elle est transmise aux agents "
                      "qui produisent l'UI (demande-leur de s'en inspirer fidelement : couleurs, structure, composants). "
@@ -1578,166 +1971,195 @@ async def _run_task(task_id, resume=False):
             ctx = ("Equipe actuelle : "
                    + (", ".join(a["name"] + " (" + a["role"] + ")" for a in team) or "(vide)")
                    + NL + "Fichiers du dossier : " + (", ".join(files) or "(aucun)")
-                   + NL + "Prochaine action ? Reponds en JSON.")
+                   + NL + "Quelle est ta prochaine action ?")
             chef_messages.append({"role": "user", "content": ctx})
             await _log_prompt(task_id, iteration, "chef", chef_system, chef_messages)
-            raw = await call_model("claude", chef_model, chef_system, chef_messages,
-                                   on_notice=notice, task_id=task_id)
-            chef_messages.append({"role": "assistant", "content": raw})
+            resp, usage = await _call_claude_native(chef_model, chef_system, chef_messages,
+                                                    CHEF_TOOLS, on_notice=notice)
+            await _account_cost(task_id, usage, notice)
 
-            decision = _extract_json(raw) or {}
-            action = decision.get("action", "")
-            thought = decision.get("thought", "")
-            await emit(task_id, iteration, "chef", "chef",
-                       {"decision": action or "?", "thought": thought,
-                        "instruction": decision.get("instruction")})
+            thinking_text = "".join(getattr(b, "thinking", "") for b in resp.content
+                                    if getattr(b, "type", "") == "thinking")
+            text = "".join(getattr(b, "text", "") for b in resp.content
+                           if getattr(b, "type", "") == "text")
+            tool_uses = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
+            # On rejoue le contenu brut (blocs SDK : thinking echoes a l'identique - REQUIS).
+            chef_messages.append({"role": "assistant", "content": resp.content})
 
-            if action == "finish" or decision.get("done"):
-                final = decision.get("final") or thought or "Objectif traite."
-                if company:
-                    sanity = await asyncio.to_thread(_company_sanity, folder)
-                    if sanity:
-                        await asyncio.to_thread(_write_manifest, folder, sanity)
-                        note = ("Livraison : " + str(len(sanity["files"])) + " fichier(s) dans delivery/ "
-                                "(manifest : delivery/_MANIFEST.md).")
-                        if sanity["missing"]:
-                            note += (" ATTENTION : reference(s) ABSENTE(S) du disque -> "
-                                     + ", ".join(sanity["missing"][:15]))
-                        await emit(task_id, iteration, "systeme", "info", {"msg": note})
-                        final = final + NL + note
-                # Auto-resume : tirer 1-3 lecons reutilisables et les ranger dans la memoire partagee
-                try:
-                    import memory as _mem
-                    msgs = await db_messages_after(task_id, 0)
-                    blob = NL.join(
-                        (m["agent"] + ": " + (json.loads(m["content"]).get("content")
-                                              or json.loads(m["content"]).get("summary")
-                                              or json.loads(m["content"]).get("instruction")
-                                              or "")) if m["content"] and m["content"].startswith("{") else ""
-                        for m in msgs if m["kind"] in ("agent_message", "chef", "done")
-                    )
-                    n_saved = await _mem.summarize_and_save(task_id, objective, blob, _client)
-                    if n_saved:
-                        await emit(task_id, iteration, "systeme", "info",
-                                   {"msg": str(n_saved) + " lecon(s) memorisee(s) pour les futures taches."})
-                except Exception as e:
-                    log.info("[memoire] auto-resume KO : %s", e)
-                await emit(task_id, iteration, "chef", "done", {"summary": final})
-                await db_update_task(task_id, status="done")
-                return
+            # Toujours emettre la premiere decision, meme sans texte de reflexion
+            # (sinon un tool_use "sec" serait invisible dans l'UI).
+            if thinking_text or text or tool_uses:
+                await emit(task_id, iteration, "chef", "chef",
+                           {"decision": (tool_uses[0].name if tool_uses else "reflexion"),
+                            "thought": (thinking_text or text)[:2000],
+                            "instruction": (tool_uses[0].input.get("instruction") if tool_uses else None)})
+            # Une decision visible par tool_use supplementaire (l'UI affiche chaque decision).
+            for tu in tool_uses[1:]:
+                await emit(task_id, iteration, "chef", "chef",
+                           {"decision": tu.name, "thought": "",
+                            "instruction": tu.input.get("instruction")})
 
-            if action == "create_agent":
-                if len(team) >= max_agents:
-                    chef_messages.append({"role": "user", "content":
-                                          "Refuse : plafond de " + str(max_agents)
-                                          + " agents atteint. Delegue a un agent existant ou termine."})
-                    continue
-                name = (decision.get("name") or ("agent" + str(len(team) + 1))).strip()
-                role = decision.get("role", "")
-                provider = decision.get("provider", "claude")
-                if provider not in ("claude", "gemini", "openai"):
-                    provider = "claude"
-                model = decision.get("model") or _default_model(provider)
-                if await db_get_agent(task_id, name):
-                    chef_messages.append({"role": "user", "content":
-                                          "Un agent nomme '" + name + "' existe deja. Choisis un autre nom ou delegue-lui."})
-                    continue
-                await db_add_agent(task_id, name, role, provider, model, "chef")
-                await emit(task_id, iteration, "chef", "agent_created",
-                           {"name": name, "role": role, "model": provider + ":" + model})
-                chef_messages.append({"role": "user", "content": "Agent '" + name + "' cree."})
-                continue
-
-            if action == "assign_task":
-                target = (decision.get("agent") or "").strip()
-                instruction = decision.get("instruction", "")
-                agent = await db_get_agent(task_id, target)
-                if not agent:
-                    chef_messages.append({"role": "user", "content":
-                                          "Agent '" + target + "' introuvable. Cree-le d'abord (create_agent)."})
-                    continue
-                report = await _run_worker(task_id, iteration, agent, instruction,
-                                           folder, web_enabled, worker_histories, notice, image)
+            if not tool_uses:
                 chef_messages.append({"role": "user", "content":
-                                      "Rapport de " + target + " : " + report[:2000]})
+                                      "Aucun outil appele. Utilise un de tes outils (create_agent, "
+                                      "assign_task, parallel_assign, challenge, assign_managed_agent) ou finish."})
                 continue
 
-            if action == "assign_managed_agent":
-                agent_id = (decision.get("agent_id") or "").strip()
-                instruction = decision.get("instruction", "") or ""
-                if not agent_id or not agent_id.startswith("agent_"):
-                    chef_messages.append({"role": "user", "content":
-                                          "assign_managed_agent : champ 'agent_id' manquant ou invalide (doit etre 'agent_...')."})
-                    continue
-                label = (decision.get("name") or agent_id)
-                await emit(task_id, iteration, label, "agent_message",
-                           {"kind": "thought",
-                            "content": "Delegation a l'agent gere Anthropic " + agent_id + "..."})
+            # Execution SEQUENTIELLE des tool_use ; le retour devient le tool_result de chacun.
+            tool_results = []
+            for tu in tool_uses:
+                act = tu.name
+                inp = tu.input
 
-                async def _on_text(t, _l=label, _it=iteration):
-                    await emit(task_id, _it, _l, "agent_message", {"kind": "result", "content": t})
+                if act == "finish":
+                    final = inp.get("final") or thinking_text or text or "Objectif traite."
+                    if company:
+                        sanity = await asyncio.to_thread(_company_sanity, folder)
+                        if sanity:
+                            await asyncio.to_thread(_write_manifest, folder, sanity)
+                            note = ("Livraison : " + str(len(sanity["files"])) + " fichier(s) dans delivery/ "
+                                    "(manifest : delivery/_MANIFEST.md).")
+                            if sanity["missing"]:
+                                note += (" ATTENTION : reference(s) ABSENTE(S) du disque -> "
+                                         + ", ".join(sanity["missing"][:15]))
+                            await emit(task_id, iteration, "systeme", "info", {"msg": note})
+                            final = final + NL + note
+                    # Auto-resume : tirer 1-3 lecons reutilisables et les ranger dans la memoire partagee
+                    try:
+                        import memory as _mem
+                        msgs = await db_messages_after(task_id, 0)
+                        blob = NL.join(
+                            (m["agent"] + ": " + (json.loads(m["content"]).get("content")
+                                                  or json.loads(m["content"]).get("summary")
+                                                  or json.loads(m["content"]).get("instruction")
+                                                  or "")) if m["content"] and m["content"].startswith("{") else ""
+                            for m in msgs if m["kind"] in ("agent_message", "chef", "done")
+                        )
+                        n_saved = await _mem.summarize_and_save(task_id, objective, blob, _client)
+                        if n_saved:
+                            await emit(task_id, iteration, "systeme", "info",
+                                       {"msg": str(n_saved) + " lecon(s) memorisee(s) pour les futures taches."})
+                    except Exception as e:
+                        log.info("[memoire] auto-resume KO : %s", e)
+                    await emit(task_id, iteration, "chef", "done", {"summary": final})
+                    await db_update_task(task_id, status="done")
+                    return  # plus aucun appel API : inutile de repondre aux tool_use restants
 
-                try:
-                    res = await managed_agents.run_session(agent_id, instruction, on_text=_on_text)
-                    text = res.get("text") or "(reponse vide)"
-                    chef_messages.append({"role": "user", "content":
-                                          "Rapport de l'agent gere " + agent_id + " (statut="
-                                          + str(res.get("status")) + ", stop_reason="
-                                          + str(res.get("stop_reason")) + ") :" + NL + text[:3000]})
-                except Exception as e:
-                    log.warning("[managed-agents] erreur session %s : %s", agent_id, e)
-                    await notice("Agent gere " + agent_id + " : erreur " + str(e)[:200])
-                    chef_messages.append({"role": "user", "content":
-                                          "assign_managed_agent a echoue (" + str(e)[:200]
-                                          + "). Essaie un autre agent ou une autre action."})
-                continue
+                elif act == "create_agent":
+                    if len(team) >= max_agents:
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                             "content": "Refuse : plafond de " + str(max_agents)
+                                             + " agents atteint. Delegue a un agent existant ou termine."})
+                        continue
+                    name = (inp.get("name") or ("agent" + str(len(team) + 1))).strip()
+                    role = inp.get("role", "")
+                    provider = inp.get("provider", "claude")
+                    if provider not in ("claude", "gemini", "openai"):
+                        provider = "claude"
+                    model = inp.get("model") or _default_model(provider)
+                    if await db_get_agent(task_id, name):
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                             "content": "Un agent nomme '" + name
+                                             + "' existe deja. Choisis un autre nom ou delegue-lui."})
+                        continue
+                    await db_add_agent(task_id, name, role, provider, model, "chef")
+                    await emit(task_id, iteration, "chef", "agent_created",
+                               {"name": name, "role": role, "model": provider + ":" + model})
+                    team = await db_list_agents(task_id)  # le plafond suit les creations du tour
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                         "content": "Agent '" + name + "' cree."})
 
-            if action == "parallel_assign":
-                assigns = decision.get("assignments", []) or []
-                # Compter les doublons : un agent assigne plusieurs fois en parallele
-                # doit recevoir un historique CLONE par branche (evite l'entrelacement).
-                counts = {}
-                for a in assigns:
-                    nm = (a.get("agent") or "").strip()
-                    counts[nm] = counts.get(nm, 0) + 1
-                coros, names = [], []
-                for a in assigns:
-                    nm = (a.get("agent") or "").strip()
-                    ag = await db_get_agent(task_id, nm)
-                    if ag:
-                        hist = list(worker_histories.setdefault(nm, [])) if counts[nm] > 1 else None
-                        coros.append(_run_worker(task_id, iteration, ag, a.get("instruction", ""),
-                                                 folder, web_enabled, worker_histories, notice, image,
-                                                 custom_hist=hist))
-                        names.append(ag["name"])
-                if not coros:
-                    chef_messages.append({"role": "user", "content":
-                                          "parallel_assign : aucun agent valide. Cree-les d'abord."})
-                    continue
-                reports = await asyncio.gather(*coros)
-                summary = NL.join(names[i] + " : " + reports[i][:600] for i in range(len(names)))
-                chef_messages.append({"role": "user", "content":
-                                      "Rapports paralleles :" + NL + summary})
-                continue
+                elif act == "assign_task":
+                    target = (inp.get("agent") or "").strip()
+                    instruction = inp.get("instruction", "")
+                    agent = await db_get_agent(task_id, target)
+                    if not agent:
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                             "content": "Agent '" + target
+                                             + "' introuvable. Cree-le d'abord (create_agent)."})
+                        continue
+                    report = await _run_worker(task_id, iteration, agent, instruction,
+                                               folder, web_enabled, worker_histories, notice, image)
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                         "content": "Rapport de " + target + " : " + report[:2000]})
 
-            if action == "challenge":
-                instruction = decision.get("instruction", "")
-                if not instruction:
-                    chef_messages.append({"role": "user", "content":
-                                          "challenge requiert un champ 'instruction'."})
-                    continue
-                report = await _run_challenge(
-                    task_id, iteration, instruction, folder, web_enabled,
-                    decision.get("rounds", 2), worker_histories, notice,
-                    decision.get("producer_provider", "claude"),
-                    decision.get("critic_providers"), image)
-                chef_messages.append({"role": "user", "content":
-                                      "Resultat du challenge : " + report[:2000]})
-                continue
+                elif act == "assign_managed_agent":
+                    agent_id = (inp.get("agent_id") or "").strip()
+                    instruction = inp.get("instruction", "") or ""
+                    if not agent_id or not agent_id.startswith("agent_"):
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                             "content": "assign_managed_agent : champ 'agent_id' manquant "
+                                             "ou invalide (doit etre 'agent_...')."})
+                        continue
+                    label = agent_id
+                    await emit(task_id, iteration, label, "agent_message",
+                               {"kind": "thought",
+                                "content": "Delegation a l'agent gere Anthropic " + agent_id + "..."})
 
-            chef_messages.append({"role": "user", "content":
-                                  "Action non reconnue. Utilise create_agent, assign_task, "
-                                  "parallel_assign, challenge, assign_managed_agent ou finish."})
+                    async def _on_text(t, _l=label, _it=iteration):
+                        await emit(task_id, _it, _l, "agent_message", {"kind": "result", "content": t})
+
+                    try:
+                        res = await managed_agents.run_session(agent_id, instruction, on_text=_on_text)
+                        mtext = res.get("text") or "(reponse vide)"
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                             "content": "Rapport de l'agent gere " + agent_id + " (statut="
+                                             + str(res.get("status")) + ", stop_reason="
+                                             + str(res.get("stop_reason")) + ") :" + NL + mtext[:3000]})
+                    except Exception as e:
+                        log.warning("[managed-agents] erreur session %s : %s", agent_id, e)
+                        await notice("Agent gere " + agent_id + " : erreur " + str(e)[:200])
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                             "content": "assign_managed_agent a echoue (" + str(e)[:200]
+                                             + "). Essaie un autre agent ou une autre action."})
+
+                elif act == "parallel_assign":
+                    assigns = inp.get("assignments", []) or []
+                    # Compter les doublons : un agent assigne plusieurs fois en parallele
+                    # doit recevoir un historique CLONE par branche (evite l'entrelacement).
+                    counts = {}
+                    for a in assigns:
+                        nm = (a.get("agent") or "").strip()
+                        counts[nm] = counts.get(nm, 0) + 1
+                    coros, names = [], []
+                    for a in assigns:
+                        nm = (a.get("agent") or "").strip()
+                        ag = await db_get_agent(task_id, nm)
+                        if ag:
+                            hist = list(worker_histories.setdefault(nm, [])) if counts[nm] > 1 else None
+                            coros.append(_run_worker(task_id, iteration, ag, a.get("instruction", ""),
+                                                     folder, web_enabled, worker_histories, notice, image,
+                                                     custom_hist=hist))
+                            names.append(ag["name"])
+                    if not coros:
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                             "content": "parallel_assign : aucun agent valide. Cree-les d'abord."})
+                        continue
+                    reports = await asyncio.gather(*coros)
+                    summary = NL.join(names[i] + " : " + reports[i][:600] for i in range(len(names)))
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                         "content": "Rapports paralleles :" + NL + summary})
+
+                elif act == "challenge":
+                    instruction = inp.get("instruction", "")
+                    if not instruction:
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                             "content": "challenge requiert un champ 'instruction'."})
+                        continue
+                    report = await _run_challenge(
+                        task_id, iteration, instruction, folder, web_enabled,
+                        inp.get("rounds", 2), worker_histories, notice,
+                        inp.get("producer_provider", "claude"),
+                        inp.get("critic_providers"), image)
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                         "content": "Resultat du challenge : " + report[:2000]})
+
+                else:
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                         "content": "Outil non reconnu : " + str(act)})
+
+            # Un tool_result par tool_use, dans l'ordre des tool_use.
+            chef_messages.append({"role": "user", "content": tool_results})
 
         if not await _is_stopped(task_id):
             await emit(task_id, iteration, "chef", "done",
