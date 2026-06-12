@@ -164,7 +164,8 @@ async def init_team_db():
                     "ALTER TABLE tasks ADD COLUMN company_mode INTEGER DEFAULT 0",
                     "ALTER TABLE tasks ADD COLUMN target_path TEXT",
                     "ALTER TABLE tasks ADD COLUMN total_cost_usd REAL DEFAULT 0",
-                    "ALTER TABLE tasks ADD COLUMN max_cost_usd REAL DEFAULT 0"):
+                    "ALTER TABLE tasks ADD COLUMN max_cost_usd REAL DEFAULT 0",
+                    "ALTER TABLE tasks ADD COLUMN target_repo_url TEXT"):
             try:
                 await db.execute(ddl)
             except Exception:
@@ -205,14 +206,16 @@ async def init_team_db():
 
 
 async def db_create_task(objective, folder, max_iterations, max_agents, web_enabled, chef_model,
-                         company_mode=False, target_path=None, max_cost_usd=0.0):
+                         company_mode=False, target_path=None, max_cost_usd=0.0,
+                         target_repo_url=None):
     async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         cur = await db.execute(
             "INSERT INTO tasks (objective,folder,status,max_iterations,max_agents,web_enabled,chef_model,"
-            "company_mode,target_path,max_cost_usd,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "company_mode,target_path,max_cost_usd,target_repo_url,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (objective, folder, "idle", max_iterations, max_agents,
              1 if web_enabled else 0, chef_model,
-             1 if company_mode else 0, target_path, max_cost_usd, datetime.utcnow().isoformat()),
+             1 if company_mode else 0, target_path, max_cost_usd, target_repo_url,
+             datetime.utcnow().isoformat()),
         )
         await db.commit()
         return cur.lastrowid
@@ -239,7 +242,7 @@ async def db_list_tasks():
 _TASKS_COLUMNS_ALLOWED = frozenset({
     "objective", "folder", "status", "iteration", "max_iterations", "max_agents",
     "web_enabled", "chef_model", "company_mode", "target_path", "image_path",
-    "total_cost_usd", "max_cost_usd",
+    "total_cost_usd", "max_cost_usd", "target_repo_url",
 })
 
 async def db_update_task(task_id, **kwargs):
@@ -1185,16 +1188,28 @@ CHEF_TOOLS = [
     },
     {
         "name": "assign_managed_agent",
-        "description": ("Delegue a un AGENT ANTHROPIC GERE (heberge cote Anthropic) liste dans le contexte "
-                        "(champ \"Agents Anthropic geres\"), identifie par son agent_id. Utilise-le quand l'un "
-                        "d'eux a deja le role/contexte recherche. Le retour est UN TEXTE seulement -- l'agent "
-                        "gere ne touche pas a tes fichiers locaux."),
+        "description": ("Delegue une mission a un AGENT ANTHROPIC GERE (il travaille dans un environnement "
+                        "isole cote Anthropic, pas sur cette machine), liste dans le contexte (champ "
+                        "\"Agents Anthropic geres\"), identifie par son agent_id. Utilise-le quand l'un "
+                        "d'eux a deja le role/contexte recherche, ou pour une mission qui doit etre isolee. "
+                        "Ses fichiers livrables sont recuperes automatiquement dans le sous-dossier "
+                        "managed/ du dossier de travail. Optionnel : github_repo_url monte un depot GitHub "
+                        "dans sa session (il peut alors lire/tester le code reel) ; rubric transforme la "
+                        "mission en OBJECTIF NOTE (un examinateur independant verifie les criteres et "
+                        "l'agent itere jusqu'a validation) -- fournis alors des criteres VERIFIABLES."),
         "strict": True,
         "input_schema": {
             "type": "object",
             "properties": {
                 "agent_id": {"type": "string", "description": "Identifiant de l'agent gere (agent_...)."},
                 "instruction": {"type": "string", "description": "Consigne autonome pour l'agent gere."},
+                "github_repo_url": {"type": "string",
+                                    "description": "URL https d'un depot GitHub a monter dans la session "
+                                                   "(optionnel ; en mode entreprise le depot cible est "
+                                                   "monte automatiquement)."},
+                "rubric": {"type": "string",
+                           "description": "Criteres de reussite verifiables (optionnel). Si fourni, la "
+                                          "mission est notee et l'agent corrige jusqu'a validation."},
             },
             "required": ["agent_id", "instruction"],
             "additionalProperties": False,
@@ -2092,20 +2107,61 @@ async def _run_task(task_id, resume=False):
                                              "ou invalide (doit etre 'agent_...')."})
                         continue
                     label = agent_id
+                    # Depot GitHub a monter dans la session : explicite (github_repo_url),
+                    # sinon celui du mode entreprise. Necessite GITHUB_TOKEN (.env) --
+                    # le token est garde cote Anthropic, jamais visible de l'agent.
+                    repo_url = (inp.get("github_repo_url") or "").strip()
+                    if not repo_url and company:
+                        repo_url = (task.get("target_repo_url") or "").strip()
+                    resources = None
+                    if repo_url:
+                        gh_token = os.getenv("GITHUB_TOKEN", "").strip()
+                        if gh_token:
+                            resources = [{"type": "github_repository", "url": repo_url,
+                                          "authorization_token": gh_token}]
+                        else:
+                            await notice("Depot " + repo_url + " non monte sur l'agent gere : "
+                                         "GITHUB_TOKEN absent du .env.")
+                    rubric = (inp.get("rubric") or "").strip() or None
                     await emit(task_id, iteration, label, "agent_message",
                                {"kind": "thought",
-                                "content": "Delegation a l'agent gere Anthropic " + agent_id + "..."})
+                                "content": "Delegation a l'agent gere Anthropic " + agent_id
+                                + (" (depot monte : " + repo_url + ")" if resources else "")
+                                + (" -- mission notee avec criteres de reussite" if rubric else "")
+                                + "..."})
 
                     async def _on_text(t, _l=label, _it=iteration):
                         await emit(task_id, _it, _l, "agent_message", {"kind": "result", "content": t})
 
                     try:
-                        res = await managed_agents.run_session(agent_id, instruction, on_text=_on_text)
+                        res = await managed_agents.run_session(
+                            agent_id, instruction, on_text=_on_text,
+                            resources=resources, rubric=rubric,
+                            outputs_dir=str(Path(folder) / "managed"),
+                            # Une mission notee itere plusieurs fois : delai elargi.
+                            timeout_s=(managed_agents.SESSION_TIMEOUT_S * 3 if rubric
+                                       else managed_agents.SESSION_TIMEOUT_S))
+                        if res.get("console_url"):
+                            await emit(task_id, iteration, "systeme", "info",
+                                       {"msg": "Session agent gere (suivi en direct) : "
+                                        + res["console_url"]})
                         mtext = res.get("text") or "(reponse vide)"
+                        extra = ""
+                        fl = res.get("files") or []
+                        if fl:
+                            await emit(task_id, iteration, label, "files_changed",
+                                       {"list": _list_files(folder)})
+                            extra += (NL + "Fichiers livres : "
+                                      + ", ".join("managed/" + p for p in fl))
+                        oc = res.get("outcome") or {}
+                        if oc.get("result"):
+                            extra += (NL + "Verdict de l'examinateur : " + str(oc["result"])
+                                      + (" -- " + oc["explanation"][:400] if oc.get("explanation") else ""))
                         tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
                                              "content": "Rapport de l'agent gere " + agent_id + " (statut="
                                              + str(res.get("status")) + ", stop_reason="
-                                             + str(res.get("stop_reason")) + ") :" + NL + mtext[:3000]})
+                                             + str(res.get("stop_reason")) + ") :" + NL
+                                             + mtext[:3000] + extra})
                     except Exception as e:
                         log.warning("[managed-agents] erreur session %s : %s", agent_id, e)
                         await notice("Agent gere " + agent_id + " : erreur " + str(e)[:200])
@@ -2241,10 +2297,13 @@ async def create_task(body: TaskCreate):
     Path(folder).mkdir(parents=True, exist_ok=True)
     if company:
         (Path(folder) / "delivery").mkdir(exist_ok=True)  # tout ce que produit la boite va ici
+    # L'URL du depot est memorisee (SANS le token) : elle sert au montage du depot
+    # dans les sessions d'agents geres Anthropic (avec GITHUB_TOKEN du .env).
     task_id = await db_create_task(objective, folder, max_iter, max_agents,
                                    body.web_enabled, body.chef_model or DEFAULT_CLAUDE,
                                    company_mode=company, target_path=target_path,
-                                   max_cost_usd=max(0.0, float(body.max_cost_usd or 0)))
+                                   max_cost_usd=max(0.0, float(body.max_cost_usd or 0)),
+                                   target_repo_url=(body.target_repo_url or "").strip() or None)
     # Amorcage optionnel d'agents par l'utilisateur
     for a in body.agents:
         name = (a.name or "").strip()

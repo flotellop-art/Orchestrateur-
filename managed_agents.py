@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from anthropic import AsyncAnthropic
@@ -101,6 +102,47 @@ async def get_or_create_environment(name: str = DEFAULT_ENV_NAME) -> str:
         return _env_id_cache
 
 
+async def _download_outputs(client: AsyncAnthropic, session_id: str, dest: Path) -> list[str]:
+    """Telecharge les fichiers ecrits par l'agent dans /mnt/session/outputs/.
+
+    Renvoie des chemins relatifs au dossier parent de `dest` (ex: "ab12cd34/rapport.md").
+    L'indexation cote Anthropic prend ~1-3 s apres la fin -> petites retentatives.
+    Best-effort : toute erreur est loggee, jamais propagee.
+    """
+    data = []
+    for _ in range(3):
+        try:
+            page = await client.beta.files.list(
+                scope_id=session_id, betas=["managed-agents-2026-04-01"])
+        except TypeError:
+            # SDK trop ancien : ne connait pas scope_id -> pas de recuperation possible.
+            log.info("[managed-agents] SDK sans scope_id : sorties de session non recuperees.")
+            return []
+        data = list(getattr(page, "data", []) or [])
+        if data:
+            break
+        await asyncio.sleep(1.5)
+    if not data:
+        return []
+    dest.mkdir(parents=True, exist_ok=True)
+    saved: list[str] = []
+    for f in data:
+        # basename : empeche un nom de fichier malveillant de sortir du dossier cible.
+        name = os.path.basename(getattr(f, "filename", "") or "") or str(getattr(f, "id", "fichier"))
+        if not name or name in (".", ".."):
+            continue
+        target = dest / name
+        try:
+            resp = await client.beta.files.download(getattr(f, "id", ""))
+            res = resp.write_to_file(str(target))
+            if asyncio.iscoroutine(res):
+                await res
+            saved.append(dest.name + "/" + name)
+        except Exception as e:
+            log.warning("[managed-agents] telechargement de %s KO : %s", name, str(e)[:120])
+    return saved
+
+
 def _extract_text(content_blocks) -> str:
     """Concat les textes d'une liste de blocs `agent.message`."""
     if not content_blocks:
@@ -118,25 +160,56 @@ async def run_session(
     on_text: Optional[Callable[[str], Awaitable[None]]] = None,
     on_thinking: Optional[Callable[[str], Awaitable[None]]] = None,
     timeout_s: float = SESSION_TIMEOUT_S,
+    resources: Optional[list[dict]] = None,
+    outputs_dir: Optional[str] = None,
+    rubric: Optional[str] = None,
+    max_outcome_iterations: int = 3,
 ) -> dict:
     """Démarre une session sur `agent_id`, envoie `instruction`, streame jusqu'à idle.
 
-    Retourne `{"text", "stop_reason", "session_id", "status", "console_url"}`.
-    Appelle `on_text(chunk)` pour chaque message texte de l'agent (utile pour
-    pousser dans le flux SSE de la tâche en cours). En cas de coupure du flux
-    SSE, reconnecte et recoupe avec l'historique (dédoublonnage par id).
+    Options :
+      - `resources`  : ressources montées dans la session (ex. dépôt GitHub
+        `{"type":"github_repository","url":...,"authorization_token":...}`).
+      - `outputs_dir`: dossier local où récupérer les fichiers que l'agent a
+        déposés dans /mnt/session/outputs/ (sous-dossier par session).
+      - `rubric`     : critères de réussite vérifiables. Si fourni, la mission
+        est envoyée comme OBJECTIF NOTÉ (`user.define_outcome`) : un examinateur
+        indépendant note le travail et l'agent itère jusqu'à validation
+        (au plus `max_outcome_iterations` tours).
+
+    Retourne `{"text", "stop_reason", "session_id", "status", "console_url",
+    "files", "outcome"}`. Appelle `on_text(chunk)` pour chaque message texte de
+    l'agent. En cas de coupure du flux SSE, reconnecte et recoupe avec
+    l'historique (dédoublonnage par id).
     """
     client = _get_client()
     env_id = await get_or_create_environment()
-    session = await client.beta.sessions.create(agent=agent_id, environment_id=env_id)
+    create_kwargs: dict[str, Any] = {"agent": agent_id, "environment_id": env_id}
+    if resources:
+        create_kwargs["resources"] = resources
+    session = await client.beta.sessions.create(**create_kwargs)
     session_id = session.id
     # Lien direct vers la session dans la Console Anthropic (observabilite).
     console_url = "https://platform.claude.com/workspaces/default/sessions/" + session_id
     log.info("[managed-agents] session %s ouverte -> %s", session_id, console_url)
+    if outputs_dir:
+        instruction = (instruction + "\n\nIMPORTANT : depose tes fichiers livrables dans "
+                       "/mnt/session/outputs/ -- c'est de la qu'ils sont recuperes automatiquement.")
+    # Evenement de demarrage : mission notee (define_outcome) OU simple message.
+    # Avec un outcome, on n'envoie PAS de user.message en plus (l'agent demarre seul).
+    if rubric:
+        kickoff = {"type": "user.define_outcome",
+                   "description": instruction,
+                   "rubric": {"type": "text", "content": rubric},
+                   "max_iterations": max(1, min(int(max_outcome_iterations or 3), 20))}
+    else:
+        kickoff = {"type": "user.message",
+                   "content": [{"type": "text", "text": instruction}]}
     parts: list[str] = []
     seen_ids: set[str] = set()  # dedoublonnage des evenements (reconnexion)
     stop_reason: Optional[str] = None
     status = "running"
+    outcome: dict = {}  # dernier verdict de l'examinateur (mission notee), mute en place
     sent = False
 
     async def _handle(event) -> bool:
@@ -169,6 +242,15 @@ async def run_session(
             err = getattr(event, "error", None)
             msg = getattr(err, "message", None) or str(err or "")[:300]
             log.warning("[managed-agents] session.error %s : %s", session_id, msg)
+        elif etype == "span.outcome_evaluation_end":
+            # Verdict de l'examinateur (mission notee) : satisfied / needs_revision /
+            # max_iterations_reached / failed / interrupted. Mute en place (closure).
+            outcome.clear()
+            outcome.update({
+                "result": getattr(event, "result", None),
+                "explanation": (getattr(event, "explanation", "") or "")[:1000],
+                "iteration": getattr(event, "iteration", None),
+            })
         elif etype == "session.status_idle":
             # `stop_reason` est un objet : on lit son `.type`. Une session
             # "idle" avec stop_reason "requires_action" attend une action du
@@ -202,11 +284,7 @@ async def run_session(
             try:
                 if not sent:
                     # Flux ouvert AVANT l'envoi : aucun evenement precoce n'est perdu.
-                    await client.beta.sessions.events.send(
-                        session_id,
-                        events=[{"type": "user.message",
-                                 "content": [{"type": "text", "text": instruction}]}],
-                    )
+                    await client.beta.sessions.events.send(session_id, events=[kickoff])
                     sent = True
                 elif await _replay_history():
                     return
@@ -244,6 +322,16 @@ async def run_session(
         status = "error"
         log.warning("[managed-agents] session %s en erreur : %s", session_id, str(e)[:200])
 
+    # Recuperer les fichiers livres AVANT d'archiver (l'archive rend la session
+    # en lecture seule). Uniquement quand la session a vraiment fini son travail.
+    files: list[str] = []
+    if outputs_dir and status in ("idle", "terminated"):
+        try:
+            files = await _download_outputs(
+                client, session_id, Path(outputs_dir) / session_id[-8:])
+        except Exception as e:
+            log.warning("[managed-agents] recuperation des sorties KO : %s", str(e)[:150])
+
     # Archive la session une fois terminee pour ne pas les accumuler. On NE le fait
     # PAS en cas de timeout (la session tourne peut-etre encore : on la laisse pour
     # inspection). Best-effort : une erreur d'archivage ne doit pas casser le retour.
@@ -259,6 +347,8 @@ async def run_session(
         "session_id": session_id,
         "status": status,
         "console_url": console_url,
+        "files": files,
+        "outcome": outcome or None,
     }
 
 
