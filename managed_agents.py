@@ -46,10 +46,14 @@ async def list_agents() -> list[dict]:
     client = _get_client()
     out: list[dict] = []
     async for ag in client.beta.agents.list():
+        model = getattr(ag, "model", "") or ""
+        if model and not isinstance(model, str):
+            # `model` peut etre un objet {id, speed} : on normalise en chaine.
+            model = getattr(model, "id", None) or str(model)
         out.append({
             "id": getattr(ag, "id", ""),
             "name": getattr(ag, "name", "") or "",
-            "model": getattr(ag, "model", "") or "",
+            "model": model,
             "status": getattr(ag, "status", "") or "",
         })
     return out
@@ -117,75 +121,128 @@ async def run_session(
 ) -> dict:
     """Démarre une session sur `agent_id`, envoie `instruction`, streame jusqu'à idle.
 
-    Retourne `{"text", "stop_reason", "session_id", "status"}`.
+    Retourne `{"text", "stop_reason", "session_id", "status", "console_url"}`.
     Appelle `on_text(chunk)` pour chaque message texte de l'agent (utile pour
-    pousser dans le flux SSE de la tâche en cours).
+    pousser dans le flux SSE de la tâche en cours). En cas de coupure du flux
+    SSE, reconnecte et recoupe avec l'historique (dédoublonnage par id).
     """
     client = _get_client()
     env_id = await get_or_create_environment()
     session = await client.beta.sessions.create(agent=agent_id, environment_id=env_id)
     session_id = session.id
+    # Lien direct vers la session dans la Console Anthropic (observabilite).
+    console_url = "https://platform.claude.com/workspaces/default/sessions/" + session_id
+    log.info("[managed-agents] session %s ouverte -> %s", session_id, console_url)
     parts: list[str] = []
+    seen_ids: set[str] = set()  # dedoublonnage des evenements (reconnexion)
     stop_reason: Optional[str] = None
     status = "running"
+    sent = False
 
-    async def _consume():
+    async def _handle(event) -> bool:
+        """Traite un evenement (dedoublonne par id). Renvoie True si terminal."""
         nonlocal stop_reason, status
-        stream = await client.beta.sessions.events.stream(session_id)
-        try:
-            await client.beta.sessions.events.send(
-                session_id,
-                events=[{"type": "user.message",
-                         "content": [{"type": "text", "text": instruction}]}],
-            )
-            async for event in stream:
-                etype = getattr(event, "type", "")
-                if etype == "agent.message":
-                    text = _extract_text(getattr(event, "content", None))
-                    if text:
-                        parts.append(text)
-                        if on_text:
-                            try:
-                                await on_text(text)
-                            except Exception as e:
-                                log.warning("[managed-agents] on_text erreur: %s", e)
-                elif etype == "agent.thinking" and on_thinking:
-                    txt = getattr(event, "text", "") or _extract_text(
-                        getattr(event, "content", None))
-                    if txt:
-                        try:
-                            await on_thinking(txt)
-                        except Exception:
-                            pass
-                elif etype == "session.status_idle":
-                    # `stop_reason` est un objet : on lit son `.type`. Une session
-                    # "idle" avec stop_reason "requires_action" attend une action du
-                    # client (confirmation d'outil, resultat d'outil custom) -- ce
-                    # pont ne sait pas y repondre ; on s'arrete proprement en le
-                    # signalant, au lieu de rendre un resultat partiel comme final.
-                    sr = getattr(event, "stop_reason", None)
-                    sr_type = getattr(sr, "type", None) if sr is not None else None
-                    stop_reason = sr_type or "end_turn"
-                    status = "requires_action" if sr_type == "requires_action" else "idle"
-                    break
-                elif etype == "session.status_terminated":
-                    status = "terminated"
-                    break
-        finally:
-            close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
-            if close:
+        eid = getattr(event, "id", None)
+        if eid:
+            if eid in seen_ids:
+                return False
+            seen_ids.add(eid)
+        etype = getattr(event, "type", "")
+        if etype == "agent.message":
+            text = _extract_text(getattr(event, "content", None))
+            if text:
+                parts.append(text)
+                if on_text:
+                    try:
+                        await on_text(text)
+                    except Exception as e:
+                        log.warning("[managed-agents] on_text erreur: %s", e)
+        elif etype == "agent.thinking" and on_thinking:
+            txt = getattr(event, "text", "") or _extract_text(
+                getattr(event, "content", None))
+            if txt:
                 try:
-                    res = close()
-                    if asyncio.iscoroutine(res):
-                        await res
+                    await on_thinking(txt)
                 except Exception:
                     pass
+        elif etype == "session.error":
+            err = getattr(event, "error", None)
+            msg = getattr(err, "message", None) or str(err or "")[:300]
+            log.warning("[managed-agents] session.error %s : %s", session_id, msg)
+        elif etype == "session.status_idle":
+            # `stop_reason` est un objet : on lit son `.type`. Une session
+            # "idle" avec stop_reason "requires_action" attend une action du
+            # client (confirmation d'outil, resultat d'outil custom) -- ce
+            # pont ne sait pas y repondre ; on s'arrete proprement en le
+            # signalant, au lieu de rendre un resultat partiel comme final.
+            sr = getattr(event, "stop_reason", None)
+            sr_type = getattr(sr, "type", None) if sr is not None else None
+            stop_reason = sr_type or "end_turn"
+            status = "requires_action" if sr_type == "requires_action" else "idle"
+            return True
+        elif etype == "session.status_terminated":
+            status = "terminated"
+            return True
+        return False
+
+    async def _replay_history() -> bool:
+        """Recoupe avec l'historique (le flux SSE n'a pas de rattrapage) ; le
+        dedoublonnage par id evite de traiter deux fois. True si terminal vu."""
+        page = await client.beta.sessions.events.list(session_id)
+        for ev in getattr(page, "data", []) or []:
+            if await _handle(ev):
+                return True
+        return False
+
+    async def _consume():
+        nonlocal sent
+        attempts = 0
+        while True:
+            stream = await client.beta.sessions.events.stream(session_id)
+            try:
+                if not sent:
+                    # Flux ouvert AVANT l'envoi : aucun evenement precoce n'est perdu.
+                    await client.beta.sessions.events.send(
+                        session_id,
+                        events=[{"type": "user.message",
+                                 "content": [{"type": "text", "text": instruction}]}],
+                    )
+                    sent = True
+                elif await _replay_history():
+                    return
+                async for event in stream:
+                    if await _handle(event):
+                        return
+                # Flux clos sans evenement terminal -> on retente (borne ci-dessous).
+                attempts += 1
+                if attempts > 2:
+                    raise RuntimeError("flux clos sans fin de session")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                attempts += 1
+                if attempts > 2:
+                    raise
+                log.warning("[managed-agents] flux interrompu (%s) -> reconnexion %d/2",
+                            str(e)[:120], attempts)
+            finally:
+                close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+                if close:
+                    try:
+                        res = close()
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception:
+                        pass
 
     try:
         await asyncio.wait_for(_consume(), timeout=timeout_s)
     except asyncio.TimeoutError:
         status = "timeout"
         log.warning("[managed-agents] timeout (%ss) sur session %s", timeout_s, session_id)
+    except Exception as e:
+        status = "error"
+        log.warning("[managed-agents] session %s en erreur : %s", session_id, str(e)[:200])
 
     # Archive la session une fois terminee pour ne pas les accumuler. On NE le fait
     # PAS en cas de timeout (la session tourne peut-etre encore : on la laisse pour
@@ -201,6 +258,7 @@ async def run_session(
         "stop_reason": stop_reason,
         "session_id": session_id,
         "status": status,
+        "console_url": console_url,
     }
 
 
