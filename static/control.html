@@ -300,6 +300,15 @@ main{grid-area:main;overflow-y:auto;padding:var(--sp-6);position:relative}
         </div>
         <div id="settings-apikey-status" style="margin-top:6px;font-size:var(--fs-xs);color:var(--c-text-faint)"></div>
       </div>
+      <div>
+        <label for="settings-ghtoken" style="display:block;margin-bottom:6px;color:var(--c-text)">Jeton GitHub <span style="color:var(--c-text-faint);font-weight:normal">(dépôts privés &amp; agents gérés Anthropic)</span></label>
+        <div style="display:flex;gap:6px">
+          <input class="input" type="password" id="settings-ghtoken" placeholder="ghp_… ou github_pat_…" style="flex:1" autocomplete="off">
+          <button class="btn btn-sm btn-primary" id="settings-ghtoken-save">Enregistrer</button>
+          <button class="btn btn-sm" id="settings-ghtoken-clear" title="Effacer le jeton enregistré">Effacer</button>
+        </div>
+        <div id="settings-ghtoken-status" style="margin-top:6px;font-size:var(--fs-xs);color:var(--c-text-faint)"></div>
+      </div>
       <div style="display:flex;justify-content:space-between"><span>Base API</span><code id="settings-base">/api</code></div>
       <div style="display:flex;justify-content:space-between"><span>État SSE</span><span id="settings-sse">—</span></div>
       <div style="display:flex;justify-content:space-between"><span>Version</span><span id="settings-version">—</span></div>
@@ -937,6 +946,39 @@ window.addEventListener('DOMContentLoaded', ()=>{
     // Re-tente une connexion SSE et recharge la vue courante
     connectSSE();
     navigate();
+  });
+
+  // Jeton GitHub — stocké côté serveur (jamais ré-affiché en clair, juste un aperçu masqué)
+  const ghInput = $('#settings-ghtoken');
+  const ghStatus = $('#settings-ghtoken-status');
+  async function refreshGhStatus(){
+    if(!ghStatus) return;
+    try{
+      const st = await api('/api/settings/github-token');
+      ghStatus.textContent = st.set
+        ? ('Jeton défini ('+(st.source==='app'?"enregistré dans l'app":'variable GITHUB_TOKEN du .env')+') : '+(st.hint||''))
+        : 'Aucun jeton — dépôts privés et montage GitHub des agents gérés indisponibles.';
+    }catch(e){ ghStatus.textContent = 'Statut du jeton indisponible ('+e.message+').'; }
+  }
+  refreshGhStatus();
+  const ghSave = $('#settings-ghtoken-save');
+  if(ghSave) ghSave.addEventListener('click', async ()=>{
+    const v = (ghInput && ghInput.value || '').trim();
+    if(!v){ toast('Jeton vide','Collez un jeton GitHub avant d\'enregistrer.','error'); return; }
+    try{
+      await api('/api/settings/github-token', {method:'POST', body: JSON.stringify({token:v})});
+      if(ghInput) ghInput.value='';
+      toast('Jeton GitHub enregistré','','success');
+      refreshGhStatus();
+    }catch(e){ toast("Échec de l'enregistrement", e.message, 'error'); }
+  });
+  const ghClear = $('#settings-ghtoken-clear');
+  if(ghClear) ghClear.addEventListener('click', async ()=>{
+    try{
+      await api('/api/settings/github-token', {method:'DELETE'});
+      toast('Jeton GitHub effacé','','success');
+      refreshGhStatus();
+    }catch(e){ toast('Échec', e.message, 'error'); }
   });
 
   // Burger mobile

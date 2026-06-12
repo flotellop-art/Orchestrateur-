@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 import team
 import api_control
 import managed_agents  # pont vers les Agents geres Anthropic
+import app_settings    # reglages persistants saisis dans l'UI (ex: jeton GitHub)
 from auth_middleware import add_auth_middleware
 from patches.security.cors_config import add_cors_middleware
 
@@ -457,6 +458,7 @@ async def lifespan(app):
     await init_db()
     await team.init_team_db()
     await api_control.init_control_db()
+    await app_settings.init_settings_db()
     import memory
     await memory.init_memory_db()
     log.info("App Creator demarre.")
@@ -481,6 +483,7 @@ app.include_router(team.router)
 # prioritaire ; control.html sait lire ce format.
 app.include_router(api_control.router)
 app.include_router(managed_agents.router)  # GET /api/managed-agents + /environment
+app.include_router(app_settings.router)    # /api/settings/* (jeton GitHub saisi dans l'UI)
 import memory as _memory_mod
 if _memory_mod.router is not None:
     app.include_router(_memory_mod.router)

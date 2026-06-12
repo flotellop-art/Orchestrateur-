@@ -34,6 +34,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import managed_agents  # pont vers les Agents geres Anthropic (delegation depuis le chef)
+import app_settings    # jeton GitHub saisi dans l'UI (repli sur GITHUB_TOKEN du .env)
 
 load_dotenv(Path(__file__).parent / ".env", override=False)
 log = logging.getLogger(__name__)
@@ -2115,13 +2116,14 @@ async def _run_task(task_id, resume=False):
                         repo_url = (task.get("target_repo_url") or "").strip()
                     resources = None
                     if repo_url:
-                        gh_token = os.getenv("GITHUB_TOKEN", "").strip()
+                        gh_token = await app_settings.get_github_token()
                         if gh_token:
                             resources = [{"type": "github_repository", "url": repo_url,
                                           "authorization_token": gh_token}]
                         else:
                             await notice("Depot " + repo_url + " non monte sur l'agent gere : "
-                                         "GITHUB_TOKEN absent du .env.")
+                                         "aucun jeton GitHub (saisis-le dans /control, onglet "
+                                         "Settings, ou GITHUB_TOKEN dans .env).")
                     rubric = (inp.get("rubric") or "").strip() or None
                     await emit(task_id, iteration, label, "agent_message",
                                {"kind": "thought",
@@ -2283,8 +2285,11 @@ async def create_task(body: TaskCreate):
     target_path = None
     if company:
         if body.target_repo_url:
+            # Jeton : celui fourni pour cette tache, sinon celui enregistre dans
+            # l'app (onglet Settings), sinon GITHUB_TOKEN du .env.
+            clone_token = (body.github_token or "").strip() or await app_settings.get_github_token() or None
             try:
-                target_path = await _clone_repo(body.target_repo_url, body.github_token)
+                target_path = await _clone_repo(body.target_repo_url, clone_token)
             except Exception as e:
                 raise HTTPException(400, "Connexion au depot GitHub impossible : " + str(e)[:300])
         elif body.target_path and Path(body.target_path).exists():
