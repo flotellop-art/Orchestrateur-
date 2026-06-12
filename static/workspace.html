@@ -186,14 +186,18 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
     <div id="company-box" style="display:none;margin-top:10px;border-left:3px solid var(--purple);padding-left:12px">
       <label for="target-repo-url">Depot GitHub a auditer (l'app le clone toute seule)</label>
       <input type="text" id="target-repo-url" placeholder="https://github.com/flotellop-art/Arty">
-      <input type="password" id="github-token" placeholder="Token GitHub (uniquement si le depot est prive)"
+      <input type="password" id="github-token" placeholder="Jeton GitHub du projet (depot prive, ou agents geres Anthropic)"
         style="margin-top:8px" autocomplete="off">
+      <p class="muted" style="margin-top:6px">Conseil : utilisez un jeton <b>limite a ce seul depot</b>
+        (fine-grained PAT). Il est conserve <b>avec ce projet</b> (base locale), sert au clone et au montage
+        du depot sur les agents geres Anthropic, et n'est jamais renvoye par l'API ni journalise.
+        Laissez vide pour utiliser le jeton global (page /control, onglet Settings).</p>
       <p class="muted" style="margin-top:8px">— ou —</p>
       <label for="target-path" style="margin-top:4px">Chemin d'un depot deja clone en local (optionnel)</label>
       <input type="text" id="target-path" placeholder="C:\\Users\\Tellop\\arty-repo">
       <p class="muted">L'entreprise lit le depot en <b>lecture seule</b> et ecrit ses livrables dans un dossier
-        <b>delivery/</b> local (elle ne pousse jamais, ne merge pas). Le token sert au clone puis n'est ni
-        stocke ni journalise. Limites etendues (jusqu'a 24 agents / 300 tours).</p>
+        <b>delivery/</b> local (elle ne pousse jamais, ne merge pas).
+        Limites etendues (jusqu'a 24 agents / 300 tours).</p>
     </div>
   </div>
 

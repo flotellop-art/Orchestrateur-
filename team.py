@@ -166,7 +166,8 @@ async def init_team_db():
                     "ALTER TABLE tasks ADD COLUMN target_path TEXT",
                     "ALTER TABLE tasks ADD COLUMN total_cost_usd REAL DEFAULT 0",
                     "ALTER TABLE tasks ADD COLUMN max_cost_usd REAL DEFAULT 0",
-                    "ALTER TABLE tasks ADD COLUMN target_repo_url TEXT"):
+                    "ALTER TABLE tasks ADD COLUMN target_repo_url TEXT",
+                    "ALTER TABLE tasks ADD COLUMN github_token TEXT"):
             try:
                 await db.execute(ddl)
             except Exception:
@@ -208,14 +209,15 @@ async def init_team_db():
 
 async def db_create_task(objective, folder, max_iterations, max_agents, web_enabled, chef_model,
                          company_mode=False, target_path=None, max_cost_usd=0.0,
-                         target_repo_url=None):
+                         target_repo_url=None, github_token=None):
     async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         cur = await db.execute(
             "INSERT INTO tasks (objective,folder,status,max_iterations,max_agents,web_enabled,chef_model,"
-            "company_mode,target_path,max_cost_usd,target_repo_url,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "company_mode,target_path,max_cost_usd,target_repo_url,github_token,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (objective, folder, "idle", max_iterations, max_agents,
              1 if web_enabled else 0, chef_model,
-             1 if company_mode else 0, target_path, max_cost_usd, target_repo_url,
+             1 if company_mode else 0, target_path, max_cost_usd, target_repo_url, github_token,
              datetime.utcnow().isoformat()),
         )
         await db.commit()
@@ -243,8 +245,18 @@ async def db_list_tasks():
 _TASKS_COLUMNS_ALLOWED = frozenset({
     "objective", "folder", "status", "iteration", "max_iterations", "max_agents",
     "web_enabled", "chef_model", "company_mode", "target_path", "image_path",
-    "total_cost_usd", "max_cost_usd", "target_repo_url",
+    "total_cost_usd", "max_cost_usd", "target_repo_url", "github_token",
 })
+
+
+def _public_task(t: Optional[dict]) -> Optional[dict]:
+    """Version d'une tache SANS secret : le jeton GitHub du projet n'est JAMAIS
+    renvoye par l'API (remplace par un booleen has_github_token)."""
+    if not t:
+        return t
+    t = dict(t)
+    t["has_github_token"] = bool((t.pop("github_token", None) or "").strip())
+    return t
 
 async def db_update_task(task_id, **kwargs):
     invalid = set(kwargs) - _TASKS_COLUMNS_ALLOWED
@@ -2116,14 +2128,17 @@ async def _run_task(task_id, resume=False):
                         repo_url = (task.get("target_repo_url") or "").strip()
                     resources = None
                     if repo_url:
-                        gh_token = await app_settings.get_github_token()
+                        # Priorite : jeton DU PROJET (limite les droits a ce depot),
+                        # sinon jeton global de l'app, sinon GITHUB_TOKEN du .env.
+                        gh_token = ((task.get("github_token") or "").strip()
+                                    or await app_settings.get_github_token())
                         if gh_token:
                             resources = [{"type": "github_repository", "url": repo_url,
                                           "authorization_token": gh_token}]
                         else:
                             await notice("Depot " + repo_url + " non monte sur l'agent gere : "
-                                         "aucun jeton GitHub (saisis-le dans /control, onglet "
-                                         "Settings, ou GITHUB_TOKEN dans .env).")
+                                         "aucun jeton GitHub (champ du projet a la creation, "
+                                         "ou /control onglet Settings, ou GITHUB_TOKEN du .env).")
                     rubric = (inp.get("rubric") or "").strip() or None
                     await emit(task_id, iteration, label, "agent_message",
                                {"kind": "thought",
@@ -2253,7 +2268,7 @@ class TaskCreate(BaseModel):
     company_mode: bool = False   # mode entreprise tech (audit d'un depot externe en lecture seule)
     target_path: Optional[str] = None  # chemin local du depot a auditer (lecture seule)
     target_repo_url: Optional[str] = None  # URL GitHub a cloner localement (lecture seule)
-    github_token: Optional[str] = None  # token pour depot prive (utilise pour le clone, jamais stocke)
+    github_token: Optional[str] = None  # jeton GitHub DU PROJET (clone + montage sur agents geres) ; conserve avec la tache, jamais renvoye par l'API
     max_cost_usd: float = 0  # plafond de cout par tache en USD (0 = pas de plafond)
 
 
@@ -2283,11 +2298,13 @@ async def create_task(body: TaskCreate):
     max_iter = max(1, min(body.max_iterations, iter_ceiling))
     max_agents = max(1, min(body.max_agents, agents_ceiling))
     target_path = None
+    # Jeton GitHub DU PROJET : conserve avec la tache (clone + montage du depot
+    # sur les agents geres). Priorite : jeton du projet > jeton global de l'app
+    # (onglet Settings) > GITHUB_TOKEN du .env. Jamais renvoye par l'API.
+    project_token = (body.github_token or "").strip() or None
     if company:
         if body.target_repo_url:
-            # Jeton : celui fourni pour cette tache, sinon celui enregistre dans
-            # l'app (onglet Settings), sinon GITHUB_TOKEN du .env.
-            clone_token = (body.github_token or "").strip() or await app_settings.get_github_token() or None
+            clone_token = project_token or await app_settings.get_github_token() or None
             try:
                 target_path = await _clone_repo(body.target_repo_url, clone_token)
             except Exception as e:
@@ -2302,13 +2319,12 @@ async def create_task(body: TaskCreate):
     Path(folder).mkdir(parents=True, exist_ok=True)
     if company:
         (Path(folder) / "delivery").mkdir(exist_ok=True)  # tout ce que produit la boite va ici
-    # L'URL du depot est memorisee (SANS le token) : elle sert au montage du depot
-    # dans les sessions d'agents geres Anthropic (avec GITHUB_TOKEN du .env).
     task_id = await db_create_task(objective, folder, max_iter, max_agents,
                                    body.web_enabled, body.chef_model or DEFAULT_CLAUDE,
                                    company_mode=company, target_path=target_path,
                                    max_cost_usd=max(0.0, float(body.max_cost_usd or 0)),
-                                   target_repo_url=(body.target_repo_url or "").strip() or None)
+                                   target_repo_url=(body.target_repo_url or "").strip() or None,
+                                   github_token=project_token)
     # Amorcage optionnel d'agents par l'utilisateur
     for a in body.agents:
         name = (a.name or "").strip()
@@ -2759,7 +2775,8 @@ async def list_builds(task_id: int):
 
 @router.get("/api/tasks")
 async def list_tasks():
-    return await db_list_tasks()
+    # _public_task : le jeton GitHub d'un projet n'est jamais expose par l'API.
+    return [_public_task(t) for t in await db_list_tasks()]
 
 
 @router.get("/api/tasks/{task_id}")
@@ -2767,6 +2784,7 @@ async def get_task(task_id: int):
     t = await db_get_task(task_id)
     if not t:
         raise HTTPException(404, "Tache introuvable")
+    t = _public_task(t)
     t["agents"] = await db_list_agents(task_id)
     t["active"] = task_id in running_tasks
     return t
