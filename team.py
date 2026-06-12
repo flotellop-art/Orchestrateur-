@@ -742,32 +742,61 @@ async def _run_pytest(folder: str, timeout: int = 120) -> str:
         return "TIMEOUT pytest apres " + str(timeout) + "s."
 
 
+async def _web_search_native(query: str) -> str:
+    """Recherche via l'outil serveur natif d'Anthropic : un seul appel, aucune dependance.
+
+    L'outil tourne cote Anthropic ; il peut rendre la main avec "pause_turn" s'il a
+    besoin de poursuivre (boucle serveur) -> on renvoie l'echange pour qu'il reprenne.
+    """
+    messages = [{"role": "user",
+                 "content": "Recherche sur le web et resume de facon concise et factuelle : " + query}]
+    tools = [{"type": "web_search_20260209", "name": "web_search"}]
+    resp = await _client.messages.create(
+        model="claude-haiku-4-5", max_tokens=2048, messages=messages, tools=tools)
+    guard = 0
+    while resp.stop_reason == "pause_turn" and guard < 4:
+        messages.append({"role": "assistant", "content": resp.content})
+        resp = await _client.messages.create(
+            model="claude-haiku-4-5", max_tokens=2048, messages=messages, tools=tools)
+        guard += 1
+    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+
+
+async def _web_search_sdk(query: str) -> str:
+    """Repli : claude-agent-sdk (utilise si l'outil serveur natif n'est pas disponible)."""
+    from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions, ResultMessage
+    out = []
+    async for msg in sdk_query(
+        prompt="Recherche sur le web et resume de facon concise : " + query,
+        options=ClaudeAgentOptions(
+            allowed_tools=["WebSearch", "WebFetch"],
+            permission_mode="dontAsk",
+            model="claude-haiku-4-5",
+            max_budget_usd=0.30,
+            max_turns=8,
+        ),
+    ):
+        if isinstance(msg, ResultMessage) and msg.subtype == "success":
+            out.append(msg.result)
+    return NL.join(out).strip()
+
+
 async def web_search(query: str) -> str:
-    # Cache : une meme requete (a la casse/espaces pres) ne repaye pas un appel SDK.
+    # Cache : une meme requete (a la casse/espaces pres) ne repaye pas un appel.
     key = " ".join((query or "").lower().split())
     if key and key in _web_cache:
         return _web_cache[key] + NL + "(resultat en cache)"
     try:
-        from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions, ResultMessage
-    except ImportError:
-        return "Recherche web indisponible (claude-agent-sdk non installe)."
-    out = []
-    try:
-        async for msg in sdk_query(
-            prompt="Recherche sur le web et resume de facon concise : " + query,
-            options=ClaudeAgentOptions(
-                allowed_tools=["WebSearch", "WebFetch"],
-                permission_mode="dontAsk",
-                model="claude-haiku-4-5",
-                max_budget_usd=0.30,
-                max_turns=8,
-            ),
-        ):
-            if isinstance(msg, ResultMessage) and msg.subtype == "success":
-                out.append(msg.result)
+        result = await _web_search_native(query)
     except Exception as e:
-        return "Erreur recherche web: " + str(e)[:200]
-    result = (NL.join(out) or "Aucun resultat.")[:3000]
+        log.info("[web] outil natif indisponible (%s) -> repli claude-agent-sdk", str(e)[:120])
+        try:
+            result = await _web_search_sdk(query)
+        except ImportError:
+            return "Recherche web indisponible (outil natif KO et claude-agent-sdk absent)."
+        except Exception as e2:
+            return "Erreur recherche web: " + str(e2)[:200]
+    result = (result or "Aucun resultat.")[:3000]
     if key and not result.startswith("Erreur"):
         if len(_web_cache) >= _WEB_CACHE_MAX:
             _web_cache.pop(next(iter(_web_cache)), None)  # evince la plus ancienne entree

@@ -158,8 +158,15 @@ async def run_session(
                         except Exception:
                             pass
                 elif etype == "session.status_idle":
-                    stop_reason = getattr(event, "stop_reason", None) or "end_turn"
-                    status = "idle"
+                    # `stop_reason` est un objet : on lit son `.type`. Une session
+                    # "idle" avec stop_reason "requires_action" attend une action du
+                    # client (confirmation d'outil, resultat d'outil custom) -- ce
+                    # pont ne sait pas y repondre ; on s'arrete proprement en le
+                    # signalant, au lieu de rendre un resultat partiel comme final.
+                    sr = getattr(event, "stop_reason", None)
+                    sr_type = getattr(sr, "type", None) if sr is not None else None
+                    stop_reason = sr_type or "end_turn"
+                    status = "requires_action" if sr_type == "requires_action" else "idle"
                     break
                 elif etype == "session.status_terminated":
                     status = "terminated"
@@ -179,6 +186,15 @@ async def run_session(
     except asyncio.TimeoutError:
         status = "timeout"
         log.warning("[managed-agents] timeout (%ss) sur session %s", timeout_s, session_id)
+
+    # Archive la session une fois terminee pour ne pas les accumuler. On NE le fait
+    # PAS en cas de timeout (la session tourne peut-etre encore : on la laisse pour
+    # inspection). Best-effort : une erreur d'archivage ne doit pas casser le retour.
+    if status in ("idle", "terminated", "requires_action"):
+        try:
+            await client.beta.sessions.archive(session_id)
+        except Exception as e:
+            log.info("[managed-agents] archivage de %s ignore : %s", session_id, str(e)[:120])
 
     return {
         "text": "\n".join(parts).strip(),
