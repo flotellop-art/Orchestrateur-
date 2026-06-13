@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 import team
 import api_control
 import managed_agents  # pont vers les Agents geres Anthropic
+import app_settings    # reglages persistants saisis dans l'UI (ex: jeton GitHub)
 from auth_middleware import add_auth_middleware
 from patches.security.cors_config import add_cors_middleware
 
@@ -210,55 +211,117 @@ Structure JSON attendue :
 }
 
 Regles absolues :
-1. Reponds UNIQUEMENT avec le JSON, rien d'autre.
-2. app.py doit ecouter sur le PORT indique dans le message.
-3. app.py doit avoir une route "/" qui retourne du HTML.
-4. L'HTML doit etre inline dans app.py (pas de fichiers separes).
-5. requirements.txt doit contenir uniquement "flask".
-6. N'utilise aucune API externe ni cle API.
-7. Le code doit fonctionner tel quel, sans modification.
-8. Cree une interface belle adaptee a la demande.
-9. Dans les valeurs "content" du JSON, les sauts de ligne du code doivent etre representes par \\n (backslash + n), pas par de vrais retours a la ligne."""
+1. app.py doit ecouter sur le PORT indique dans le message.
+2. app.py doit avoir une route "/" qui retourne du HTML.
+3. L'HTML doit etre inline dans app.py (pas de fichiers separes).
+4. requirements.txt doit contenir uniquement "flask".
+5. N'utilise aucune API externe ni cle API.
+6. Le code doit fonctionner tel quel, sans modification.
+7. Cree une interface belle adaptee a la demande."""
+
+# Schema de sortie impose a Claude (sorties structurees) : la reponse est alors
+# un JSON valide GARANTI par l'API -- plus besoin d'extraction ni de reparation.
+APP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "files": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["filename", "content"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["name", "files"],
+    "additionalProperties": False,
+}
+
+MODEL_APP_CREATOR = "claude-sonnet-4-6"
 
 
 # ── Generation du code via Claude ─────────────────────────────────────────────
-async def generate_app_code(description, port, retry_error=""):
+def _extract_json_app(raw):
+    """Extraction + reparation du JSON (repli quand les sorties structurees sont indispo)."""
+    raw = (raw or "").strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("Pas de JSON dans la reponse : " + raw[:200])
+    candidate = raw[start:end + 1]
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(repair_json(candidate))
+    except json.JSONDecodeError as e:
+        raise ValueError("JSON invalide apres reparation : {} | Debut : {}".format(str(e), candidate[:150]))
+
+
+async def _generate_structured(msg_user):
+    """Voie principale : sorties structurees + streaming (gros fichiers sans timeout).
+
+    Retourne le dict {name, files} ou None si la fonctionnalite n'est pas disponible
+    (ancienne version du SDK / API) -- l'appelant bascule alors sur le repli.
     """
-    Appelle Claude et retourne un dict {name, files}.
-    Essaie de reparer le JSON si necessaire.
+    try:
+        async with client.messages.stream(
+            model=MODEL_APP_CREATOR,
+            max_tokens=32000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": msg_user}],
+            output_config={"format": {"type": "json_schema", "schema": APP_SCHEMA}},
+        ) as stream:
+            final = await stream.get_final_message()
+    except TypeError:
+        return None  # SDK trop ancien : ne connait pas output_config -> repli
+    except anthropic.BadRequestError as e:
+        # output_config non supporte par ce modele/cette API -> repli silencieux.
+        if "output_config" in str(e) or "json_schema" in str(e):
+            return None
+        raise
+    if final.stop_reason == "refusal":
+        raise ValueError("Demande refusee par le modele (securite).")
+    text = next((b.text for b in final.content if getattr(b, "type", "") == "text"), "")
+    return json.loads(text)  # garanti valide par les sorties structurees
+
+
+async def _generate_legacy(msg_user):
+    """Repli historique : prompt JSON + extraction + reparation caractere par caractere."""
+    response = await client.messages.create(
+        model=MODEL_APP_CREATOR,
+        max_tokens=16000,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": msg_user}],
+    )
+    raw = response.content[0].text.strip()
+    return _extract_json_app(raw)
+
+
+async def generate_app_code(description, port, retry_error=""):
+    """Appelle Claude et retourne un dict {name, files}.
+
+    Essaie d'abord les sorties structurees (JSON garanti valide) ; en cas
+    d'indisponibilite, bascule sur l'extraction/reparation historique.
     """
     msg_user = "Port : {}\nDescription : {}".format(port, description)
     if retry_error:
         msg_user += "\n\nERREUR A CORRIGER :\n{}\nCorrige le code et renvoie le JSON complet.".format(retry_error)
 
-    response = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": msg_user}],
-    )
-    raw = response.content[0].text.strip()
-
-    # Extraire le JSON entre le premier { et le dernier }
-    start = raw.find("{")
-    end   = raw.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("Pas de JSON dans la reponse : " + raw[:200])
-
-    candidate = raw[start : end + 1]
-
-    # Tentative 1 : json.loads direct
     try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        pass
-
-    # Tentative 2 : reparer les retours a la ligne litteraux
-    try:
-        repaired = repair_json(candidate)
-        return json.loads(repaired)
+        data = await _generate_structured(msg_user)
+        if data is not None:
+            return data
+        log.info("Sorties structurees indisponibles -> repli sur extraction JSON.")
     except json.JSONDecodeError as e:
-        raise ValueError("JSON invalide apres reparation : {} | Debut : {}".format(str(e), candidate[:150]))
+        log.warning("JSON structure illisible (%s) -> repli sur extraction JSON.", e)
+    return await _generate_legacy(msg_user)
 
 
 # ── Pipeline de creation (SSE) ─────────────────────────────────────────────────
@@ -395,10 +458,13 @@ async def lifespan(app):
     await init_db()
     await team.init_team_db()
     await api_control.init_control_db()
+    await app_settings.init_settings_db()
     import memory
     await memory.init_memory_db()
+    team.start_scheduler()  # planificateur des missions programmees
     log.info("App Creator demarre.")
     yield
+    await team.stop_scheduler()
     for proc in running_servers.values():
         try:
             proc.terminate()
@@ -419,6 +485,7 @@ app.include_router(team.router)
 # prioritaire ; control.html sait lire ce format.
 app.include_router(api_control.router)
 app.include_router(managed_agents.router)  # GET /api/managed-agents + /environment
+app.include_router(app_settings.router)    # /api/settings/* (jeton GitHub saisi dans l'UI)
 import memory as _memory_mod
 if _memory_mod.router is not None:
     app.include_router(_memory_mod.router)
@@ -544,4 +611,14 @@ app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("orchestrator:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+    # Securite : par defaut on n'ecoute que sur le PC local (127.0.0.1).
+    # Pour exposer sur le reseau, definir HOST=0.0.0.0 -- mais alors une cle API
+    # (API_SECRET_KEY) est vivement recommandee, sinon l'API est ouverte a tous.
+    host = os.getenv("HOST", "127.0.0.1")
+    if host not in ("127.0.0.1", "localhost") and not os.getenv("API_SECRET_KEY", "").strip():
+        log.warning(
+            "ATTENTION : HOST=%s expose l'API sur le reseau SANS protection "
+            "(API_SECRET_KEY vide). Definis une cle dans .env, ou garde HOST=127.0.0.1.",
+            host,
+        )
+    uvicorn.run("orchestrator:app", host=host, port=int(os.getenv("PORT", "8000")), reload=False)

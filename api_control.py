@@ -610,6 +610,7 @@ async def get_agents():
                     ta.role,
                     ta.provider,
                     ta.model,
+                    ta.managed_agent_id,
                     ta.created_by,
                     ta.created_at,
                     t.status       AS task_status,

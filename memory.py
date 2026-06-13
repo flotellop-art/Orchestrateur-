@@ -1,9 +1,12 @@
 """memory.py — Memoire long-terme evoluee pour les agents internes.
 
-3 etages :
+4 etages :
   - _user        : tes notes/preferences (chargees au demarrage de chaque tache)
   - role:<slug>  : memoire dediee a un role d'agent (ex. role:security-auditor)
   - _shared      : leconage commun (toutes taches, tous agents)
+  - managed      : memoire PARTAGEE entre les missions des Agents geres Anthropic
+                   (chaque mission lit les lecons des precedentes et en depose de
+                   nouvelles a la fin -- voir MANAGED_NS)
 
 Recherche : semantique (embeddings OpenAI 256-dim) si OPENAI_API_KEY dispo,
 sinon fallback LIKE (idem ancien comportement).
@@ -32,6 +35,10 @@ EMBED_DIM = int(os.getenv("MEMORY_EMBED_DIM", "256"))
 SUMMARY_MODEL = os.getenv("MEMORY_SUMMARY_MODEL", "claude-haiku-4-5")
 SIMILARITY_THRESHOLD = float(os.getenv("MEMORY_THRESHOLD", "0.32"))
 MAX_RECALL = int(os.getenv("MEMORY_MAX_RECALL", "5"))
+
+# Namespace partage par TOUTES les missions confiees aux Agents geres Anthropic.
+# Une mission lit ce qu'ont appris les precedentes et y ajoute ses propres lecons.
+MANAGED_NS = "managed"
 
 
 # ── Embeddings ────────────────────────────────────────────────────────────────
@@ -272,8 +279,13 @@ except ImportError:
 
 
 async def summarize_and_save(task_id: int, objective: str, messages_blob: str,
-                             anthropic_client) -> int:
-    """Genere 1-3 lecons via Haiku et les range dans _shared. Retourne le nb enregistre."""
+                             anthropic_client, namespace: str = "_shared",
+                             source_prefix: str = "task:") -> int:
+    """Genere 1-3 lecons via Haiku et les range dans `namespace`. Retourne le nb enregistre.
+
+    Par defaut -> _shared (auto-resume de fin de tache). Avec namespace=MANAGED_NS,
+    sert a alimenter la memoire partagee entre les missions des Agents geres.
+    """
     if not messages_blob or not messages_blob.strip():
         return 0
     try:
@@ -299,8 +311,8 @@ async def summarize_and_save(task_id: int, objective: str, messages_blob: str,
         saved = 0
         for lesson in (data.get("lessons") or [])[:3]:
             if lesson and isinstance(lesson, str) and len(lesson.strip()) > 12:
-                await remember(lesson.strip(), namespace="_shared",
-                               source="task:" + str(task_id))
+                await remember(lesson.strip(), namespace=namespace,
+                               source=source_prefix + str(task_id))
                 saved += 1
         return saved
     except Exception as e:

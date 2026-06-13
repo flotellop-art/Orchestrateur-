@@ -19,8 +19,11 @@ function pyPath(){
 }
 
 function checkServer(){
+  // Sonde /health : endpoint PUBLIC (jamais protege par la cle API). Sonder une
+  // route protegee (/api/stats) renverrait 401 quand API_SECRET_KEY est definie,
+  // et le lanceur croirait a tort que le serveur n'est pas pret (splash bloque).
   return new Promise(res=>{
-    const r=http.get(BASE+'/api/stats',resp=>{res(resp.statusCode===200);});
+    const r=http.get(BASE+'/health',resp=>{res(resp.statusCode===200);});
     r.on('error',()=>res(false));
     r.setTimeout(2000,()=>{r.destroy();res(false);});
   });
@@ -57,6 +60,8 @@ function buildMenu(){
     {label:'Navigation',submenu:[
       {label:'Tableau de bord',accelerator:'CmdOrCtrl+1',click:()=>win&&win.loadURL(BASE)},
       {label:'Chat',accelerator:'CmdOrCtrl+2',click:()=>win&&win.loadURL(BASE+'/chat')},
+      {label:'Centre de controle',accelerator:'CmdOrCtrl+3',click:()=>win&&win.webContents.session.clearCache().then(()=>win.loadURL(BASE+'/control'))},
+      {label:'Espace agents',accelerator:'CmdOrCtrl+4',click:()=>win&&win.loadURL(BASE+'/workspace')},
       {type:'separator'},
       {label:'Ouvrir dans navigateur',click:()=>security.safeOpenExternal(BASE)}
     ]},
@@ -86,6 +91,7 @@ function createTray(){
       {label:'Afficher',click:()=>show()},
       {label:'Tableau de bord',click:()=>{show();win&&win.webContents.session.clearCache().then(()=>win.loadURL(BASE));}},
       {label:'Chat',click:()=>{show();win&&win.loadURL(BASE+'/chat');}},
+      {label:'Centre de controle',click:()=>{show();win&&win.webContents.session.clearCache().then(()=>win.loadURL(BASE+'/control'));}},
       {type:'separator'},{label:'Quitter',click:()=>quit()}
     ]));
     tray.on('double-click',()=>show());
