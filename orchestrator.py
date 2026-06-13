@@ -461,8 +461,10 @@ async def lifespan(app):
     await app_settings.init_settings_db()
     import memory
     await memory.init_memory_db()
+    team.start_scheduler()  # planificateur des missions programmees
     log.info("App Creator demarre.")
     yield
+    await team.stop_scheduler()
     for proc in running_servers.values():
         try:
             proc.terminate()

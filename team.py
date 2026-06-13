@@ -22,7 +22,7 @@ import shutil
 import sys
 import uuid
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -202,6 +202,31 @@ async def init_team_db():
             await db.execute("CREATE TABLE IF NOT EXISTS knowledge "
                              "(id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT, created_at TEXT)")
             _KNOWLEDGE_FTS = False
+        # Missions PROGRAMMEES : lancees automatiquement a heure fixe (une fois,
+        # tous les jours, ou a intervalle regulier). `config` = JSON des parametres
+        # de la tache a creer (modele, web, plafonds, depot...). Le jeton GitHub
+        # eventuel y est stocke mais JAMAIS renvoye par l'API (voir _public_schedule).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS scheduled_missions (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                objective         TEXT NOT NULL,
+                config            TEXT NOT NULL DEFAULT '{}',
+                schedule_kind     TEXT NOT NULL DEFAULT 'once',
+                run_at            TEXT,
+                daily_time        TEXT,
+                interval_minutes  INTEGER,
+                tz_offset_minutes INTEGER DEFAULT 0,
+                enabled           INTEGER DEFAULT 1,
+                next_run          TEXT,
+                last_run          TEXT,
+                last_task_id      INTEGER,
+                last_status       TEXT,
+                runs_count        INTEGER DEFAULT 0,
+                created_at        TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_sched_due "
+                         "ON scheduled_missions(enabled, next_run)")
         # Les taches en cours ne survivent pas a un redemarrage du serveur.
         await db.execute("UPDATE tasks SET status='stopped' WHERE status IN ('running','paused')")
         await db.commit()
@@ -275,6 +300,150 @@ async def db_delete_task(task_id):
         await db.execute("DELETE FROM task_agents WHERE task_id=?", (task_id,))
         await db.execute("DELETE FROM messages WHERE task_id=?", (task_id,))
         await db.commit()
+
+
+# ── Missions programmees : calcul d'horaire + CRUD ───────────────────────────
+SCHEDULE_KINDS = ("once", "daily", "interval")
+
+
+def _parse_local_dt(s: str) -> Optional[datetime]:
+    """Parse une date-heure LOCALE 'YYYY-MM-DDTHH:MM[:SS]' (sans fuseau)."""
+    if not s:
+        return None
+    s = s.strip().replace(" ", "T").rstrip("Z")
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        try:
+            return datetime.strptime(s, "%Y-%m-%dT%H:%M")
+        except Exception:
+            return None
+
+
+def _parse_hhmm(s: str) -> Optional[tuple[int, int]]:
+    try:
+        hh, mm = (s or "").strip().split(":")[:2]
+        h, m = int(hh), int(mm)
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h, m
+    except Exception:
+        pass
+    return None
+
+
+def _compute_next_run(kind: str, *, run_at=None, daily_time=None, interval_minutes=None,
+                      tz_offset_minutes: int = 0, after: Optional[datetime] = None) -> Optional[str]:
+    """Prochain declenchement en UTC (ISO) selon le type de planification.
+
+    `tz_offset_minutes` = minutes a AJOUTER a l'UTC pour obtenir l'heure locale de
+    l'utilisateur (soit -getTimezoneOffset() cote navigateur). On raisonne en heure
+    locale puis on reconvertit en UTC pour le stockage.
+    """
+    base = after or datetime.utcnow()
+    off = timedelta(minutes=int(tz_offset_minutes or 0))
+    if kind == "once":
+        dt_local = _parse_local_dt(run_at)
+        if dt_local is None:
+            return None
+        return (dt_local - off).isoformat()  # local -> utc
+    if kind == "interval":
+        mins = int(interval_minutes or 0)
+        if mins < 1:
+            return None
+        return (base + timedelta(minutes=mins)).isoformat()
+    if kind == "daily":
+        hm = _parse_hhmm(daily_time)
+        if not hm:
+            return None
+        local_now = base + off
+        target = local_now.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
+        if target <= local_now:
+            target += timedelta(days=1)
+        return (target - off).isoformat()  # local -> utc
+    return None
+
+
+def _public_schedule(s: Optional[dict]) -> Optional[dict]:
+    """Version sans secret : le jeton GitHub eventuel du config n'est jamais renvoye."""
+    if not s:
+        return s
+    s = dict(s)
+    try:
+        cfg = json.loads(s.get("config") or "{}")
+    except Exception:
+        cfg = {}
+    has_tok = bool((cfg.pop("github_token", None) or "").strip())
+    s["config"] = cfg
+    s["has_github_token"] = has_tok
+    return s
+
+
+async def db_create_schedule(objective, config, schedule_kind, next_run, *,
+                             run_at=None, daily_time=None, interval_minutes=None,
+                             tz_offset_minutes=0, enabled=True):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cur = await db.execute(
+            "INSERT INTO scheduled_missions (objective,config,schedule_kind,run_at,daily_time,"
+            "interval_minutes,tz_offset_minutes,enabled,next_run,runs_count,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,0,?)",
+            (objective, json.dumps(config, ensure_ascii=False), schedule_kind, run_at, daily_time,
+             interval_minutes, int(tz_offset_minutes or 0), 1 if enabled else 0, next_run,
+             datetime.utcnow().isoformat()),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def db_list_schedules():
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM scheduled_missions ORDER BY enabled DESC, next_run ASC, id DESC") as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def db_get_schedule(sched_id):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM scheduled_missions WHERE id=?", (sched_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+_SCHED_COLUMNS_ALLOWED = frozenset({
+    "objective", "config", "schedule_kind", "run_at", "daily_time", "interval_minutes",
+    "tz_offset_minutes", "enabled", "next_run", "last_run", "last_task_id", "last_status",
+    "runs_count",
+})
+
+
+async def db_update_schedule(sched_id, **kwargs):
+    invalid = set(kwargs) - _SCHED_COLUMNS_ALLOWED
+    if invalid:
+        raise ValueError("Colonnes non autorisees pour UPDATE scheduled_missions : "
+                         + ", ".join(sorted(invalid)))
+    if not kwargs:
+        return
+    sets = ", ".join(k + "=?" for k in kwargs)
+    vals = list(kwargs.values()) + [sched_id]
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        await db.execute("UPDATE scheduled_missions SET " + sets + " WHERE id=?", vals)
+        await db.commit()
+
+
+async def db_delete_schedule(sched_id):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        await db.execute("DELETE FROM scheduled_missions WHERE id=?", (sched_id,))
+        await db.commit()
+
+
+async def db_due_schedules(now_iso: str):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM scheduled_missions WHERE enabled=1 AND next_run IS NOT NULL "
+            "AND next_run<=? ORDER BY next_run ASC", (now_iso,)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
 
 async def db_add_agent(task_id, name, role, provider, model, created_by):
@@ -1209,7 +1378,9 @@ CHEF_TOOLS = [
                         "managed/ du dossier de travail. Optionnel : github_repo_url monte un depot GitHub "
                         "dans sa session (il peut alors lire/tester le code reel) ; rubric transforme la "
                         "mission en OBJECTIF NOTE (un examinateur independant verifie les criteres et "
-                        "l'agent itere jusqu'a validation) -- fournis alors des criteres VERIFIABLES."),
+                        "l'agent itere jusqu'a validation) -- fournis alors des criteres VERIFIABLES. "
+                        "Les missions d'agents geres PARTAGENT une memoire : chacune recoit "
+                        "automatiquement les lecons des precedentes et y ajoute les siennes."),
         "strict": True,
         "input_schema": {
             "type": "object",
@@ -2140,11 +2311,33 @@ async def _run_task(task_id, resume=False):
                                          "aucun jeton GitHub (champ du projet a la creation, "
                                          "ou /control onglet Settings, ou GITHUB_TOKEN du .env).")
                     rubric = (inp.get("rubric") or "").strip() or None
+                    # Memoire PARTAGEE entre missions d'agents geres : on injecte en tete
+                    # de l'instruction les lecons tirees des missions precedentes (+ lecons
+                    # communes + notes utilisateur). L'agent gere demarre ainsi avec le
+                    # contexte accumule, sans qu'on ait a tout lui repeter.
+                    instruction_for_agent = instruction
+                    mem_hits = []
+                    try:
+                        import memory as _mem
+                        mem_hits = await _mem.recall(
+                            instruction or objective,
+                            namespaces=[_mem.MANAGED_NS, "_shared", "_user"], k=6)
+                    except Exception as e:
+                        log.info("[memoire] rappel agent gere indisponible (%s)", e)
+                    if mem_hits:
+                        mem_block = (NL.join("- " + h["content"] for h in mem_hits))
+                        instruction_for_agent = (
+                            "MEMOIRE PARTAGEE (lecons des missions precedentes d'agents geres "
+                            "et regles communes -- tiens-en compte, ne les repete pas betement) :"
+                            + NL + mem_block + NL + NL
+                            + "MISSION :" + NL + instruction)
                     await emit(task_id, iteration, label, "agent_message",
                                {"kind": "thought",
                                 "content": "Delegation a l'agent gere Anthropic " + agent_id
                                 + (" (depot monte : " + repo_url + ")" if resources else "")
                                 + (" -- mission notee avec criteres de reussite" if rubric else "")
+                                + (" -- " + str(len(mem_hits)) + " lecon(s) de memoire partagee injectee(s)"
+                                   if mem_hits else "")
                                 + "..."})
 
                     async def _on_text(t, _l=label, _it=iteration):
@@ -2152,7 +2345,7 @@ async def _run_task(task_id, resume=False):
 
                     try:
                         res = await managed_agents.run_session(
-                            agent_id, instruction, on_text=_on_text,
+                            agent_id, instruction_for_agent, on_text=_on_text,
                             resources=resources, rubric=rubric,
                             outputs_dir=str(Path(folder) / "managed"),
                             # Une mission notee itere plusieurs fois : delai elargi.
@@ -2174,6 +2367,24 @@ async def _run_task(task_id, resume=False):
                         if oc.get("result"):
                             extra += (NL + "Verdict de l'examinateur : " + str(oc["result"])
                                       + (" -- " + oc["explanation"][:400] if oc.get("explanation") else ""))
+                        # Memoire PARTAGEE : a la fin d'une mission reussie, on tire 1-3 lecons
+                        # reutilisables et on les range dans le namespace `managed`, pour que les
+                        # PROCHAINES missions d'agents geres en beneficient (cercle vertueux).
+                        if res.get("status") in ("idle", "terminated") and mtext and mtext != "(reponse vide)":
+                            try:
+                                import memory as _mem
+                                blob = ("Mission confiee a un agent gere :" + NL + instruction
+                                        + NL + NL + "Resultat de l'agent :" + NL + mtext[:6000])
+                                n_mem = await _mem.summarize_and_save(
+                                    task_id, instruction, blob, _client,
+                                    namespace=_mem.MANAGED_NS,
+                                    source_prefix="managed:" + agent_id + ":task:")
+                                if n_mem:
+                                    await emit(task_id, iteration, "systeme", "info",
+                                               {"msg": str(n_mem) + " lecon(s) ajoutee(s) a la memoire "
+                                                "partagee des agents geres."})
+                            except Exception as e:
+                                log.info("[memoire] capture mission agent gere KO : %s", e)
                         tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
                                              "content": "Rapport de l'agent gere " + agent_id + " (statut="
                                              + str(res.get("status")) + ", stop_reason="
@@ -2272,6 +2483,30 @@ class TaskCreate(BaseModel):
     max_cost_usd: float = 0  # plafond de cout par tache en USD (0 = pas de plafond)
 
 
+class ScheduleCreate(BaseModel):
+    objective: str
+    schedule_kind: str = "once"          # once | daily | interval
+    run_at: Optional[str] = None         # "YYYY-MM-DDTHH:MM" LOCAL (kind=once)
+    daily_time: Optional[str] = None     # "HH:MM" LOCAL (kind=daily)
+    interval_minutes: Optional[int] = None  # (kind=interval)
+    tz_offset_minutes: int = 0           # -getTimezoneOffset() du navigateur
+    enabled: bool = True
+    # Parametres de la tache creee a l'echeance (memes champs que TaskCreate) :
+    chef_model: str = DEFAULT_CLAUDE
+    web_enabled: bool = True
+    max_iterations: int = 15
+    max_agents: int = 4
+    company_mode: bool = False
+    target_repo_url: Optional[str] = None
+    github_token: Optional[str] = None   # jamais renvoye par l'API
+    max_cost_usd: float = 0
+
+
+# Champs de config d'une mission programmee transmis a TaskCreate a l'echeance.
+_SCHEDULE_CONFIG_KEYS = ("chef_model", "web_enabled", "max_iterations", "max_agents",
+                         "company_mode", "target_repo_url", "github_token", "max_cost_usd")
+
+
 router = APIRouter()
 
 
@@ -2350,6 +2585,174 @@ def _spawn_loop(task_id, resume=False):
     pause.set()  # set = en marche ; clear = en pause
     running_tasks[task_id] = {"pause": pause, "step": False, "inbox": [], "mcp": {}}
     running_tasks[task_id]["task"] = asyncio.create_task(_run_task(task_id, resume=resume))
+
+
+# ── Planificateur de missions programmees ────────────────────────────────────
+_SCHED_TICK_SECONDS = int(os.getenv("SCHEDULER_TICK_SECONDS", "20"))
+_scheduler_task: Optional[asyncio.Task] = None
+
+
+async def _fire_schedule(sched: dict):
+    """Cree et lance la tache d'une mission programmee, puis reprogramme la suite.
+
+    Une mission `once` est desactivee apres son unique declenchement ; les missions
+    `daily`/`interval` recoivent un nouveau `next_run`. Toute erreur de lancement est
+    consignee dans `last_status` sans interrompre le planificateur.
+    """
+    sid = sched["id"]
+    try:
+        cfg = json.loads(sched.get("config") or "{}")
+    except Exception:
+        cfg = {}
+    body = TaskCreate(
+        objective=sched["objective"],
+        chef_model=cfg.get("chef_model") or DEFAULT_CLAUDE,
+        web_enabled=bool(cfg.get("web_enabled", True)),
+        max_iterations=int(cfg.get("max_iterations") or 15),
+        max_agents=int(cfg.get("max_agents") or 4),
+        company_mode=bool(cfg.get("company_mode", False)),
+        target_repo_url=(cfg.get("target_repo_url") or None),
+        github_token=(cfg.get("github_token") or None),
+        max_cost_usd=float(cfg.get("max_cost_usd") or 0),
+    )
+    now = datetime.utcnow()
+    last_status = ""
+    task_id = None
+    try:
+        created = await create_task(body)        # reutilise toute la logique (clone, agents...)
+        task_id = created.get("id")
+        _spawn_loop(task_id, resume=False)
+        last_status = "lancee (tache #" + str(task_id) + ")"
+        log.info("[scheduler] mission programmee #%s -> tache #%s lancee.", sid, task_id)
+    except Exception as e:
+        last_status = "erreur au lancement : " + str(e)[:200]
+        log.warning("[scheduler] mission #%s : %s", sid, last_status)
+
+    # Reprogrammation : `once` -> desactivee ; sinon prochain creneau a partir de maintenant.
+    upd = {"last_run": now.isoformat(), "last_status": last_status,
+           "runs_count": int(sched.get("runs_count") or 0) + 1}
+    if task_id is not None:
+        upd["last_task_id"] = task_id
+    if sched.get("schedule_kind") == "once":
+        upd["enabled"] = 0
+        upd["next_run"] = None
+    else:
+        nxt = _compute_next_run(
+            sched.get("schedule_kind"),
+            daily_time=sched.get("daily_time"),
+            interval_minutes=sched.get("interval_minutes"),
+            tz_offset_minutes=sched.get("tz_offset_minutes") or 0,
+            after=now)
+        upd["next_run"] = nxt
+    await db_update_schedule(sid, **upd)
+
+
+async def _scheduler_loop():
+    log.info("[scheduler] planificateur demarre (tick %ss).", _SCHED_TICK_SECONDS)
+    while True:
+        try:
+            due = await db_due_schedules(datetime.utcnow().isoformat())
+            for sched in due:
+                await _fire_schedule(sched)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("[scheduler] tick en erreur : %s", str(e)[:200])
+        await asyncio.sleep(_SCHED_TICK_SECONDS)
+
+
+def start_scheduler():
+    """Demarre la boucle du planificateur (idempotent). A appeler dans un event loop."""
+    global _scheduler_task
+    if _scheduler_task is None or _scheduler_task.done():
+        _scheduler_task = asyncio.create_task(_scheduler_loop())
+
+
+async def stop_scheduler():
+    global _scheduler_task
+    if _scheduler_task and not _scheduler_task.done():
+        _scheduler_task.cancel()
+        try:
+            await _scheduler_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    _scheduler_task = None
+
+
+@router.get("/api/schedules")
+async def list_schedules():
+    items = await db_list_schedules()
+    return {"schedules": [_public_schedule(s) for s in items]}
+
+
+@router.post("/api/schedules")
+async def create_schedule(body: ScheduleCreate):
+    objective = (body.objective or "").strip()
+    if not objective:
+        raise HTTPException(400, "Objectif manquant.")
+    kind = (body.schedule_kind or "once").strip()
+    if kind not in SCHEDULE_KINDS:
+        raise HTTPException(400, "Type de planification inconnu : " + kind
+                            + " (attendu : once, daily ou interval).")
+    if kind == "interval" and (not body.interval_minutes or body.interval_minutes < 1):
+        raise HTTPException(400, "interval : interval_minutes doit etre >= 1.")
+    if kind == "daily" and not _parse_hhmm(body.daily_time or ""):
+        raise HTTPException(400, "daily : daily_time doit etre au format HH:MM.")
+    if kind == "once" and _parse_local_dt(body.run_at or "") is None:
+        raise HTTPException(400, "once : run_at doit etre une date-heure 'YYYY-MM-DDTHH:MM'.")
+    if body.company_mode and not (body.target_repo_url or "").strip():
+        raise HTTPException(400, "Mode entreprise : fournis target_repo_url (depot GitHub a auditer).")
+    next_run = _compute_next_run(
+        kind, run_at=body.run_at, daily_time=body.daily_time,
+        interval_minutes=body.interval_minutes, tz_offset_minutes=body.tz_offset_minutes)
+    if not next_run:
+        raise HTTPException(400, "Impossible de calculer la prochaine echeance (parametres incomplets).")
+    config = {k: getattr(body, k) for k in _SCHEDULE_CONFIG_KEYS}
+    # Normalise : pas de jeton vide stocke.
+    config["github_token"] = (config.get("github_token") or "").strip() or None
+    config["target_repo_url"] = (config.get("target_repo_url") or "").strip() or None
+    sid = await db_create_schedule(
+        objective, config, kind, next_run,
+        run_at=(body.run_at or None), daily_time=(body.daily_time or None),
+        interval_minutes=body.interval_minutes, tz_offset_minutes=body.tz_offset_minutes,
+        enabled=body.enabled)
+    return _public_schedule(await db_get_schedule(sid))
+
+
+@router.post("/api/schedules/{sched_id}/toggle")
+async def toggle_schedule(sched_id: int):
+    s = await db_get_schedule(sched_id)
+    if not s:
+        raise HTTPException(404, "Mission programmee introuvable.")
+    new_enabled = 0 if s.get("enabled") else 1
+    upd = {"enabled": new_enabled}
+    # Reactivee : si l'echeance est passee (ou absente), on recalcule a partir de maintenant
+    # pour eviter un declenchement immediat surprise (sauf `once` dont l'heure est figee).
+    if new_enabled and s.get("schedule_kind") != "once":
+        upd["next_run"] = _compute_next_run(
+            s.get("schedule_kind"), daily_time=s.get("daily_time"),
+            interval_minutes=s.get("interval_minutes"),
+            tz_offset_minutes=s.get("tz_offset_minutes") or 0)
+    await db_update_schedule(sched_id, **upd)
+    return _public_schedule(await db_get_schedule(sched_id))
+
+
+@router.post("/api/schedules/{sched_id}/run-now")
+async def run_schedule_now(sched_id: int):
+    s = await db_get_schedule(sched_id)
+    if not s:
+        raise HTTPException(404, "Mission programmee introuvable.")
+    await _fire_schedule(s)
+    return _public_schedule(await db_get_schedule(sched_id))
+
+
+@router.delete("/api/schedules/{sched_id}")
+async def delete_schedule(sched_id: int):
+    s = await db_get_schedule(sched_id)
+    if not s:
+        raise HTTPException(404, "Mission programmee introuvable.")
+    await db_delete_schedule(sched_id)
+    return {"deleted": sched_id}
 
 
 @router.post("/api/tasks/{task_id}/start")

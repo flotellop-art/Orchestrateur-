@@ -208,6 +208,40 @@
 >        
 >         - ---
 >
+> ## Mémoire partagée des agents gérés & missions planifiées
+>
+> ### Mémoire partagée entre missions des Agents gérés Anthropic
+> Chaque délégation à un Agent géré (`assign_managed_agent`) participe désormais à une
+> **mémoire commune** (namespace `managed` dans `memory.py`). Avant la mission, les leçons
+> tirées des missions précédentes — ainsi que les règles `_shared` et les notes `_user` —
+> sont injectées en tête de l'instruction. À la fin d'une mission réussie, 1 à 3 leçons
+> réutilisables sont extraites (Haiku) et rangées dans `managed`. Les missions suivantes en
+> bénéficient automatiquement, sans qu'on ait à tout répéter. Consultable via
+> `GET /api/memory/list?namespace=managed`.
+>
+> ### Missions planifiées (à heure fixe)
+> Onglet **Planifié** du centre de contrôle (`/control`). Programmez une mission qui se lance
+> toute seule : **une seule fois** (date/heure), **chaque jour** (HH:MM), ou **à intervalle
+> régulier** (toutes les N minutes). Les paramètres de la tâche (modèle du chef, recherche web,
+> plafonds, mode entreprise + dépôt GitHub, jeton du projet) sont conservés avec la mission. Un
+> planificateur asyncio (démarré au lancement du serveur) vérifie les échéances toutes les
+> ~20 s et crée/lance la tâche correspondante, puis reprogramme la suivante.
+>
+> Les heures saisies dans l'UI sont locales (le navigateur transmet son décalage), converties et
+> stockées en UTC. Le jeton GitHub d'une mission est conservé en base mais **jamais renvoyé** par
+> l'API (seul un booléen `has_github_token` l'est).
+>
+> **Routes exposées :**
+> | Route | Description |
+> |-------|-------------|
+> | `GET /api/schedules` | Liste les missions programmées (sans secret) |
+> | `POST /api/schedules` | Crée une mission (`once` / `daily` / `interval`) |
+> | `POST /api/schedules/{id}/toggle` | Active / suspend une mission |
+> | `POST /api/schedules/{id}/run-now` | Lance immédiatement la mission |
+> | `DELETE /api/schedules/{id}` | Supprime une mission programmée |
+>
+> ---
+>
 > ## Licence
 >
 > MIT — Libre d'utilisation, modification et distribution.
