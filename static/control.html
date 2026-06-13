@@ -213,7 +213,19 @@ main{grid-area:main;overflow-y:auto;padding:var(--sp-6);position:relative}
   </section>
 
   <section class="panel" id="panel-agents" data-route="agents">
-   <div class="panel-header"><div><h1 class="panel-title">Agents</h1><p class="panel-subtitle">Pool d'agents et statut temps réel</p></div><div class="panel-actions"><button class="btn btn-primary" id="agent-create">+ Nouvel agent</button></div></div>
+   <div class="panel-header"><div><h1 class="panel-title">Agents</h1><p class="panel-subtitle">Pool d'agents et statut temps réel</p></div><div class="panel-actions"><button class="btn btn-primary" id="agent-create">+ Agent géré</button></div></div>
+   <div class="card" id="managed-agents-card" style="margin-bottom:var(--sp-5)">
+    <div class="card-title">Agents gérés Anthropic — persistants &amp; réutilisables</div>
+    <p style="font-size:var(--fs-sm);color:var(--c-text-mut);margin:-2px 0 12px">Créés sur votre compte Anthropic : réutilisables par toutes les tâches (le chef peut leur déléguer via <em>assign_managed_agent</em>). Vous pouvez aussi <strong>promouvoir</strong> un agent local depuis sa carte ci-dessous.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+     <div><label style="display:block;font-size:var(--fs-sm);margin-bottom:4px">Nom</label><input class="input" id="ma-name" placeholder="ex : Auditeur sécurité" style="width:200px"></div>
+     <div><label style="display:block;font-size:var(--fs-sm);margin-bottom:4px">Modèle</label><select class="select" id="ma-model"><option value="claude-opus-4-8">Claude Opus 4.8</option><option value="claude-sonnet-4-6" selected>Claude Sonnet 4.6</option><option value="claude-haiku-4-5">Claude Haiku 4.5</option></select></div>
+     <div style="flex:1;min-width:200px"><label style="display:block;font-size:var(--fs-sm);margin-bottom:4px">Rôle / spécialité</label><input class="input" id="ma-role" placeholder="ex : audit de sécurité applicative" style="width:100%"></div>
+     <button class="btn btn-primary" id="ma-create">Créer l'agent géré</button>
+    </div>
+    <details style="margin-top:10px"><summary style="cursor:pointer;font-size:var(--fs-sm);color:var(--c-text-mut)">Prompt système personnalisé (optionnel — sinon généré depuis le rôle)</summary><textarea class="input" id="ma-system" rows="3" style="width:100%;margin-top:8px;resize:vertical;font-family:var(--f-sans)" placeholder="Instructions système de l'agent…"></textarea></details>
+    <div id="ma-list" style="display:flex;flex-direction:column;gap:6px;margin-top:12px"><div class="skeleton"></div></div>
+   </div>
    <div class="toolbar" id="agents-filters">
     <button class="chip" data-agent-filter="all" aria-pressed="true">Tous</button>
     <button class="chip" data-agent-filter="active">Actifs</button>
@@ -676,6 +688,13 @@ async function loadAgents(){
     const taskLine = a.task_objective || a.current_task || a.task || '(idle)';
     const taskBadge = a.task_status ? ' <span class="badge">'+escapeHtml(a.task_status)+'</span>' : '';
     const lastMsg = a.last_message ? '<div style="margin-top:8px;font-size:var(--fs-xs);color:var(--c-text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+escapeHtml(a.last_message)+'">'+escapeHtml(a.last_message)+'</div>' : '';
+    // Promotion vers un vrai agent géré Anthropic (agents Claude locaux uniquement).
+    let promo = '';
+    if(a.managed_agent_id){
+      promo = '<div class="agent-actions"><span class="badge badge-claude" title="'+escapeHtml(a.managed_agent_id)+'">→ agent géré</span></div>';
+    } else if(p==='claude' && a.task_id!=null){
+      promo = '<div class="agent-actions"><button class="btn btn-sm" data-promote-task="'+escapeHtml(a.task_id)+'" data-promote-name="'+escapeHtml(a.name||'')+'">Promouvoir en agent géré</button></div>';
+    }
     return '<div class="agent-card '+(isActive?'active':'')+'">'+
       '<div class="agent-head">'+
       '<div class="agent-avatar" style="background:var(--c-'+(p==='claude'||p==='gemini'||p==='openai'?p:'primary')+')">'+escapeHtml(initial)+'</div>'+
@@ -685,9 +704,52 @@ async function loadAgents(){
       '</div></div>'+
       '<div class="agent-task" title="'+escapeHtml(taskLine)+'">'+escapeHtml(taskLine)+taskBadge+'</div>'+
       '<div class="agent-stats"><span>'+(totTok?fmtNum(totTok)+' tokens':'—')+'</span><span>'+msgCount+' msg</span></div>'+
-      lastMsg+
+      lastMsg+ promo+
       '</div>';
   }).join('');
+  $$('[data-promote-task]', grid).forEach(b=>b.addEventListener('click', ()=>promoteAgent(b.getAttribute('data-promote-task'), b.getAttribute('data-promote-name'))));
+}
+
+// ============================================================
+// AGENTS GÉRÉS ANTHROPIC — /api/managed-agents (persistants)
+// ============================================================
+async function loadManagedAgents(){
+  const list = $('#ma-list'); if(!list) return;
+  const res = await apiSafe('/api/managed-agents', {agents:[]});
+  const items = (res && res.agents) || [];
+  if(!items.length){ list.innerHTML = '<div style="font-size:var(--fs-sm);color:var(--c-text-faint)">Aucun agent géré sur ce compte. Créez-en un ci-dessus, ou promouvez un agent local.</div>'; return; }
+  list.innerHTML = items.map(a=>(
+    '<div class="task-row" style="cursor:default">'+
+      '<span class="status-dot active"></span>'+
+      '<div class="task-meta"><div class="task-name">'+escapeHtml(a.name||a.id)+'</div>'+
+      '<div class="task-sub">'+providerBadge('claude')+' <span>'+escapeHtml(a.model||'')+'</span> · <code style="font-size:var(--fs-xs)">'+escapeHtml(a.id)+'</code></div></div>'+
+      '<button class="btn btn-sm btn-danger" data-ma-archive="'+escapeHtml(a.id)+'">Archiver</button>'+
+    '</div>'
+  )).join('');
+  $$('[data-ma-archive]', list).forEach(b=>b.addEventListener('click', async ()=>{
+    if(!confirm('Archiver cet agent géré ? Il ne sera plus proposé aux nouvelles tâches.')) return;
+    try{ await api('/api/managed-agents/'+encodeURIComponent(b.getAttribute('data-ma-archive')), {method:'DELETE'}); toast('Agent géré archivé','','success'); loadManagedAgents(); }
+    catch(e){ toast('Échec', e.message, 'error'); }
+  }));
+}
+async function createManagedAgent(){
+  const name = ($('#ma-name').value||'').trim();
+  if(!name){ toast('Nom requis','','error'); return; }
+  const body = { name, model: $('#ma-model').value, role: ($('#ma-role').value||'').trim() || null, system: ($('#ma-system').value||'').trim() || null };
+  try{
+    const r = await api('/api/managed-agents', {method:'POST', body: JSON.stringify(body)});
+    toast('Agent géré créé', (r.agent&&r.agent.id)||'', 'success');
+    $('#ma-name').value=''; $('#ma-role').value=''; $('#ma-system').value='';
+    loadManagedAgents();
+  }catch(e){ toast('Échec de la création', e.message, 'error'); }
+}
+async function promoteAgent(taskId, name){
+  if(!confirm('Promouvoir cet agent local « '+name+' » en agent géré Anthropic persistant ?')) return;
+  try{
+    const r = await api('/api/tasks/'+encodeURIComponent(taskId)+'/agents/'+encodeURIComponent(name)+'/promote', {method:'POST', body: JSON.stringify({})});
+    toast('Agent promu', (r.managed_agent&&r.managed_agent.id)||'', 'success');
+    loadAgents(); loadManagedAgents();
+  }catch(e){ toast('Échec de la promotion', e.message, 'error'); }
 }
 
 // ============================================================
@@ -1066,7 +1128,7 @@ function navigate(){
   const ttl=$('#section-title'); if(ttl) ttl.textContent = ({overview:'Overview',agents:'Agents',tasks:'Tâches',chat:'Chat',monitoring:'Monitoring',apps:'Apps',schedules:'Planifié',settings:'Settings'}[route]||route);
   $('#sidebar').classList.remove('open'); $('#sidebar-backdrop').classList.remove('show');
   if(route==='overview') loadOverview();
-  else if(route==='agents') loadAgents();
+  else if(route==='agents'){ loadAgents(); loadManagedAgents(); }
   else if(route==='tasks') loadTasks();
   else if(route==='monitoring') loadMonitoring();
   else if(route==='apps') loadApps();
@@ -1175,6 +1237,10 @@ window.addEventListener('DOMContentLoaded', ()=>{
     loadAgents();
   }));
   const agSearch = $('#agents-search'); if(agSearch) agSearch.addEventListener('input', e=>{ agentsSearch = e.target.value; loadAgents(); });
+
+  // Agents gérés Anthropic
+  const maCreate = $('#ma-create'); if(maCreate) maCreate.addEventListener('click', createManagedAgent);
+  const agentCreate = $('#agent-create'); if(agentCreate) agentCreate.addEventListener('click', ()=>{ location.hash='#agents'; const n=$('#ma-name'); if(n){ n.focus(); n.scrollIntoView({behavior:'smooth',block:'center'}); } });
 
   // Monitoring period
   const mp = $('#mon-period'); if(mp) mp.addEventListener('change', loadMonitoring);

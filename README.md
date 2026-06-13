@@ -240,6 +240,28 @@
 > | `POST /api/schedules/{id}/run-now` | Lance immédiatement la mission |
 > | `DELETE /api/schedules/{id}` | Supprime une mission programmée |
 >
+> ### Synchronisation du registre local vers de vrais Agents gérés
+> Les agents que le chef crée pour une tâche (table `task_agents`) sont éphémères. On peut
+> désormais **promouvoir** un agent local (Claude) en **vrai Agent géré Anthropic** persistant
+> (`client.beta.agents.create`), réutilisable par toutes les tâches futures et délégable par le
+> chef via `assign_managed_agent`. Le prompt système est repris d'un champ explicite ou
+> **synthétisé depuis le rôle** ; le lien local→géré est conservé (`task_agents.managed_agent_id`)
+> et affiché dans l'UI. On peut aussi créer un agent géré de zéro, le mettre à jour, l'archiver,
+> et lister les agents existants (archives comprises). Onglet **Agents** du centre de contrôle :
+> carte « Agents gérés Anthropic » (créer / archiver) + bouton **Promouvoir** sur chaque agent
+> local Claude.
+>
+> **Routes exposées :**
+> | Route | Description |
+> |-------|-------------|
+> | `GET /api/managed-agents?include_archived=` | Liste les agents gérés du compte |
+> | `POST /api/managed-agents` | Crée un agent géré (nom, modèle, rôle/système) |
+> | `GET /api/managed-agents/{id}` | Détail d'un agent (prompt système inclus) |
+> | `PATCH /api/managed-agents/{id}` | Met à jour un agent géré |
+> | `DELETE /api/managed-agents/{id}` | Archive un agent géré |
+> | `POST /api/tasks/{id}/agents/{name}/promote` | Promeut un agent local en agent géré |
+> | `POST /api/tasks/{id}/agents/sync` | Promeut tous les agents Claude locaux non synchronisés |
+>
 > ---
 >
 > ## Licence

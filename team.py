@@ -167,7 +167,9 @@ async def init_team_db():
                     "ALTER TABLE tasks ADD COLUMN total_cost_usd REAL DEFAULT 0",
                     "ALTER TABLE tasks ADD COLUMN max_cost_usd REAL DEFAULT 0",
                     "ALTER TABLE tasks ADD COLUMN target_repo_url TEXT",
-                    "ALTER TABLE tasks ADD COLUMN github_token TEXT"):
+                    "ALTER TABLE tasks ADD COLUMN github_token TEXT",
+                    # Registre local -> agents geres : id de l'agent Anthropic cree depuis cet agent local.
+                    "ALTER TABLE task_agents ADD COLUMN managed_agent_id TEXT"):
             try:
                 await db.execute(ddl)
             except Exception:
@@ -469,6 +471,14 @@ async def db_get_agent(task_id, name):
         async with db.execute("SELECT * FROM task_agents WHERE task_id=? AND name=?", (task_id, name)) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
+
+
+async def db_set_agent_managed(task_id, name, managed_agent_id):
+    """Lie un agent local au vrai agent gere Anthropic cree a partir de lui."""
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        await db.execute("UPDATE task_agents SET managed_agent_id=? WHERE task_id=? AND name=?",
+                         (managed_agent_id, task_id, name))
+        await db.commit()
 
 
 async def emit(task_id, iteration, agent, kind, payload: dict):
@@ -2753,6 +2763,81 @@ async def delete_schedule(sched_id: int):
         raise HTTPException(404, "Mission programmee introuvable.")
     await db_delete_schedule(sched_id)
     return {"deleted": sched_id}
+
+
+# ── Registre local -> vrais Agents geres Anthropic ───────────────────────────
+class PromoteAgent(BaseModel):
+    system: Optional[str] = None       # prompt systeme explicite (sinon synthetise du role)
+    description: Optional[str] = None
+    model: Optional[str] = None        # surclasse le modele de l'agent local
+
+
+async def _promote_local_agent(task_id: int, agent: dict, *, system=None, description=None,
+                               model=None) -> dict:
+    """Cree un vrai agent gere Anthropic a partir d'un agent local, et lie les deux.
+
+    Leve HTTPException si l'agent n'est pas promouvable (fournisseur non-Claude).
+    """
+    name = agent.get("name") or ""
+    if (agent.get("provider") or "claude") != "claude":
+        raise HTTPException(400, "Seuls les agents Claude peuvent devenir des agents geres "
+                            "Anthropic (l'agent '" + name + "' est " + str(agent.get("provider")) + ").")
+    sys_prompt = (system or "").strip() or managed_agents._system_from_role(name, agent.get("role") or "")
+    use_model = (model or "").strip() or (agent.get("model") or "").strip() or DEFAULT_WORKER_CLAUDE
+    desc = (description or "").strip() or (("Role : " + agent["role"]) if agent.get("role") else None)
+    created = await managed_agents.create_agent(name, model=use_model, system=sys_prompt,
+                                                description=desc)
+    await db_set_agent_managed(task_id, name, created.get("id"))
+    await emit(task_id, 0, "systeme", "info",
+               {"msg": "Agent local '" + name + "' promu en agent gere Anthropic "
+                + str(created.get("id")) + " (persistant, reutilisable par les futures taches)."})
+    return created
+
+
+@router.post("/api/tasks/{task_id}/agents/{name}/promote")
+async def promote_agent(task_id: int, name: str, body: Optional[PromoteAgent] = None):
+    """Transforme un agent LOCAL (du registre de la tache) en vrai agent gere Anthropic."""
+    if not await db_get_task(task_id):
+        raise HTTPException(404, "Tache introuvable.")
+    agent = await db_get_agent(task_id, name)
+    if not agent:
+        raise HTTPException(404, "Agent local '" + name + "' introuvable dans cette tache.")
+    if (agent.get("managed_agent_id") or "").strip():
+        raise HTTPException(409, "Cet agent est deja lie a l'agent gere "
+                            + agent["managed_agent_id"] + ".")
+    b = body or PromoteAgent()
+    try:
+        created = await _promote_local_agent(task_id, agent, system=b.system,
+                                             description=b.description, model=b.model)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, "Promotion impossible : " + str(e)[:200])
+    return {"promoted": name, "managed_agent": created}
+
+
+@router.post("/api/tasks/{task_id}/agents/sync")
+async def sync_agents(task_id: int):
+    """Promeut en agents geres TOUS les agents Claude locaux pas encore synchronises."""
+    if not await db_get_task(task_id):
+        raise HTTPException(404, "Tache introuvable.")
+    agents = await db_list_agents(task_id)
+    created, skipped = [], []
+    for agent in agents:
+        nm = agent.get("name") or ""
+        if (agent.get("managed_agent_id") or "").strip():
+            skipped.append({"name": nm, "reason": "deja synchronise", "agent_id": agent["managed_agent_id"]})
+            continue
+        if (agent.get("provider") or "claude") != "claude":
+            skipped.append({"name": nm, "reason": "fournisseur non-Claude (" + str(agent.get("provider")) + ")"})
+            continue
+        try:
+            mc = await _promote_local_agent(task_id, agent)
+            created.append({"name": nm, "managed_agent": mc})
+        except Exception as e:
+            skipped.append({"name": nm, "reason": str(e)[:160]})
+    return {"created": created, "skipped": skipped,
+            "summary": str(len(created)) + " agent(s) gere(s) cree(s), " + str(len(skipped)) + " ignore(s)."}
 
 
 @router.post("/api/tasks/{task_id}/start")

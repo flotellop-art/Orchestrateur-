@@ -20,12 +20,15 @@ from typing import Any, Awaitable, Callable, Optional
 
 from anthropic import AsyncAnthropic
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
 
 DEFAULT_ENV_NAME = os.getenv("ANTHROPIC_DEFAULT_ENV_NAME", "default-orchestrateur")
 DEFAULT_ENV_ID = (os.getenv("ANTHROPIC_DEFAULT_ENV_ID") or "").strip() or None
 SESSION_TIMEOUT_S = float(os.getenv("MANAGED_AGENT_TIMEOUT", "300"))
+# Modele par defaut quand on cree un agent gere sans en preciser un.
+DEFAULT_AGENT_MODEL = os.getenv("ANTHROPIC_DEFAULT_AGENT_MODEL", "claude-sonnet-4-6")
 
 _client: Optional[AsyncAnthropic] = None
 _env_id_cache: Optional[str] = None
@@ -42,22 +45,101 @@ def _get_client() -> AsyncAnthropic:
     return _client
 
 
-async def list_agents() -> list[dict]:
-    """Liste les agents gérés du compte : [{id, name, model, status}, ...]."""
+def _agent_to_dict(ag) -> dict:
+    """Normalise un objet agent du SDK en dict simple pour l'UI et le chef.
+
+    `model` peut etre une chaine ou un objet de config -> on extrait l'identifiant.
+    L'objet agent n'a pas de champ `status` : on le derive de `archived_at`.
+    """
+    model = getattr(ag, "model", "") or ""
+    if model and not isinstance(model, str):
+        model = getattr(model, "id", None) or str(model)
+    archived = getattr(ag, "archived_at", None)
+    return {
+        "id": getattr(ag, "id", "") or "",
+        "name": getattr(ag, "name", "") or "",
+        "model": model,
+        "description": getattr(ag, "description", None),
+        "system": getattr(ag, "system", None),
+        "version": getattr(ag, "version", None),
+        "archived": bool(archived),
+        "status": "archived" if archived else "active",
+    }
+
+
+async def list_agents(include_archived: bool = False) -> list[dict]:
+    """Liste les agents gérés du compte : [{id, name, model, status, ...}, ...]."""
     client = _get_client()
     out: list[dict] = []
-    async for ag in client.beta.agents.list():
-        model = getattr(ag, "model", "") or ""
-        if model and not isinstance(model, str):
-            # `model` peut etre un objet {id, speed} : on normalise en chaine.
-            model = getattr(model, "id", None) or str(model)
-        out.append({
-            "id": getattr(ag, "id", ""),
-            "name": getattr(ag, "name", "") or "",
-            "model": model,
-            "status": getattr(ag, "status", "") or "",
-        })
+    async for ag in client.beta.agents.list(include_archived=include_archived):
+        out.append(_agent_to_dict(ag))
     return out
+
+
+def _system_from_role(name: str, role: str) -> str:
+    """Construit un prompt systeme d'agent gere a partir d'un nom + role local."""
+    role = (role or "").strip()
+    return ("Tu es l'agent " + chr(171) + " " + name + " " + chr(187)
+            + ((", specialiste : " + role) if role else "") + "." + chr(10)
+            + "Tu travailles de facon autonome dans un environnement isole (Agents geres "
+            "Anthropic). Mene la mission confiee jusqu'au bout, produis des livrables concrets et "
+            "depose tes fichiers dans /mnt/session/outputs/. Sois rigoureux, verifie ton travail, "
+            "et termine par un resume clair de ce que tu as produit.")
+
+
+async def create_agent(name: str, model: Optional[str] = None, system: Optional[str] = None,
+                       description: Optional[str] = None) -> dict:
+    """Cree un agent gere PERSISTANT sur le compte Anthropic. Retourne le dict normalise."""
+    client = _get_client()
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Nom d'agent requis.")
+    kwargs: dict[str, Any] = {"name": name, "model": (model or DEFAULT_AGENT_MODEL)}
+    if system and system.strip():
+        kwargs["system"] = system.strip()
+    if description and description.strip():
+        kwargs["description"] = description.strip()
+    ag = await client.beta.agents.create(**kwargs)
+    log.info("[managed-agents] agent gere cree : %s (%s)", getattr(ag, "id", "?"), name)
+    return _agent_to_dict(ag)
+
+
+async def retrieve_agent(agent_id: str) -> dict:
+    """Recupere un agent gere (inclut le prompt systeme)."""
+    client = _get_client()
+    return _agent_to_dict(await client.beta.agents.retrieve(agent_id))
+
+
+async def update_agent(agent_id: str, name: Optional[str] = None, system: Optional[str] = None,
+                       description: Optional[str] = None, model: Optional[str] = None) -> dict:
+    """Met a jour un agent gere. La version courante est lue puis transmise (requis par l'API)."""
+    client = _get_client()
+    current = await client.beta.agents.retrieve(agent_id)
+    version = getattr(current, "version", None)
+    if version is None:
+        raise RuntimeError("Version de l'agent introuvable, mise a jour impossible.")
+    kwargs: dict[str, Any] = {"version": version}
+    if name and name.strip():
+        kwargs["name"] = name.strip()
+    if system is not None:
+        kwargs["system"] = system.strip() or None
+    if description is not None:
+        kwargs["description"] = description.strip() or None
+    if model and model.strip():
+        kwargs["model"] = model.strip()
+    ag = await client.beta.agents.update(agent_id, **kwargs)
+    return _agent_to_dict(ag)
+
+
+async def archive_agent(agent_id: str) -> dict:
+    """Archive (desactive) un agent gere. Best-effort sur la normalisation du retour."""
+    client = _get_client()
+    ag = await client.beta.agents.archive(agent_id)
+    log.info("[managed-agents] agent gere archive : %s", agent_id)
+    try:
+        return _agent_to_dict(ag)
+    except Exception:
+        return {"id": agent_id, "archived": True, "status": "archived"}
 
 
 async def get_or_create_environment(name: str = DEFAULT_ENV_NAME) -> str:
@@ -356,13 +438,44 @@ async def run_session(
 router = APIRouter()
 
 
+class CreateAgentIn(BaseModel):
+    name: str
+    model: Optional[str] = None
+    system: Optional[str] = None     # prompt systeme explicite
+    role: Optional[str] = None       # role court -> synthetise un prompt systeme si `system` absent
+    description: Optional[str] = None
+
+
+class UpdateAgentIn(BaseModel):
+    name: Optional[str] = None
+    model: Optional[str] = None
+    system: Optional[str] = None
+    description: Optional[str] = None
+
+
 @router.get("/api/managed-agents")
-async def http_list_agents():
+async def http_list_agents(include_archived: bool = False):
     """Liste les agents gérés du compte (pour l'UI et le chef)."""
     try:
-        return {"agents": await list_agents()}
+        return {"agents": await list_agents(include_archived=include_archived)}
     except Exception as e:
         raise HTTPException(500, "Impossible de lister les agents Anthropic : " + str(e)[:200])
+
+
+@router.post("/api/managed-agents")
+async def http_create_agent(body: CreateAgentIn):
+    """Crée un agent géré persistant sur le compte (réutilisable par toutes les tâches)."""
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(400, "Nom d'agent requis.")
+    system = (body.system or "").strip() or None
+    if not system and (body.role or "").strip():
+        system = _system_from_role(name, body.role)
+    try:
+        return {"agent": await create_agent(name, model=body.model, system=system,
+                                            description=body.description)}
+    except Exception as e:
+        raise HTTPException(500, "Création de l'agent géré impossible : " + str(e)[:200])
 
 
 @router.get("/api/managed-agents/environment")
@@ -373,3 +486,33 @@ async def http_get_environment():
         return {"environment_id": eid, "name": DEFAULT_ENV_NAME}
     except Exception as e:
         raise HTTPException(500, "Environnement Anthropic indisponible : " + str(e)[:200])
+
+
+# NB : routes parametrees DECLAREES APRES /environment pour ne pas l'occulter
+# (Starlette resout dans l'ordre de declaration).
+@router.get("/api/managed-agents/{agent_id}")
+async def http_get_agent(agent_id: str):
+    """Détail d'un agent géré (inclut son prompt système)."""
+    try:
+        return {"agent": await retrieve_agent(agent_id)}
+    except Exception as e:
+        raise HTTPException(500, "Agent géré introuvable : " + str(e)[:200])
+
+
+@router.patch("/api/managed-agents/{agent_id}")
+async def http_update_agent(agent_id: str, body: UpdateAgentIn):
+    """Met à jour un agent géré (nom, modèle, prompt système, description)."""
+    try:
+        return {"agent": await update_agent(agent_id, name=body.name, system=body.system,
+                                            description=body.description, model=body.model)}
+    except Exception as e:
+        raise HTTPException(500, "Mise à jour de l'agent géré impossible : " + str(e)[:200])
+
+
+@router.delete("/api/managed-agents/{agent_id}")
+async def http_archive_agent(agent_id: str):
+    """Archive (désactive) un agent géré."""
+    try:
+        return {"agent": await archive_agent(agent_id)}
+    except Exception as e:
+        raise HTTPException(500, "Archivage de l'agent géré impossible : " + str(e)[:200])
