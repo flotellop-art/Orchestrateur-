@@ -20,7 +20,7 @@ function pyPath(){
 
 function checkServer(){
   return new Promise(res=>{
-    const r=http.get(BASE+'/api/stats',resp=>{res(resp.statusCode===200);});
+    const r=http.get(BASE+'/health',resp=>{res(resp.statusCode===200);});
     r.on('error',()=>res(false));
     r.setTimeout(2000,()=>{r.destroy();res(false);});
   });
@@ -56,7 +56,8 @@ function buildMenu(){
     {label:'Vue',submenu:[{role:'reload',accelerator:'CmdOrCtrl+R'},{role:'zoomIn'},{role:'zoomOut'},{role:'resetZoom'},{type:'separator'},{role:'togglefullscreen',accelerator:'F11'},{type:'separator'},{role:'toggleDevTools',accelerator:'F12'}]},
     {label:'Navigation',submenu:[
       {label:'Tableau de bord',accelerator:'CmdOrCtrl+1',click:()=>win&&win.loadURL(BASE)},
-      {label:'Chat',accelerator:'CmdOrCtrl+2',click:()=>win&&win.loadURL(BASE+'/chat')},
+      {label:'Espace agents',accelerator:'CmdOrCtrl+2',click:()=>win&&win.loadURL(BASE+'/workspace')},
+      {label:'Chat',accelerator:'CmdOrCtrl+3',click:()=>win&&win.loadURL(BASE+'#chat')},
       {type:'separator'},
       {label:'Ouvrir dans navigateur',click:()=>security.safeOpenExternal(BASE)}
     ]},
@@ -65,7 +66,7 @@ function buildMenu(){
 }
 
 function createWin(){
-  win=new BrowserWindow({width:1280,height:800,minWidth:800,minHeight:600,show:false,title:TITLE,backgroundColor:'#f7f7f7',
+  win=new BrowserWindow({width:1280,height:800,minWidth:800,minHeight:600,show:false,title:TITLE,backgroundColor:'#0f1117',
     webPreferences:security.getSecureWebPreferences()});
   security.attachSecurityHooks(win);
   buildMenu();
@@ -85,7 +86,8 @@ function createTray(){
       {label:TITLE,enabled:false},{type:'separator'},
       {label:'Afficher',click:()=>show()},
       {label:'Tableau de bord',click:()=>{show();win&&win.webContents.session.clearCache().then(()=>win.loadURL(BASE));}},
-      {label:'Chat',click:()=>{show();win&&win.loadURL(BASE+'/chat');}},
+      {label:'Espace agents',click:()=>{show();win&&win.loadURL(BASE+'/workspace');}},
+      {label:'Chat',click:()=>{show();win&&win.loadURL(BASE+'#chat');}},
       {type:'separator'},{label:'Quitter',click:()=>quit()}
     ]));
     tray.on('double-click',()=>show());
