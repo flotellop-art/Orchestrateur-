@@ -3,412 +3,1001 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Créateur d'applications</title>
+<title>Orchestrateur — Atelier</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="icon" href="/static/icon-app.svg">
+<link rel="manifest" href="/static/manifest.webmanifest">
 <style>
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-:root {
-  --bg: #f8f9fa; --white: #fff; --dark: #1a1a2e; --orange: #e8825a;
-  --orange-d: #c96840; --green: #27ae60; --red: #e74c3c; --grey: #6c757d;
-  --border: #dee2e6; --sh: 0 4px 20px rgba(0,0,0,.08); --r: 12px;
-}
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  background: var(--bg); color: var(--dark); min-height: 100vh; }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:#f3ece1; --panel:#fbf7f0; --border:#e4d8c7; --ink:#241d16;
+    --terra:#cf6b3f; --green:#2ea067; --red:#d2563f;
+    --muted:#8a7e6c; --muted2:#6e6353; --muted3:#9c907e; --muted4:#a8987f;
+    --serif:'Instrument Serif',Georgia,serif;
+    --sans:'Hanken Grotesk',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+    --mono:'JetBrains Mono',ui-monospace,monospace;
+  }
+  html,body{ background:var(--bg); color:var(--ink); font-family:var(--sans); min-height:100vh; }
+  button,textarea,input{ font-family:inherit; }
+  textarea,input{ outline:none; }
+  ::placeholder{ color:#bcae97; }
+  a{ color:inherit; }
 
-/* ── Header ── */
-header { background: var(--dark); color: #fff; padding: 18px 32px;
-  display: flex; align-items: center; justify-content: space-between; }
-header h1 { font-size: 1.2rem; font-weight: 700; }
-header h1 span { color: var(--orange); }
-.hdr-stats { display: flex; gap: 20px; font-size: .82rem; color: #aaa; }
-.hdr-stat strong { color: #fff; font-size: 1rem; }
+  @keyframes a-pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  @keyframes a-ringG { 0%{box-shadow:0 0 0 0 rgba(46,160,103,.45)} 70%{box-shadow:0 0 0 7px rgba(46,160,103,0)} 100%{box-shadow:0 0 0 0 rgba(46,160,103,0)} }
+  @keyframes a-ring  { 0%{box-shadow:0 0 0 0 rgba(207,107,63,.5)} 70%{box-shadow:0 0 0 8px rgba(207,107,63,0)} 100%{box-shadow:0 0 0 0 rgba(207,107,63,0)} }
+  @keyframes a-spin { to{ transform:rotate(360deg) } }
+  @keyframes a-rise { 0%{opacity:0;transform:translateY(10px)} 100%{opacity:1;transform:none} }
+  @keyframes a-fade { 0%{opacity:0} 100%{opacity:1} }
 
-/* ── Hero ── */
-.hero { max-width: 760px; margin: 60px auto 0; padding: 0 20px; text-align: center; }
-.hero h2 { font-size: 2rem; font-weight: 700; margin-bottom: 12px; }
-.hero h2 span { color: var(--orange); }
-.hero p { color: var(--grey); font-size: 1.05rem; margin-bottom: 36px; line-height: 1.6; }
-.create-box { background: var(--white); border-radius: 16px; box-shadow: var(--sh); padding: 28px; }
-.create-box textarea {
-  width: 100%; border: 2px solid var(--border); border-radius: 10px;
-  padding: 16px; font-size: 1rem; font-family: inherit; resize: none;
-  min-height: 110px; transition: border-color .2s; outline: none; line-height: 1.6;
-}
-.create-box textarea:focus { border-color: var(--orange); }
-.create-box textarea::placeholder { color: #bbb; }
-.examples { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 20px; justify-content: center; }
-.example { background: #f0f0f0; border: none; border-radius: 20px; padding: 6px 14px;
-  font-size: .82rem; cursor: pointer; color: var(--grey); transition: background .15s; }
-.example:hover { background: var(--orange); color: #fff; }
-.btn-create { background: var(--orange); color: #fff; border: none; border-radius: 10px;
-  padding: 14px 40px; font-size: 1rem; font-weight: 700; cursor: pointer;
-  width: 100%; transition: background .15s, transform .1s; }
-.btn-create:hover { background: var(--orange-d); }
-.btn-create:active { transform: scale(.98); }
-.btn-create:disabled { opacity: .6; cursor: not-allowed; }
+  .screen{ display:none; }
+  .screen.active{ display:block; animation:a-fade .2s ease; }
 
-/* ── Mes applications ── */
-.apps-section { max-width: 1100px; margin: 48px auto 40px; padding: 0 20px; }
-.apps-section h3 { font-size: 1.1rem; font-weight: 700; margin-bottom: 20px;
-  color: var(--grey); text-transform: uppercase; letter-spacing: .5px; font-size: .85rem; }
-.apps-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; }
-.app-card { background: var(--white); border-radius: var(--r); box-shadow: var(--sh);
-  padding: 20px; display: flex; flex-direction: column; gap: 12px; }
-.app-card-header { display: flex; align-items: center; justify-content: space-between; }
-.app-name { font-weight: 700; font-size: 1rem; }
-.status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-.dot-running { background: var(--green); box-shadow: 0 0 0 3px rgba(39,174,96,.2);
-  animation: pulse 2s infinite; }
-.dot-stopped { background: var(--border); }
-.dot-failed  { background: var(--red); }
-.dot-creating { background: var(--orange); animation: pulse 1s infinite; }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
-.app-desc { color: var(--grey); font-size: .85rem; line-height: 1.5; }
-.app-status-text { font-size: .78rem; font-weight: 600; padding: 3px 10px;
-  border-radius: 20px; width: fit-content; }
-.st-running  { background: #eafaf1; color: var(--green); }
-.st-stopped  { background: #f5f5f5; color: var(--grey); }
-.st-failed   { background: #fdedec; color: var(--red); }
-.st-creating { background: #fef0eb; color: var(--orange); }
-.app-actions { display: flex; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
-.btn { border: none; border-radius: 7px; padding: 8px 16px; font-size: .84rem;
-  font-weight: 600; cursor: pointer; transition: background .15s, transform .1s; }
-.btn:active { transform: scale(.97); }
-.btn-open    { background: var(--dark); color: #fff; }
-.btn-open:hover { background: #333; }
-.btn-start   { background: var(--green); color: #fff; }
-.btn-start:hover { background: #229954; }
-.btn-stop    { background: #f0f0f0; color: var(--dark); }
-.btn-stop:hover { background: #e0e0e0; }
-.btn-delete  { background: #fdedec; color: var(--red); margin-left: auto; }
-.btn-delete:hover { background: var(--red); color: #fff; }
-.empty-state { text-align: center; padding: 48px 20px; color: var(--grey); }
-.empty-state p { font-size: 1.05rem; margin-top: 8px; }
+  /* Header */
+  header{ position:sticky; top:0; z-index:20; background:rgba(243,236,225,.88);
+    backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); border-bottom:1px solid var(--border);
+    padding:0 56px; display:flex; align-items:center; justify-content:space-between; height:68px; }
+  .brand{ display:flex; align-items:center; gap:11px; }
+  .brand .dot{ width:10px; height:10px; border-radius:50%; background:var(--terra); }
+  .brand .name{ font-family:var(--serif); font-size:23px; letter-spacing:.01em; }
+  nav{ display:flex; align-items:center; gap:6px; }
+  .tab{ background:none; border:none; font-family:var(--sans); font-size:14px; padding:8px 14px;
+    border-radius:8px; cursor:pointer; color:var(--muted); font-weight:500; transition:background .15s,color .15s; }
+  .tab:hover{ color:var(--ink); }
+  .tab.on{ color:var(--ink); font-weight:700; background:#e7dac6; }
+  .hdr-stats{ display:flex; align-items:center; gap:20px; font-size:13px; color:var(--muted); }
+  .hdr-stats strong{ color:var(--ink); font-weight:700; }
+  .hdr-stats .live{ display:flex; align-items:center; gap:6px; }
+  .hdr-stats .live i{ width:7px; height:7px; border-radius:50%; background:var(--green); display:inline-block; }
 
-/* ── Modal progression ── */
-.overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6);
-  z-index: 1000; align-items: center; justify-content: center; padding: 20px; }
-.overlay.show { display: flex; }
-.modal { background: var(--white); border-radius: 16px; width: 100%; max-width: 560px;
-  padding: 32px; box-shadow: 0 20px 60px rgba(0,0,0,.3); }
-.modal h3 { font-size: 1.1rem; font-weight: 700; margin-bottom: 24px; }
-.steps { display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px; }
-.step { display: flex; align-items: center; gap: 12px; font-size: .92rem;
-  color: var(--grey); transition: color .3s; }
-.step.active { color: var(--dark); font-weight: 600; }
-.step.done   { color: var(--green); }
-.step.error  { color: var(--red); }
-.step-icon { width: 28px; height: 28px; border-radius: 50%; display: flex;
-  align-items: center; justify-content: center; font-size: .9rem; flex-shrink: 0; }
-.step.active .step-icon { background: var(--orange); color: #fff; animation: pulse 1s infinite; }
-.step.done   .step-icon { background: var(--green); color: #fff; }
-.step.error  .step-icon { background: var(--red); color: #fff; }
-.step.pending .step-icon { background: #f0f0f0; color: #ccc; }
-.progress-bar { height: 6px; background: #f0f0f0; border-radius: 3px; overflow: hidden; }
-.progress-fill { height: 100%; background: var(--orange); border-radius: 3px;
-  transition: width .5s ease; }
-.modal-actions { display: flex; gap: 10px; margin-top: 20px; }
-.btn-cancel { background: #f0f0f0; color: var(--grey); padding: 10px 20px;
-  border: none; border-radius: 8px; cursor: pointer; font-size: .9rem; }
-.success-box { background: #eafaf1; border-radius: 10px; padding: 16px;
-  display: none; text-align: center; }
-.success-box.show { display: block; }
-.success-box h4 { color: var(--green); font-size: 1rem; margin-bottom: 8px; }
-.btn-open-app { background: var(--green); color: #fff; border: none; border-radius: 8px;
-  padding: 12px 28px; font-size: 1rem; font-weight: 700; cursor: pointer; width: 100%; }
-.btn-open-app:hover { background: #229954; }
-.error-box { background: #fdedec; border-radius: 10px; padding: 14px;
-  display: none; color: var(--red); font-size: .88rem; }
-.error-box.show { display: block; }
+  main{ max-width:1180px; margin:0 auto; }
+
+  /* Buttons */
+  .btn{ border:none; border-radius:8px; font-family:var(--sans); cursor:pointer; font-weight:600; transition:background .15s,transform .1s,opacity .15s; }
+  .btn:active{ transform:scale(.98); }
+  .btn-ink{ background:var(--ink); color:var(--bg); }
+  .btn-terra{ background:var(--terra); color:#fff; }
+  .btn-green{ background:var(--green); color:#fff; }
+  .btn-soft{ background:#f1ece2; color:var(--ink); }
+  .btn-danger{ background:#f7ece9; color:var(--red); }
+  .btn[disabled]{ opacity:.55; cursor:default; }
+
+  .dot-status{ width:9px; height:9px; border-radius:50%; flex-shrink:0; display:inline-block; }
+  .d-run{ background:var(--green); animation:a-ringG 2.3s infinite; }
+  .d-stop{ background:#cfc3b0; }
+  .d-fail{ background:var(--red); }
+
+  /* ATELIER */
+  .at-eyebrow{ font-family:var(--mono); font-size:11.5px; letter-spacing:.18em; text-transform:uppercase; color:var(--terra); margin-bottom:22px; }
+  .at-title{ font-family:var(--serif); font-size:62px; line-height:1.03; margin:0 0 20px; font-weight:400; letter-spacing:-.01em; }
+  .at-title em{ font-style:italic; color:var(--terra); }
+  .at-sub{ font-size:17.5px; color:var(--muted2); line-height:1.6; margin:0 0 36px; max-width:580px; }
+  .inputbox{ background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:20px; max-width:780px; box-shadow:0 8px 30px rgba(80,55,30,.06); }
+  .inputbox textarea{ width:100%; border:none; background:transparent; resize:none; min-height:84px; font-size:17px; color:var(--ink); line-height:1.55; }
+  .chips{ display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 18px; }
+  .chip{ background:#f1e7d6; border:1px solid #e7dac6; border-radius:20px; padding:7px 15px; font-size:13px; color:#7a6e5c; cursor:pointer; }
+  .chip:hover{ background:#ece0cd; }
+  .inputbar{ display:flex; align-items:center; justify-content:space-between; gap:16px; }
+  .charcount{ font-size:12.5px; color:var(--muted4); font-family:var(--mono); }
+  .grid2{ display:grid; grid-template-columns:1.05fr 1fr; gap:56px; margin-top:64px; }
+  .colhead{ font-family:var(--mono); font-size:11.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted4); margin:0 0 22px; }
+  .step-row{ display:flex; gap:18px; padding:15px 0; border-bottom:1px solid #e8ddcd; }
+  .step-row:last-child{ border-bottom:none; }
+  .step-row .n{ font-family:var(--serif); font-size:25px; color:var(--terra); width:32px; flex-shrink:0; }
+  .step-row .t{ font-size:15.5px; font-weight:600; }
+  .step-row .d{ font-size:13.5px; color:var(--muted); line-height:1.5; }
+  .recent{ background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:16px 18px; display:flex; align-items:center; justify-content:space-between; cursor:pointer; }
+  .recent:hover{ border-color:#d8c8b0; }
+  .recent .nm{ font-family:var(--serif); font-size:19px; }
+  .recent .sl{ font-size:12.5px; color:var(--muted3); }
+  .linkbtn{ background:none; border:none; font-family:var(--sans); font-size:13px; color:var(--terra); cursor:pointer; }
+
+  /* APPS */
+  .page-head{ display:flex; align-items:flex-end; justify-content:space-between; margin-bottom:8px; }
+  .page-title{ font-family:var(--serif); font-size:44px; margin:0; font-weight:400; }
+  .statrow{ display:flex; gap:36px; margin:18px 0 34px; padding-bottom:26px; border-bottom:1px solid var(--border); }
+  .statrow .num{ font-family:var(--serif); font-size:38px; line-height:1; }
+  .statrow .lab{ font-size:12.5px; color:var(--muted3); margin-top:4px; }
+  .appgrid{ display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+  .appcard{ background:var(--panel); border:1px solid var(--border); border-radius:13px; padding:20px; display:flex; flex-direction:column; }
+  .appcard .top{ display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin-bottom:9px; }
+  .appcard .nm{ font-family:var(--serif); font-size:21px; line-height:1.15; cursor:pointer; }
+  .appcard .nm:hover{ color:var(--terra); }
+  .appcard .desc{ font-size:13px; color:#7a6e5c; line-height:1.5; margin:0 0 13px; min-height:39px; }
+  .pill{ align-self:flex-start; font-size:11.5px; font-weight:700; padding:3px 11px; border-radius:20px; margin-bottom:15px; }
+  .pill-run{ background:#e9f6ef; color:var(--green); }
+  .pill-stop{ background:#f1ece2; color:var(--muted); }
+  .pill-fail{ font-size:11.5px; color:var(--red); background:#faece9; padding:5px 11px; border-radius:7px; margin-bottom:15px; align-self:flex-start; }
+  .appcard .acts{ display:flex; gap:7px; margin-top:auto; }
+  .appcard .acts .btn{ font-size:13px; padding:10px 0; }
+  .appcard .acts .btn.grow{ flex:1; }
+  .appcard .acts .btn.pad{ padding:10px 14px; }
+
+  .empty{ text-align:center; padding:60px 20px; color:var(--muted); }
+  .empty .big{ font-family:var(--serif); font-size:24px; color:var(--muted2); margin-bottom:6px; }
+
+  /* DETAIL */
+  .back{ background:none; border:none; font-size:13.5px; color:var(--muted); cursor:pointer; padding:0; margin-bottom:22px; display:flex; align-items:center; gap:7px; }
+  .back:hover{ color:var(--ink); }
+  .detail-head{ display:flex; align-items:flex-start; justify-content:space-between; gap:24px; margin-bottom:26px; }
+  .detail-title{ font-family:var(--serif); font-size:42px; margin:0; font-weight:400; line-height:1; }
+  .badge{ font-size:12px; font-weight:700; padding:4px 12px; border-radius:20px; display:inline-flex; align-items:center; gap:6px; }
+  .badge-run{ background:#e9f6ef; color:var(--green); }
+  .badge-stop{ background:#f1ece2; color:var(--muted); }
+  .badge-fail{ background:#faece9; color:var(--red); }
+  .detail-grid{ display:grid; grid-template-columns:1fr 332px; gap:24px; align-items:start; }
+  .preview{ border:1px solid var(--border); border-radius:14px; overflow:hidden; background:#fff; box-shadow:0 10px 34px rgba(80,55,30,.08); }
+  .chrome{ height:40px; background:#efe7da; display:flex; align-items:center; gap:10px; padding:0 14px; border-bottom:1px solid var(--border); }
+  .chrome .lights{ display:flex; gap:6px; }
+  .chrome .lights i{ width:11px; height:11px; border-radius:50%; display:inline-block; }
+  .chrome .urlbar{ flex:1; background:#f6f0e6; border-radius:7px; height:24px; display:flex; align-items:center; padding:0 12px; font-family:var(--mono); font-size:11.5px; color:var(--muted3); }
+  .chrome .lat{ font-family:var(--mono); font-size:11px; color:#bcae97; }
+  .viewport{ height:452px; position:relative; background:#fdfdfb; }
+  .viewport iframe{ width:100%; height:100%; border:none; }
+  .vp-off{ position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; background:#f7f3ec; text-align:center; padding:24px; }
+  .vp-off .t{ font-family:var(--serif); font-size:23px; color:var(--muted); }
+  .side{ display:flex; flex-direction:column; gap:16px; }
+  .card{ background:var(--panel); border:1px solid var(--border); border-radius:13px; padding:18px 20px; }
+  .card h3{ font-family:var(--mono); font-size:10.5px; letter-spacing:.13em; text-transform:uppercase; color:var(--muted4); margin:0 0 14px; font-weight:500; }
+  .kv{ display:flex; align-items:center; justify-content:space-between; }
+  .kv + .kv{ margin-top:11px; }
+  .kv .k{ font-size:13px; color:var(--muted); }
+  .kv .v{ font-size:13px; font-weight:600; }
+  .kv .v.mono{ font-family:var(--mono); font-weight:400; font-size:12.5px; }
+  .card textarea{ width:100%; border:1px solid #e7dac6; border-radius:9px; background:#fff; resize:none; min-height:62px; padding:11px 13px; font-size:13.5px; color:var(--ink); line-height:1.5; }
+  .card .full{ margin-top:11px; width:100%; padding:11px 0; font-size:13.5px; }
+  .timeline .it{ display:flex; gap:12px; padding-bottom:15px; }
+  .timeline .it:last-child{ padding-bottom:0; }
+  .timeline .rail{ display:flex; flex-direction:column; align-items:center; flex-shrink:0; }
+  .timeline .rail i{ width:9px; height:9px; border-radius:50%; margin-top:4px; }
+  .timeline .rail span{ width:1px; flex:1; background:#e7dac6; margin-top:3px; }
+  .timeline .tx{ font-size:13.5px; color:#3a3026; line-height:1.45; }
+  .timeline .dt{ font-size:11.5px; color:var(--muted4); margin-top:2px; }
+
+  /* MEMORY */
+  .mem-head{ display:flex; align-items:flex-start; justify-content:space-between; gap:24px; margin-bottom:10px; }
+  .mem-toggle{ flex-shrink:0; background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px; display:flex; align-items:center; gap:13px; }
+  .track{ width:44px; height:26px; border-radius:13px; border:none; cursor:pointer; position:relative; transition:background .2s; flex-shrink:0; padding:0; }
+  .knob{ position:absolute; top:3px; width:20px; height:20px; border-radius:50%; background:#fff; transition:left .2s; box-shadow:0 1px 3px rgba(0,0,0,.2); }
+  .mem-stats{ display:flex; gap:30px; margin:26px 0 36px; padding:20px 24px; background:#efe7da; border-radius:13px; }
+  .mem-stats .num{ font-family:var(--serif); font-size:34px; line-height:1; }
+  .mem-stats .lab{ font-size:12px; color:var(--muted); margin-top:3px; }
+  .mem-stats .sep{ width:1px; background:#e0d3bf; }
+  .memgrid{ display:grid; grid-template-columns:1fr 1fr; gap:16px; transition:opacity .2s; }
+  .memcard{ background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:22px 24px; }
+  .memcard .ch{ display:flex; align-items:center; gap:11px; margin-bottom:16px; }
+  .memcard .ch .n{ font-family:var(--serif); font-size:22px; color:var(--terra); line-height:1; }
+  .memcard .ch h3{ font-size:15px; font-weight:700; margin:0; }
+  .memcard .ch .ct{ margin-left:auto; font-size:12px; color:#b3a890; }
+  .memitem{ display:flex; align-items:flex-start; gap:11px; padding:11px 13px; background:#fff; border:1px solid #efe5d4; border-radius:10px; }
+  .memitem + .memitem{ margin-top:9px; }
+  .memitem i{ width:6px; height:6px; border-radius:50%; background:#d6b48f; margin-top:7px; flex-shrink:0; }
+  .memitem .tx{ font-size:14px; color:#2c2820; line-height:1.45; }
+  .memitem .src{ font-size:11.5px; color:var(--muted4); margin-top:3px; }
+  .memitem .x{ background:none; border:none; color:#cabda6; font-size:16px; line-height:1; cursor:pointer; padding:0 2px; flex-shrink:0; }
+  .memitem .x:hover{ color:var(--red); }
+  .mem-empty{ font-size:13px; color:#b3a890; font-style:italic; padding:6px 2px; }
+  .mem-add{ margin-top:24px; background:var(--panel); border:1px solid var(--border); border-radius:13px; padding:16px 18px; display:flex; align-items:center; gap:12px; max-width:760px; }
+  .mem-add .plus{ font-family:var(--serif); font-size:20px; color:var(--terra); flex-shrink:0; }
+  .mem-add input{ flex:1; border:none; background:transparent; font-size:14.5px; color:var(--ink); }
+
+  /* CHAT */
+  .chat-main{ max-width:780px; margin:0 auto; padding:36px 24px 140px; min-height:calc(100vh - 68px); }
+  .chat-id{ display:flex; align-items:center; gap:11px; margin-bottom:30px; }
+  .chat-id .av{ width:34px; height:34px; border-radius:10px; background:var(--ink); display:flex; align-items:center; justify-content:center; color:var(--terra); font-family:var(--serif); font-size:18px; }
+  .chat-id .nm{ font-weight:700; font-size:15px; }
+  .chat-id .st{ font-size:12px; color:var(--green); display:flex; align-items:center; gap:5px; }
+  .chat-id .st i{ width:6px; height:6px; border-radius:50%; background:var(--green); animation:a-pulse 1.6s infinite; }
+  .chat-log{ display:flex; flex-direction:column; gap:18px; }
+  .msg-user{ align-self:flex-end; max-width:74%; background:var(--terra); color:#fff; padding:13px 17px; border-radius:16px 16px 4px 16px; font-size:15px; line-height:1.5; white-space:pre-wrap; word-wrap:break-word; }
+  .msg-agent{ align-self:flex-start; max-width:82%; display:flex; gap:11px; }
+  .msg-agent .av{ width:30px; height:30px; border-radius:9px; background:var(--ink); flex-shrink:0; display:flex; align-items:center; justify-content:center; color:var(--terra); font-family:var(--serif); font-size:15px; }
+  .msg-agent .bubble{ background:var(--panel); border:1px solid #ebe0cf; padding:13px 17px; border-radius:16px 16px 16px 4px; font-size:15px; line-height:1.55; color:#3a3026; white-space:pre-wrap; word-wrap:break-word; }
+  .msg-tool{ align-self:flex-start; font-family:var(--mono); font-size:11.5px; color:var(--muted3); padding:2px 6px; background:#efe7da; border-radius:6px; }
+  .confirm-box{ align-self:flex-start; max-width:82%; background:#fff7ef; border:1px solid #ecd9bf; border-radius:12px; padding:14px 16px; font-size:13.5px; }
+  .confirm-box .acts{ display:flex; gap:8px; margin-top:12px; }
+  .chat-dock{ position:fixed; bottom:0; left:0; right:0; z-index:30; background:linear-gradient(transparent, var(--bg) 34%); padding:24px; }
+  .chat-dock .inner{ max-width:780px; margin:0 auto; background:var(--panel); border:1px solid #e3d8c6; border-radius:14px; padding:6px 6px 6px 18px; display:flex; align-items:center; gap:12px; box-shadow:0 8px 28px rgba(80,55,30,.1); }
+  .chat-dock input{ flex:1; border:none; background:transparent; font-size:15px; color:var(--ink); }
+  .chat-send{ background:#e0d3bf; color:#fff; border:none; border-radius:9px; width:40px; height:40px; font-size:17px; cursor:pointer; flex-shrink:0; }
+  .chat-send.on{ background:var(--terra); }
+
+  /* Overlay creation */
+  .overlay{ display:none; position:fixed; inset:0; z-index:50; background:rgba(36,29,22,.5); backdrop-filter:blur(3px); -webkit-backdrop-filter:blur(3px); align-items:center; justify-content:center; padding:24px; }
+  .overlay.show{ display:flex; animation:a-fade .2s ease; }
+  .modal{ background:var(--bg); border-radius:18px; width:100%; max-width:560px; box-shadow:0 30px 80px rgba(36,29,22,.4); overflow:hidden; animation:a-rise .25s ease; }
+  .modal .mh{ padding:24px 30px; border-bottom:1px solid var(--border); }
+  .modal .mh .tag{ font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--terra); margin-bottom:7px; }
+  .modal .mh .nm{ font-family:var(--serif); font-size:26px; }
+  .modal .mb{ padding:24px 30px 28px; }
+  .msteps{ display:flex; flex-direction:column; gap:13px; margin-bottom:22px; }
+  .mstep{ display:flex; align-items:center; gap:13px; }
+  .mstep .ic{ width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px; flex-shrink:0; }
+  .mstep.pending .ic{ background:#ece2d2; color:#bcae97; }
+  .mstep.active .ic{ background:var(--terra); color:#fff; animation:a-ring 1.3s infinite; }
+  .mstep.done .ic{ background:#e9f6ef; color:var(--green); }
+  .mstep .lb{ font-size:14px; line-height:1.3; color:#bcae97; }
+  .mstep.active .lb{ color:var(--ink); font-weight:600; }
+  .mstep.done .lb{ color:var(--muted2); }
+  .mbar{ height:6px; background:#e8ddcd; border-radius:3px; overflow:hidden; margin-bottom:6px; }
+  .mfill{ width:0%; height:100%; background:var(--terra); border-radius:3px; transition:width .45s ease; }
+  .mstatus{ font-size:12.5px; color:var(--muted3); font-family:var(--mono); }
+  .msuccess{ display:none; margin-top:22px; background:#e9f6ef; border-radius:12px; padding:18px; text-align:center; }
+  .msuccess.show{ display:block; }
+  .msuccess .t{ font-family:var(--serif); font-size:21px; color:var(--green); margin-bottom:5px; }
+  .msuccess .u{ font-size:13px; color:#5f8a72; margin-bottom:16px; }
+  .merror{ display:none; margin-top:18px; background:#faece9; border-radius:10px; padding:14px; color:var(--red); font-size:13.5px; }
+  .merror.show{ display:block; }
+  .mcancel{ margin-top:20px; text-align:right; }
+  .mcancel button{ background:none; border:none; color:var(--muted3); font-size:13.5px; cursor:pointer; }
+
+  @media (max-width:920px){
+    header{ padding:0 20px; height:auto; flex-wrap:wrap; gap:8px; padding-top:10px; padding-bottom:10px; }
+    main{ padding-left:20px; padding-right:20px; }
+    .grid2{ grid-template-columns:1fr; gap:36px; }
+    .appgrid{ grid-template-columns:1fr; }
+    .detail-grid{ grid-template-columns:1fr; }
+    .memgrid{ grid-template-columns:1fr; }
+    .at-title{ font-size:46px; }
+    .hdr-stats{ display:none; }
+  }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>✨ Créateur d'<span>Applications</span></h1>
+  <div class="brand"><span class="dot"></span><span class="name">Orchestrateur</span></div>
+  <nav>
+    <button class="tab" data-tab="atelier" onclick="go('atelier')">Atelier</button>
+    <button class="tab" data-tab="chat" onclick="go('chat')">Assistant</button>
+    <button class="tab" data-tab="apps" onclick="go('apps')">Mes applications</button>
+    <button class="tab" data-tab="memory" onclick="go('memory')">Mémoire</button>
+  </nav>
   <div class="hdr-stats">
-    <div><strong id="hdr-total">0</strong> créées</div>
-    <div><strong id="hdr-running">0</strong> en ligne</div>
-    <a href="/memory" style="color:var(--orange);text-decoration:none;font-weight:600">Gérer la mémoire →</a>
+    <span><strong id="hdr-total">0</strong> créées</span>
+    <span class="live"><i></i><strong id="hdr-running">0</strong> en ligne</span>
   </div>
 </header>
 
-<!-- Zone de création -->
-<div class="hero">
-  <h2>Que voulez-vous <span>créer</span> ?</h2>
-  <p>Décrivez votre idée en quelques mots. L'IA s'occupe du reste.</p>
-  <div class="create-box">
-    <textarea id="description" placeholder="Ex : une liste de tâches avec la possibilité d'ajouter, cocher et supprimer des éléments..." maxlength="500"></textarea>
-    <div class="examples">
-      <button class="example" onclick="fillExample(this)">Liste de tâches</button>
-      <button class="example" onclick="fillExample(this)">Calculatrice</button>
-      <button class="example" onclick="fillExample(this)">Convertisseur de devises</button>
-      <button class="example" onclick="fillExample(this)">Prise de notes</button>
-      <button class="example" onclick="fillExample(this)">Minuteur / Chronomètre</button>
-      <button class="example" onclick="fillExample(this)">Générateur de mots de passe</button>
+<!-- ============ ATELIER ============ -->
+<section class="screen" id="screen-atelier">
+  <main style="padding:64px 56px 80px;">
+    <div style="max-width:740px;">
+      <div class="at-eyebrow">— de l'idée à l'application</div>
+      <h1 class="at-title">Décrivez-le.<br>Et regardez-le <em>prendre vie.</em></h1>
+      <p class="at-sub">Pas de code, pas de configuration. Vous écrivez une phrase, l'atelier façonne une application web complète, l'installe et l'ouvre devant vous.</p>
     </div>
-    <button class="btn-create" id="btn-create" onclick="startCreation()">
-      ✨ Créer mon application
-    </button>
-  </div>
-</div>
 
-<!-- Mes applications -->
-<div class="apps-section">
-  <h3>Mes applications</h3>
-  <div class="apps-grid" id="apps-grid">
-    <div class="empty-state"><span style="font-size:2.5rem">🚀</span><p>Votre première application apparaîtra ici.</p></div>
-  </div>
-</div>
+    <div class="inputbox">
+      <textarea id="at-input" maxlength="500" placeholder="Ex : un carnet de recettes avec photos et liste de courses générée automatiquement…"></textarea>
+      <div class="chips" id="at-chips"></div>
+      <div class="inputbar">
+        <span class="charcount"><span id="at-count">0</span> / 500</span>
+        <button class="btn btn-terra" id="at-create" style="padding:13px 26px;font-size:15px;font-weight:700;white-space:nowrap;" onclick="startCreation()">Créer mon application →</button>
+      </div>
+    </div>
 
-<!-- Modal de progression -->
+    <div class="grid2">
+      <div>
+        <h3 class="colhead">Comment l'atelier procède</h3>
+        <div>
+          <div class="step-row"><span class="n">01</span><div><div class="t">Réflexion &amp; écriture</div><div class="d">Claude conçoit la structure et écrit le code Python/Flask.</div></div></div>
+          <div class="step-row"><span class="n">02</span><div><div class="t">Vérification</div><div class="d">La syntaxe est testée et corrigée automatiquement.</div></div></div>
+          <div class="step-row"><span class="n">03</span><div><div class="t">Installation &amp; lancement</div><div class="d">Les composants s'installent, le serveur démarre.</div></div></div>
+          <div class="step-row"><span class="n">04</span><div><div class="t">Ouverture</div><div class="d">L'application s'ouvre dans le navigateur, prête à l'emploi.</div></div></div>
+        </div>
+      </div>
+      <div>
+        <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:22px;">
+          <h3 class="colhead" style="margin:0;">Dernières créations</h3>
+          <button class="linkbtn" onclick="go('apps')">Tout voir →</button>
+        </div>
+        <div id="at-recent" style="display:flex;flex-direction:column;gap:12px;"></div>
+      </div>
+    </div>
+  </main>
+</section>
+
+<!-- ============ MES APPLICATIONS ============ -->
+<section class="screen" id="screen-apps">
+  <main style="padding:52px 56px 80px;">
+    <div class="page-head">
+      <h1 class="page-title">Mes applications</h1>
+      <button class="btn btn-ink" style="padding:12px 22px;font-size:14.5px;" onclick="go('atelier')">+ Nouvelle app</button>
+    </div>
+    <div class="statrow">
+      <div><div class="num" id="ap-total">0</div><div class="lab">applications</div></div>
+      <div><div class="num" id="ap-running" style="color:var(--green);">0</div><div class="lab">en ligne</div></div>
+      <div><div class="num" id="ap-stopped" style="color:var(--terra);">0</div><div class="lab">arrêtées</div></div>
+    </div>
+    <div class="appgrid" id="ap-grid"></div>
+  </main>
+</section>
+
+<!-- ============ DÉTAIL ============ -->
+<section class="screen" id="screen-detail">
+  <main style="padding:30px 56px 80px;" id="detail-body"></main>
+</section>
+
+<!-- ============ MÉMOIRE ============ -->
+<section class="screen" id="screen-memory">
+  <main style="padding:52px 56px 90px;">
+    <div class="mem-head">
+      <div style="max-width:600px;">
+        <h1 class="page-title" style="font-size:46px;margin:0 0 12px;line-height:1.02;">Ce que l'atelier a retenu</h1>
+        <p style="font-size:16px;color:var(--muted2);line-height:1.6;margin:0;">À chaque création, l'atelier apprend vos goûts et vos habitudes pour rendre les applications suivantes plus justes — sans que vous ayez à tout réexpliquer.</p>
+      </div>
+      <div class="mem-toggle">
+        <div><div style="font-size:13.5px;font-weight:600;">Mémoire</div><div style="font-size:11.5px;color:var(--muted3);" id="mem-state">Activée</div></div>
+        <button class="track" id="mem-track" onclick="toggleMemory()"><span class="knob" id="mem-knob"></span></button>
+      </div>
+    </div>
+
+    <div class="mem-stats">
+      <div><div class="num" id="mem-total">0</div><div class="lab">souvenirs</div></div>
+      <div class="sep"></div>
+      <div><div class="num" style="color:var(--terra);" id="mem-apps">0</div><div class="lab">apps analysées</div></div>
+      <div class="sep"></div>
+      <div style="flex:1;"><div style="font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em;">Appliquée à la prochaine création</div><div style="font-size:14px;color:#3a3026;line-height:1.5;" id="mem-hint">L'atelier réutilisera vos notes et les leçons apprises.</div></div>
+    </div>
+
+    <div class="memgrid" id="mem-grid"></div>
+
+    <div class="mem-add">
+      <span class="plus">+</span>
+      <input id="mem-input" maxlength="120" placeholder="Apprendre un fait à l'atelier — ex : je préfère les apps en anglais…" onkeydown="if(event.key==='Enter')addMemory()">
+      <button class="btn" id="mem-btn" style="padding:10px 18px;font-size:13.5px;background:#e0d3bf;color:#b3a48c;white-space:nowrap;" onclick="addMemory()">Mémoriser</button>
+    </div>
+  </main>
+</section>
+
+<!-- ============ ASSISTANT (CHAT) ============ -->
+<section class="screen" id="screen-chat">
+  <div class="chat-main">
+    <div class="chat-id">
+      <div class="av">O</div>
+      <div><div class="nm">Assistant Orchestrateur</div><div class="st"><i></i>en ligne</div></div>
+    </div>
+    <div class="chat-log" id="chat-log"></div>
+  </div>
+  <div class="chat-dock">
+    <div class="inner">
+      <input id="chat-input" placeholder="Posez une question ou décrivez ce que vous cherchez…" onkeydown="if(event.key==='Enter')sendChat()" oninput="syncSend()">
+      <button class="chat-send" id="chat-send" onclick="sendChat()">↑</button>
+    </div>
+  </div>
+</section>
+
+<!-- ============ OVERLAY CRÉATION ============ -->
 <div class="overlay" id="overlay">
   <div class="modal">
-    <h3>⚙️ Création de votre application</h3>
-    <div class="steps" id="steps">
-      <div class="step pending" id="step-0"><div class="step-icon">💭</div><span>Réflexion sur votre application</span></div>
-      <div class="step pending" id="step-1"><div class="step-icon">✍️</div><span>Écriture du code</span></div>
-      <div class="step pending" id="step-2"><div class="step-icon">🔍</div><span>Vérification du code</span></div>
-      <div class="step pending" id="step-3"><div class="step-icon">📦</div><span>Installation des composants</span></div>
-      <div class="step pending" id="step-4"><div class="step-icon">🚀</div><span>Démarrage de l'application</span></div>
-      <div class="step pending" id="step-5"><div class="step-icon">⏳</div><span>Vérification que tout fonctionne</span></div>
+    <div class="mh">
+      <div class="tag" id="ov-tag">Création en cours</div>
+      <div class="nm" id="ov-name">Nouvelle application</div>
     </div>
-    <div class="progress-bar"><div class="progress-fill" id="progress" style="width:0%"></div></div>
-    <div class="success-box" id="success-box">
-      <h4>✅ Votre application est prête !</h4>
-      <p style="color:#555;font-size:.9rem;margin-bottom:14px">Elle s'ouvre automatiquement dans votre navigateur.</p>
-      <button class="btn-open-app" id="btn-open-result" onclick="openResult()">🌐 Ouvrir mon application</button>
-    </div>
-    <div class="error-box" id="error-box"></div>
-    <div class="modal-actions">
-      <button class="btn-cancel" id="btn-cancel" onclick="cancelCreation()">Annuler</button>
+    <div class="mb">
+      <div class="msteps" id="ov-steps"></div>
+      <div class="mbar"><div class="mfill" id="ov-fill"></div></div>
+      <div class="mstatus" id="ov-status"></div>
+      <div class="msuccess" id="ov-success">
+        <div class="t">Votre application est prête</div>
+        <div class="u" id="ov-url"></div>
+        <div style="display:flex;gap:9px;">
+          <button class="btn btn-green" style="flex:1;padding:13px 0;font-size:14.5px;font-weight:700;" onclick="openResult()">Ouvrir l'application</button>
+          <button class="btn" style="background:#dceadd;color:var(--green);padding:13px 18px;font-size:14px;" onclick="closeOverlay();go('apps')">Mes apps</button>
+        </div>
+      </div>
+      <div class="merror" id="ov-error"></div>
+      <div class="mcancel" id="ov-cancel"><button onclick="cancelCreation()">Annuler</button></div>
     </div>
   </div>
 </div>
 
 <script>
-var currentUrl = null;
-var creationRunning = false;
-
-// ── Exemples ──────────────────────────────────────────────────────────────────
-var EXAMPLES = {
-  'Liste de tâches': 'Une application de liste de tâches avec la possibilité d\'ajouter des tâches, les cocher comme faites, et les supprimer. Interface moderne et claire.',
-  'Calculatrice': 'Une calculatrice avec les opérations de base (addition, soustraction, multiplication, division) et un historique des calculs.',
-  'Convertisseur de devises': 'Un convertisseur pour les devises courantes (EUR, USD, GBP, JPY) avec des taux approximatifs. Interface simple avec deux champs.',
-  'Prise de notes': 'Une application de notes avec titre et contenu, possibilité d\'ajouter et supprimer des notes. Sauvegarde en session.',
-  'Minuteur / Chronomètre': 'Un minuteur avec décompte configurable et un chronomètre avec démarrer/arrêter/réinitialiser. Design épuré.',
-  'Générateur de mots de passe': 'Un générateur de mots de passe sécurisés avec options de longueur, majuscules, chiffres, symboles. Bouton copier.'
+"use strict";
+// ── Données / état ──────────────────────────────────────────────────────────
+var STEPS = [
+  'Réflexion sur votre application',
+  'Écriture du code',
+  'Vérification de la syntaxe',
+  'Installation des composants',
+  'Démarrage du serveur',
+  'Vérification que tout fonctionne',
+];
+var STEP_MAP = {
+  'réfléch':0,'réflexion':0,'conç':0,'pense':0,
+  'écri':1,'code':1,'génér':1,'rédig':1,
+  'corrige':2,'vérif':2,'correction':2,'syntaxe':2,'teste':2,
+  'installe':3,'bibliothèque':3,'composant':3,'install':3,'dépend':3,
+  'démarre':4,'démarr':4,'lance':4,'start':4,'serveur':4,
+  'attend':5,'prête':5,'prêt':5,'fonctionne':5,'écoute':5,
 };
-function fillExample(btn) {
-  var text = btn.textContent.trim();
-  document.getElementById('description').value = EXAMPLES[text] || text;
+var EXAMPLES = [
+  ['Liste de tâches', 'Une liste de tâches : ajouter, cocher comme fait et supprimer des éléments. Interface claire et moderne.'],
+  ['Calculatrice', 'Une calculatrice avec les opérations de base et un historique des calculs.'],
+  ['Convertisseur de devises', 'Un convertisseur de devises (EUR, USD, GBP, JPY) avec taux et deux champs simples.'],
+  ['Minuteur Pomodoro', 'Un minuteur Pomodoro 25/5 avec historique des sessions et statistiques de productivité.'],
+  ['Générateur de mots de passe', 'Un générateur de mots de passe : longueur, majuscules, chiffres, symboles, bouton copier.'],
+];
+
+var state = {
+  screen: 'atelier',
+  apps: [],
+  detailId: null,
+  memNotes: [],
+  memLessons: [],
+  memEmbeddings: false,
+  memEnabled: (localStorage.getItem('mem_enabled') !== '0'),
+  creating: null,
+  improving: false,
+  chatStreaming: false,
+};
+
+// ── Utilitaires ─────────────────────────────────────────────────────────────
+function esc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function $(id){ return document.getElementById(id); }
+function appUrl(a){ return (a && a.port) ? ('http://localhost:' + a.port) : ''; }
+function openExternal(url){
+  if (!url) return;
+  if (window.electronAPI && window.electronAPI.openExternal) window.electronAPI.openExternal(url);
+  else window.open(url, '_blank');
+}
+function fmtDate(iso){
+  if (!iso) return '—';
+  try { var d = new Date(iso); if (isNaN(d)) return String(iso).slice(0,10);
+    return d.toLocaleDateString('fr-FR', { day:'numeric', month:'long', year:'numeric' }); }
+  catch(e){ return String(iso).slice(0,10); }
+}
+function deriveName(desc){
+  var d = (desc||'').trim(); if(!d) return 'Nouvelle application';
+  var w = d.split(/\s+/).slice(0,5).join(' ');
+  w = w.charAt(0).toUpperCase() + w.slice(1);
+  if (w.length > 32) w = w.slice(0,32).trim() + '…';
+  return w;
+}
+function statusLabel(a){
+  if (a.status === 'running') return '● En ligne · port ' + a.port;
+  if (a.status === 'failed') return '✗ Échec';
+  if (a.status === 'creating') return '⏳ En création…';
+  return 'Arrêtée';
 }
 
-// ── Stats ─────────────────────────────────────────────────────────────────────
-async function loadStats() {
-  try {
-    var d = await (await fetch('/api/stats')).json();
-    document.getElementById('hdr-total').textContent = d.total;
-    document.getElementById('hdr-running').textContent = d.running;
-  } catch(e) {}
+// ── Navigation ──────────────────────────────────────────────────────────────
+function go(screen){
+  state.screen = screen;
+  ['atelier','apps','detail','memory','chat'].forEach(function(s){
+    var el = $('screen-' + s); if (el) el.classList.toggle('active', s === screen);
+  });
+  document.querySelectorAll('.tab').forEach(function(t){
+    var tab = t.getAttribute('data-tab');
+    t.classList.toggle('on', tab === screen || (screen === 'detail' && tab === 'apps'));
+  });
+  window.scrollTo(0, 0);
+  if (screen === 'apps') renderApps();
+  if (screen === 'memory') loadMemory();
+  if (screen === 'chat') { loadChatHistory(); setTimeout(function(){ $('chat-input').focus(); }, 50); }
 }
+function openApp(id){ state.detailId = id; _detailSig = null; go('detail'); renderDetail(true); }
 
-// ── Liste des apps ────────────────────────────────────────────────────────────
-async function loadApps() {
+// ── Chargement apps / stats ─────────────────────────────────────────────────
+async function loadApps(){
   try {
     var apps = await (await fetch('/api/apps')).json();
-    renderApps(apps);
-    await loadStats();
-  } catch(e) {}
+    state.apps = Array.isArray(apps) ? apps : [];
+  } catch(e) { /* serveur indisponible */ }
+  renderHeaderStats();
+  renderRecent();
+  if (state.screen === 'apps') renderApps();
+  if (state.screen === 'detail') renderDetail();
+}
+function counts(){
+  var total = state.apps.length;
+  var running = state.apps.filter(function(a){ return a.status === 'running'; }).length;
+  return { total: total, running: running, stopped: total - running };
+}
+function renderHeaderStats(){
+  var c = counts();
+  $('hdr-total').textContent = c.total;
+  $('hdr-running').textContent = c.running;
 }
 
-function statusInfo(s) {
-  var map = {
-    running:  { text: '● En ligne',      cls: 'st-running',  dot: 'dot-running',  icon: '●' },
-    stopped:  { text: '◯ Arrêtée',       cls: 'st-stopped',  dot: 'dot-stopped',  icon: '◯' },
-    failed:   { text: '✗ Erreur',         cls: 'st-failed',   dot: 'dot-failed',   icon: '✗' },
-    creating: { text: '⏳ En création...', cls: 'st-creating', dot: 'dot-creating', icon: '⏳' },
-  };
-  return map[s] || map['stopped'];
+// ── ATELIER ─────────────────────────────────────────────────────────────────
+function renderChips(){
+  $('at-chips').innerHTML = EXAMPLES.map(function(e, i){
+    return '<button class="chip" onclick="fillExample(' + i + ')">' + esc(e[0]) + '</button>';
+  }).join('');
 }
-
-function renderApps(apps) {
-  var el = document.getElementById('apps-grid');
-  if (!apps.length) {
-    el.innerHTML = '<div class="empty-state"><span style="font-size:2.5rem">🚀</span><p>Votre première application apparaîtra ici.</p></div>';
+function fillExample(i){
+  var t = EXAMPLES[i][1];
+  $('at-input').value = t;
+  $('at-count').textContent = t.length;
+}
+function renderRecent(){
+  var el = $('at-recent'); if (!el) return;
+  var recents = state.apps.slice(0, 3);
+  if (!recents.length){
+    el.innerHTML = '<div style="font-size:13.5px;color:var(--muted3);font-style:italic;padding:4px 0;">Aucune création pour l\'instant — décrivez votre première application ci-dessus.</div>';
     return;
   }
-  el.innerHTML = apps.map(function(a) {
-    var si = statusInfo(a.status);
-    var url = 'http://localhost:' + a.port;
-    var isRunning = a.status === 'running';
-    var isStopped = a.status === 'stopped' || a.status === 'failed';
-    return '<div class="app-card" id="app-' + a.id + '">'
-      + '<div class="app-card-header">'
-      + '<span class="app-name">' + esc(a.name || ('Application #' + a.id)) + '</span>'
-      + '<span class="status-dot ' + si.dot + '"></span>'
-      + '</div>'
-      + '<div class="app-desc">' + esc(a.description.substring(0, 100) + (a.description.length > 100 ? '…' : '')) + '</div>'
-      + '<span class="app-status-text ' + si.cls + '">' + si.text + '</span>'
-      + (a.error && a.status === 'failed' ? '<div style="font-size:.76rem;color:#e74c3c;background:#fdedec;padding:6px 10px;border-radius:6px">' + esc(a.error.substring(0,120)) + '</div>' : '')
-      + '<div class="app-actions">'
-      + (isRunning ? '<button class="btn btn-open" onclick="openApp(\'' + url + '\')">🌐 Ouvrir</button>' : '')
-      + (isRunning ? '<button class="btn btn-stop" onclick="stopApp(' + a.id + ')">⏹ Arrêter</button>' : '')
-      + (isStopped ? '<button class="btn btn-start" onclick="startApp(' + a.id + ')">▶ Relancer</button>' : '')
-      + '<button class="btn btn-delete" onclick="deleteApp(' + a.id + ')">🗑</button>'
-      + '</div></div>';
+  el.innerHTML = recents.map(function(a){
+    var dotCls = a.status === 'running' ? 'd-run' : (a.status === 'failed' ? 'd-fail' : 'd-stop');
+    return '<div class="recent" onclick="openApp(' + a.id + ')">'
+      + '<div><div class="nm">' + esc(a.name || ('Application #' + a.id)) + '</div>'
+      + '<div class="sl">' + esc(statusLabel(a)) + '</div></div>'
+      + '<span class="dot-status ' + dotCls + '"></span></div>';
   }).join('');
 }
 
-function esc(s) {
-  if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+// ── MES APPLICATIONS ────────────────────────────────────────────────────────
+function renderApps(){
+  var c = counts();
+  $('ap-total').textContent = c.total;
+  $('ap-running').textContent = c.running;
+  $('ap-stopped').textContent = c.stopped;
+  var el = $('ap-grid');
+  if (!state.apps.length){
+    el.innerHTML = '<div class="empty" style="grid-column:1/-1;"><div class="big">Rien ici pour l\'instant</div><p>Votre première application apparaîtra ici.</p><button class="btn btn-terra" style="padding:11px 22px;margin-top:14px;" onclick="go(\'atelier\')">Créer une application</button></div>';
+    return;
+  }
+  el.innerHTML = state.apps.map(function(a){
+    var nm = esc(a.name || ('Application #' + a.id));
+    var dotCls = a.status === 'running' ? 'd-run' : (a.status === 'failed' ? 'd-fail' : 'd-stop');
+    var pill;
+    if (a.status === 'running') pill = '<span class="pill pill-run">● En ligne · port ' + esc(a.port) + '</span>';
+    else if (a.status === 'failed') pill = '<span class="pill-fail">' + esc((a.error || 'Échec du démarrage').substring(0,90)) + '</span>';
+    else pill = '<span class="pill pill-stop">◯ Arrêtée</span>';
+    var acts;
+    if (a.status === 'running'){
+      acts = '<button class="btn btn-ink grow" onclick="openExternal(appUrlOf(' + a.id + '))">Ouvrir</button>'
+           + '<button class="btn btn-soft pad" onclick="stopApp(' + a.id + ')">Arrêter</button>';
+    } else if (a.status === 'failed'){
+      acts = '<button class="btn btn-green grow" onclick="startApp(' + a.id + ')">Réessayer</button>'
+           + '<button class="btn btn-danger pad" onclick="deleteApp(' + a.id + ')">Suppr.</button>';
+    } else {
+      acts = '<button class="btn btn-green grow" onclick="startApp(' + a.id + ')">Relancer</button>'
+           + '<button class="btn btn-danger pad" onclick="deleteApp(' + a.id + ')">Suppr.</button>';
+    }
+    return '<div class="appcard">'
+      + '<div class="top"><span class="nm" onclick="openApp(' + a.id + ')">' + nm + '</span><span class="dot-status ' + dotCls + '" style="margin-top:6px;"></span></div>'
+      + '<p class="desc">' + esc((a.description || '').substring(0,110)) + ((a.description || '').length > 110 ? '…' : '') + '</p>'
+      + pill
+      + '<div class="acts">' + acts + '</div></div>';
+  }).join('');
+}
+function appById(id){ return state.apps.filter(function(a){ return a.id === id; })[0]; }
+function appUrlOf(id){ return appUrl(appById(id)); }
+
+// ── DÉTAIL ──────────────────────────────────────────────────────────────────
+var _detailSig = null;
+function renderDetail(force){
+  var a = appById(state.detailId);
+  var el = $('detail-body');
+  if (!a){ _detailSig = null; el.innerHTML = '<button class="back" onclick="go(\'apps\')">← Mes applications</button><div class="empty"><div class="big">Application introuvable</div></div>'; return; }
+  // Évite de reconstruire (et recharger l'iframe d'aperçu) à chaque rafraîchissement :
+  // on ne re-rend que si l'état pertinent de l'app a changé, ou sur navigation explicite.
+  var sig = [a.id, a.status, a.port, a.name, a.description, a.error, a.created_at].join('|');
+  if (!force && sig === _detailSig) return;
+  _detailSig = sig;
+  var running = a.status === 'running';
+  var url = appUrl(a);
+  var badge = running ? '<span class="badge badge-run"><span class="dot-status d-run"></span>En ligne</span>'
+            : (a.status === 'failed' ? '<span class="badge badge-fail">Échec</span>' : '<span class="badge badge-stop">◯ Arrêtée</span>');
+  var headActs = '';
+  if (running){
+    headActs = '<button class="btn btn-ink" style="padding:11px 20px;font-size:14px;" onclick="openExternal(appUrlOf(' + a.id + '))">Ouvrir ↗</button>'
+             + '<button class="btn btn-soft" style="padding:11px 18px;font-size:14px;" onclick="stopApp(' + a.id + ')">Arrêter</button>';
+  } else if (a.status === 'failed'){
+    headActs = '<button class="btn btn-green" style="padding:11px 20px;font-size:14px;" onclick="startApp(' + a.id + ')">Réessayer</button>';
+  } else {
+    headActs = '<button class="btn btn-green" style="padding:11px 20px;font-size:14px;" onclick="startApp(' + a.id + ')">Relancer</button>';
+  }
+
+  var viewport;
+  if (running){
+    viewport = '<iframe src="' + esc(url) + '" title="Aperçu de l\'application"></iframe>';
+  } else {
+    viewport = '<div class="vp-off"><div class="t">' + (a.status === 'failed' ? 'Le démarrage a échoué' : 'Application arrêtée') + '</div>'
+      + '<button class="btn btn-green" style="padding:11px 22px;font-size:14px;" onclick="startApp(' + a.id + ')">' + (a.status === 'failed' ? 'Réessayer' : 'Relancer le serveur') + '</button></div>';
+  }
+
+  el.innerHTML =
+    '<button class="back" onclick="go(\'apps\')">← Mes applications</button>'
+    + '<div class="detail-head">'
+      + '<div><div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">'
+        + '<h1 class="detail-title">' + esc(a.name || ('Application #' + a.id)) + '</h1>' + badge + '</div>'
+        + '<p style="font-size:15px;color:var(--muted2);line-height:1.55;margin:0;max-width:560px;">' + esc(a.description || '') + '</p></div>'
+      + '<div style="display:flex;gap:8px;flex-shrink:0;">' + headActs + '</div>'
+    + '</div>'
+    + '<div class="detail-grid">'
+      + '<div class="preview">'
+        + '<div class="chrome"><div class="lights"><i style="background:#e0917a;"></i><i style="background:#e8c47a;"></i><i style="background:#a7cf94;"></i></div>'
+        + '<div class="urlbar">' + (running ? esc('localhost:' + a.port) : '— hors ligne —') + '</div></div>'
+        + '<div class="viewport">' + viewport + '</div>'
+      + '</div>'
+      + '<div class="side">'
+        + '<div class="card"><h3>Informations</h3>'
+          + '<div class="kv"><span class="k">Statut</span><span class="v">' + (running ? 'En ligne' : (a.status === 'failed' ? 'Échec' : 'Arrêtée')) + '</span></div>'
+          + '<div class="kv"><span class="k">Adresse</span><span class="v mono">' + (a.port ? (':' + a.port) : '—') + '</span></div>'
+          + '<div class="kv"><span class="k">Créée le</span><span class="v" style="font-weight:400;">' + esc(fmtDate(a.created_at)) + '</span></div>'
+        + '</div>'
+        + '<div class="card"><h3>Améliorer cette app</h3>'
+          + '<textarea id="improve-input" maxlength="240" placeholder="Ex : ajoute un export PDF mensuel…"></textarea>'
+          + '<button class="btn btn-ink full" id="improve-btn" onclick="improveApp(' + a.id + ')">Générer une version améliorée</button>'
+          + '<div style="font-size:11px;color:var(--muted3);margin-top:8px;line-height:1.4;">Crée une nouvelle application à partir de celle-ci, enrichie de votre demande.</div>'
+        + '</div>'
+        + '<div class="card"><h3>Historique</h3><div class="timeline">'
+          + '<div class="it"><div class="rail"><i style="background:var(--terra);"></i></div>'
+          + '<div><div class="tx">Création initiale</div><div class="dt">' + esc(fmtDate(a.created_at)) + '</div></div></div>'
+        + '</div></div>'
+        + '<button class="btn" style="background:none;border:1px solid #f0d6cf;color:var(--red);padding:11px 0;font-size:13.5px;" onclick="deleteApp(' + a.id + ',true)">Supprimer l\'application</button>'
+      + '</div>'
+    + '</div>';
 }
 
-// ── Création ──────────────────────────────────────────────────────────────────
-var STEP_MAP = {
-  'réfléchis': 0, 'réflexion': 0, 'réfléchit': 0,
-  'écris': 1, 'écriture': 1, 'code': 1, 'j\'écris': 1,
-  'corrige': 2, 'vérif': 2, 'correction': 2, 'syntaxe': 2,
-  'installe': 3, 'bibliothèque': 3, 'composant': 3, 'install': 3,
-  'démarre': 4, 'démarr': 4, 'lance': 4, 'start': 4,
-  'attends': 5, 'attend': 5, 'prête': 5, 'prêt': 5,
-};
+// ── Actions apps ────────────────────────────────────────────────────────────
+async function stopApp(id){
+  try { await fetch('/api/apps/' + id + '/stop', { method:'POST' }); } catch(e){}
+  await loadApps();
+}
+async function startApp(id){
+  try {
+    var r = await fetch('/api/apps/' + id + '/start', { method:'POST' });
+    var d = await r.json();
+    await loadApps();
+    if (d && d.status === 'running' && d.url) openExternal(d.url);
+  } catch(e){ await loadApps(); }
+}
+async function deleteApp(id, fromDetail){
+  if (!confirm('Supprimer cette application ? Elle sera définitivement effacée.')) return;
+  try { await fetch('/api/apps/' + id, { method:'DELETE' }); } catch(e){}
+  if (fromDetail) go('apps');
+  await loadApps();
+}
 
-function detectStep(msg) {
-  var lower = msg.toLowerCase();
-  for (var k in STEP_MAP) {
-    if (lower.includes(k)) return STEP_MAP[k];
-  }
+// ── Création (overlay + SSE) ────────────────────────────────────────────────
+function renderOverlaySteps(activeIdx, done){
+  $('ov-steps').innerHTML = STEPS.map(function(label, j){
+    var cls = done || activeIdx > j ? 'done' : (activeIdx === j ? 'active' : 'pending');
+    var inner = cls === 'done' ? '✓' : (cls === 'active' ? '<span style="width:11px;height:11px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;display:inline-block;animation:a-spin .8s linear infinite;"></span>' : (j + 1));
+    return '<div class="mstep ' + cls + '"><span class="ic">' + inner + '</span><span class="lb">' + esc(label) + '</span></div>';
+  }).join('');
+  var pct = done ? 100 : Math.round(((activeIdx + 0.5) / STEPS.length) * 100);
+  $('ov-fill').style.width = pct + '%';
+}
+function detectStep(msg){
+  var lower = (msg || '').toLowerCase();
+  for (var k in STEP_MAP){ if (lower.indexOf(k) !== -1) return STEP_MAP[k]; }
   return -1;
 }
+function closeOverlay(){ $('overlay').classList.remove('show'); state.creating = null; }
+function cancelCreation(){ closeOverlay(); loadApps(); }
 
-function setStep(stepIdx) {
-  for (var i = 0; i < 6; i++) {
-    var el = document.getElementById('step-' + i);
-    if (!el) continue;
-    el.className = 'step ' + (i < stepIdx ? 'done' : i === stepIdx ? 'active' : 'pending');
-  }
-  document.getElementById('progress').style.width = Math.round((stepIdx / 5) * 85) + '%';
+async function startCreation(){
+  var desc = $('at-input').value.trim();
+  if (!desc){ $('at-input').focus(); return; }
+  _runCreate(desc, deriveName(desc));
 }
-
-async function startCreation() {
-  var desc = document.getElementById('description').value.trim();
-  if (!desc) { document.getElementById('description').focus(); return; }
-
-  creationRunning = true;
-  currentUrl = null;
-  document.getElementById('btn-create').disabled = true;
-  document.getElementById('success-box').className = 'success-box';
-  document.getElementById('error-box').className = 'error-box';
-  document.getElementById('error-box').textContent = '';
-  document.getElementById('btn-cancel').style.display = '';
-  for (var i = 0; i < 6; i++) {
-    var s = document.getElementById('step-' + i);
-    if (s) s.className = 'step pending';
-  }
-  document.getElementById('progress').style.width = '0%';
-  document.getElementById('overlay').classList.add('show');
+async function _runCreate(desc, name, opts){
+  opts = opts || {};
+  var fromAtelier = !opts.fromImprove;
+  state.creating = { url:null, done:false };
+  $('ov-tag').textContent = 'Création en cours';
+  $('ov-name').textContent = name;
+  $('ov-success').className = 'msuccess';
+  $('ov-error').className = 'merror';
+  $('ov-error').textContent = '';
+  $('ov-cancel').style.display = '';
+  $('ov-status').textContent = STEPS[0] + '…';
+  renderOverlaySteps(0, false);
+  $('overlay').classList.add('show');
+  if (fromAtelier) $('at-create').disabled = true;
 
   try {
     var resp = await fetch('/api/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ description: desc })
+      method:'POST', headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({ description: desc }),
     });
-
+    if (!resp.ok || !resp.body) throw new Error('Le serveur a répondu ' + resp.status);
     var reader = resp.body.getReader();
     var dec = new TextDecoder();
-
-    while (true) {
+    var buf = '';
+    while (true){
       var res = await reader.read();
       if (res.done) break;
-      var lines = dec.decode(res.value).split('\n');
-      for (var i = 0; i < lines.length; i++) {
+      buf += dec.decode(res.value, { stream:true });
+      var lines = buf.split('\n');
+      buf = lines.pop();
+      for (var i = 0; i < lines.length; i++){
         var line = lines[i];
-        if (!line.startsWith('data: ')) continue;
-        try {
-          var ev = JSON.parse(line.slice(6));
-          if (ev.type === 'step') {
-            var s = detectStep(ev.msg);
-            if (s >= 0) setStep(s);
-          }
-          if (ev.type === 'done') {
-            currentUrl = ev.url;
-            document.getElementById('progress').style.width = '100%';
-            for (var j = 0; j < 6; j++) {
-              var el = document.getElementById('step-' + j);
-              if (el) el.className = 'step done';
-            }
-            document.getElementById('success-box').className = 'success-box show';
-            document.getElementById('btn-cancel').style.display = 'none';
-            await loadApps();
-            // Ouvrir automatiquement après 1.5s
-            setTimeout(function() { if (currentUrl) openApp(currentUrl); }, 1500);
-          }
-          if (ev.type === 'error') {
-            document.getElementById('error-box').textContent = '❌ ' + ev.msg;
-            document.getElementById('error-box').className = 'error-box show';
-            document.getElementById('btn-cancel').textContent = 'Fermer';
-            await loadApps();
-          }
-        } catch(e) {}
+        if (line.indexOf('data: ') !== 0) continue;
+        var ev; try { ev = JSON.parse(line.slice(6)); } catch(e){ continue; }
+        if (!state.creating) break;
+        if (ev.type === 'step'){
+          var s = detectStep(ev.msg);
+          if (s >= 0){ renderOverlaySteps(s, false); }
+          $('ov-status').textContent = ev.msg || (STEPS[Math.max(0,s)] + '…');
+        } else if (ev.type === 'done'){
+          state.creating.url = ev.url;
+          state.creating.done = true;
+          renderOverlaySteps(STEPS.length, true);
+          $('ov-tag').textContent = 'Application créée';
+          if (ev.name) $('ov-name').textContent = ev.name;
+          $('ov-status').textContent = 'Terminé · serveur en écoute';
+          $('ov-url').textContent = 'Elle tourne sur ' + (ev.url || '').replace(/^https?:\/\//,'');
+          $('ov-success').className = 'msuccess show';
+          $('ov-cancel').style.display = 'none';
+          await loadApps();
+        } else if (ev.type === 'error'){
+          $('ov-error').textContent = '❌ ' + (ev.msg || 'Erreur inconnue');
+          $('ov-error').className = 'merror show';
+          $('ov-cancel').querySelector('button').textContent = 'Fermer';
+          await loadApps();
+        }
       }
     }
-  } catch(e) {
-    document.getElementById('error-box').textContent = '❌ Erreur de connexion : ' + e.message;
-    document.getElementById('error-box').className = 'error-box show';
+  } catch(e){
+    $('ov-error').textContent = '❌ Erreur de connexion : ' + e.message;
+    $('ov-error').className = 'merror show';
   }
-
-  creationRunning = false;
-  document.getElementById('btn-create').disabled = false;
-}
-
-function cancelCreation() {
-  document.getElementById('overlay').classList.remove('show');
-  document.getElementById('btn-cancel').textContent = 'Annuler';
-  loadApps();
-}
-
-function openResult() {
-  if (currentUrl) openApp(currentUrl);
-  cancelCreation();
-}
-
-function openApp(url) {
-  if (window.electronAPI && window.electronAPI.openExternal) {
-    window.electronAPI.openExternal(url);
-  } else {
-    window.open(url, '_blank');
+  if (fromAtelier){
+    $('at-create').disabled = false;
+    if (state.creating && state.creating.done){ $('at-input').value = ''; $('at-count').textContent = '0'; }
   }
 }
-
-// ── Actions sur les apps ──────────────────────────────────────────────────────
-async function stopApp(id) {
-  await fetch('/api/apps/' + id + '/stop', { method: 'POST' });
-  loadApps();
+function openResult(){
+  if (state.creating && state.creating.url) openExternal(state.creating.url);
+  closeOverlay(); go('apps');
 }
 
-async function startApp(id) {
-  var card = document.getElementById('app-' + id);
-  if (card) {
-    var btn = card.querySelector('.btn-start');
-    if (btn) { btn.textContent = '⏳ Démarrage...'; btn.disabled = true; }
+// ── Améliorer (crée une variante via /api/create) ──────────────────────────
+function improveApp(id){
+  if (state.improving) return;
+  var a = appById(id); if (!a) return;
+  var txt = ($('improve-input').value || '').trim();
+  if (!txt){ $('improve-input').focus(); return; }
+  state.improving = true;
+  var btn = $('improve-btn'); if (btn){ btn.disabled = true; btn.textContent = 'Génération en cours…'; }
+  var combined = (a.description || a.name || '') + '\n\nAmélioration souhaitée : ' + txt;
+  _runCreate(combined, deriveName(a.name || a.description || '') + ' +', { fromImprove: true }).finally(function(){
+    state.improving = false;
+    if (btn){ btn.disabled = false; btn.textContent = 'Générer une version améliorée'; }
+  });
+}
+
+// ── MÉMOIRE ─────────────────────────────────────────────────────────────────
+async function loadMemory(){
+  try {
+    var n = await (await fetch('/api/memory/notes')).json();
+    state.memNotes = (n && n.notes) || [];
+  } catch(e){ state.memNotes = []; }
+  try {
+    var l = await (await fetch('/api/memory/list?namespace=_shared&limit=100')).json();
+    state.memLessons = (l && l.items) || [];
+  } catch(e){ state.memLessons = []; }
+  try {
+    var st = await (await fetch('/api/memory/status')).json();
+    state.memEmbeddings = !!(st && st.embeddings);
+  } catch(e){}
+  renderMemory();
+}
+function renderMemory(){
+  var en = state.memEnabled;
+  $('mem-track').style.background = en ? 'var(--green)' : '#d2c8b6';
+  $('mem-knob').style.left = en ? '21px' : '3px';
+  $('mem-state').textContent = en ? 'Activée' : 'Désactivée';
+  $('mem-total').textContent = state.memNotes.length + state.memLessons.length;
+  $('mem-apps').textContent = state.apps.length;
+  $('mem-hint').textContent = en
+    ? 'L\'atelier réutilisera vos notes et les leçons apprises lors des prochaines créations.'
+    : 'Désactivée — vos prochaines créations repartiront d\'une page blanche.';
+
+  var grid = $('mem-grid');
+  grid.style.opacity = en ? '1' : '0.45';
+  grid.style.pointerEvents = en ? 'auto' : 'none';
+
+  function itemHtml(it, deletable){
+    return '<div class="memitem"><i></i><div style="flex:1;min-width:0;">'
+      + '<div class="tx">' + esc(it.content) + '</div>'
+      + '<div class="src">' + esc(it.source || '') + '</div></div>'
+      + (deletable ? '<button class="x" onclick="removeMemory(' + it.id + ')">×</button>' : '') + '</div>';
   }
-  var r = await fetch('/api/apps/' + id + '/start', { method: 'POST' });
-  var d = await r.json();
-  if (d.status === 'running') openApp(d.url);
-  loadApps();
+  function cardHtml(num, title, items, deletable){
+    var body = items.length
+      ? items.map(function(it){ return itemHtml(it, deletable); }).join('')
+      : '<div class="mem-empty">Rien retenu pour l\'instant.</div>';
+    return '<div class="memcard"><div class="ch"><span class="n">' + num + '</span><h3>' + title + '</h3>'
+      + '<span class="ct">' + items.length + '</span></div><div>' + body + '</div></div>';
+  }
+  grid.innerHTML =
+      cardHtml('01', 'Vos notes', state.memNotes, true)
+    + cardHtml('02', 'Leçons apprises', state.memLessons, false);
+
+  var has = state.memInputHas;
+  var btn = $('mem-btn');
+  btn.style.background = has ? 'var(--ink)' : '#e0d3bf';
+  btn.style.color = has ? 'var(--bg)' : '#b3a48c';
+}
+function toggleMemory(){
+  state.memEnabled = !state.memEnabled;
+  localStorage.setItem('mem_enabled', state.memEnabled ? '1' : '0');
+  renderMemory();
+}
+async function addMemory(){
+  var inp = $('mem-input');
+  var txt = (inp.value || '').trim();
+  if (txt.length < 3){ inp.focus(); return; }
+  inp.value = '';
+  state.memInputHas = false;
+  try {
+    await fetch('/api/memory/notes', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ content: txt }) });
+  } catch(e){}
+  await loadMemory();
+}
+async function removeMemory(id){
+  try { await fetch('/api/memory/notes/' + id, { method:'DELETE' }); } catch(e){}
+  await loadMemory();
 }
 
-async function deleteApp(id) {
-  if (!confirm('Supprimer cette application ? Elle sera définitivement effacée.')) return;
-  await fetch('/api/apps/' + id, { method: 'DELETE' });
-  loadApps();
+// ── ASSISTANT (CHAT) ────────────────────────────────────────────────────────
+var CHAT_SESSION = 'default';
+var chatLoaded = false;
+function syncSend(){
+  var has = ($('chat-input').value || '').trim().length > 0;
+  $('chat-send').classList.toggle('on', has);
+}
+function chatAddUser(text){
+  var d = document.createElement('div');
+  d.className = 'msg-user';
+  d.textContent = text;
+  $('chat-log').appendChild(d);
+  scrollChat();
+}
+function chatAddAgent(){
+  var wrap = document.createElement('div');
+  wrap.className = 'msg-agent';
+  wrap.innerHTML = '<div class="av">O</div><div class="bubble"></div>';
+  $('chat-log').appendChild(wrap);
+  scrollChat();
+  return wrap.querySelector('.bubble');
+}
+function chatAddTool(text){
+  var d = document.createElement('div');
+  d.className = 'msg-tool';
+  d.textContent = '⚙ ' + text;
+  $('chat-log').appendChild(d);
+  scrollChat();
+}
+function scrollChat(){ window.scrollTo(0, document.body.scrollHeight); }
+
+async function loadChatHistory(){
+  if (chatLoaded) return;
+  chatLoaded = true;
+  var log = $('chat-log');
+  try {
+    var h = await (await fetch('/api/chat/history?session_id=' + CHAT_SESSION)).json();
+    var msgs = (h && h.messages) || [];
+    if (!msgs.length){
+      var b = chatAddAgent();
+      b.textContent = 'Bonjour ! Je suis l\'assistant de l\'Orchestrateur. Posez-moi une question, ou décrivez une application — je peux vous guider pas à pas.';
+      return;
+    }
+    msgs.forEach(function(m){
+      if (m.role === 'user') chatAddUser(m.text);
+      else { var b = chatAddAgent(); b.textContent = m.text; }
+    });
+  } catch(e){
+    var bb = chatAddAgent();
+    bb.textContent = 'Bonjour ! Je suis l\'assistant de l\'Orchestrateur.';
+  }
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────────
+async function sendChat(){
+  if (state.chatStreaming) return;
+  var inp = $('chat-input');
+  var text = (inp.value || '').trim();
+  if (!text) return;
+  inp.value = ''; syncSend();
+  chatAddUser(text);
+  state.chatStreaming = true;
+  var bubble = chatAddAgent();
+  bubble.textContent = '…';
+  var first = true;
+  try {
+    var resp = await fetch('/api/chat', {
+      method:'POST', headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({ message: text, session_id: CHAT_SESSION }),
+    });
+    if (!resp.ok || !resp.body) throw new Error('Le serveur a répondu ' + resp.status);
+    var reader = resp.body.getReader();
+    var dec = new TextDecoder();
+    var buf = '';
+    while (true){
+      var res = await reader.read();
+      if (res.done) break;
+      buf += dec.decode(res.value, { stream:true });
+      var lines = buf.split('\n');
+      buf = lines.pop();
+      for (var i = 0; i < lines.length; i++){
+        var line = lines[i];
+        if (line.indexOf('data: ') !== 0) continue;
+        var ev; try { ev = JSON.parse(line.slice(6)); } catch(e){ continue; }
+        if (ev.type === 'text_delta'){
+          if (first){ bubble.textContent = ''; first = false; }
+          bubble.textContent += ev.text || '';
+          scrollChat();
+        } else if (ev.type === 'tool_executing'){
+          chatAddTool('Outil : ' + (ev.tool_name || ''));
+          bubble = chatAddAgent(); bubble.textContent = '…'; first = true;
+        } else if (ev.type === 'tool_result'){
+          /* résultat d'outil — déjà reflété dans la réponse */
+        } else if (ev.type === 'confirmation_needed'){
+          renderConfirm(ev);
+          if (first) bubble.parentNode && bubble.parentNode.remove();
+        } else if (ev.type === 'error'){
+          if (first){ bubble.textContent = ''; first = false; }
+          bubble.textContent += '\n⚠ ' + (ev.message || 'Erreur');
+        } else if (ev.type === 'done'){
+          /* fin */
+        }
+      }
+    }
+    if (first) bubble.textContent = '(aucune réponse)';
+  } catch(e){
+    bubble.textContent = '⚠ Erreur de connexion : ' + e.message;
+  }
+  state.chatStreaming = false;
+}
+
+function renderConfirm(ev){
+  var box = document.createElement('div');
+  box.className = 'confirm-box';
+  box.innerHTML = '<div><strong>Confirmation requise</strong></div>'
+    + '<div style="margin-top:6px;color:var(--muted2);">' + esc(ev.description || ('Exécuter ' + (ev.tool_name || 'l\'action') + ' ?')) + '</div>'
+    + '<div class="acts"><button class="btn btn-green" style="padding:8px 16px;font-size:13px;">Confirmer</button>'
+    + '<button class="btn btn-soft" style="padding:8px 16px;font-size:13px;">Annuler</button></div>';
+  var btns = box.querySelectorAll('button');
+  btns[0].onclick = function(){ confirmChat(ev.action_id, true, box); };
+  btns[1].onclick = function(){ confirmChat(ev.action_id, false, box); };
+  $('chat-log').appendChild(box);
+  scrollChat();
+}
+async function confirmChat(actionId, ok, box){
+  box.querySelectorAll('button').forEach(function(b){ b.disabled = true; });
+  var bubble = chatAddAgent(); bubble.textContent = '…'; var first = true;
+  try {
+    var resp = await fetch('/api/chat/confirm/' + actionId, {
+      method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ confirmed: ok }),
+    });
+    if (!resp.ok || !resp.body) throw new Error('Le serveur a répondu ' + resp.status);
+    var reader = resp.body.getReader(); var dec = new TextDecoder(); var buf = '';
+    while (true){
+      var res = await reader.read(); if (res.done) break;
+      buf += dec.decode(res.value, { stream:true });
+      var lines = buf.split('\n'); buf = lines.pop();
+      for (var i = 0; i < lines.length; i++){
+        var line = lines[i]; if (line.indexOf('data: ') !== 0) continue;
+        var ev; try { ev = JSON.parse(line.slice(6)); } catch(e){ continue; }
+        if (ev.type === 'text_delta'){ if (first){ bubble.textContent=''; first=false; } bubble.textContent += ev.text || ''; scrollChat(); }
+        else if (ev.type === 'tool_executing'){ chatAddTool('Outil : ' + (ev.tool_name || '')); bubble = chatAddAgent(); bubble.textContent='…'; first=true; }
+        else if (ev.type === 'confirmation_needed'){ renderConfirm(ev); }
+        else if (ev.type === 'error'){ if (first){ bubble.textContent=''; first=false; } bubble.textContent += '\n⚠ ' + (ev.message || 'Erreur'); }
+      }
+    }
+    if (first) bubble.textContent = ok ? '(action exécutée)' : '(action annulée)';
+  } catch(e){ bubble.textContent = '⚠ ' + e.message; }
+}
+
+// ── Init ────────────────────────────────────────────────────────────────────
+$('at-input').addEventListener('input', function(){ $('at-count').textContent = this.value.length; });
+$('mem-input').addEventListener('input', function(){ state.memInputHas = this.value.trim().length > 0;
+  var btn = $('mem-btn'); btn.style.background = state.memInputHas ? 'var(--ink)' : '#e0d3bf'; btn.style.color = state.memInputHas ? 'var(--bg)' : '#b3a48c'; });
+
+renderChips();
+go('atelier');
 loadApps();
-setInterval(loadApps, 8000);
+setInterval(function(){ if (!state.creating) loadApps(); }, 8000);
 </script>
 </body>
 </html>

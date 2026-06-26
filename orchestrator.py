@@ -419,6 +419,8 @@ app.include_router(team.router)
 # prioritaire ; control.html sait lire ce format.
 app.include_router(api_control.router)
 app.include_router(managed_agents.router)  # GET /api/managed-agents + /environment
+import chat_agent  # Assistant : GET /chat + POST /api/chat (+ history/confirm)
+app.include_router(chat_agent.router)
 import memory as _memory_mod
 if _memory_mod.router is not None:
     app.include_router(_memory_mod.router)
