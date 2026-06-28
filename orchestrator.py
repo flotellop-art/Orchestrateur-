@@ -31,6 +31,8 @@ load_dotenv()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+DEFAULT_HOST = "127.0.0.1"
+PUBLIC_BIND_HOSTS = {"0.0.0.0", "::"}
 DB_PATH  = Path(__file__).parent / "apps.db"
 STATIC   = Path(__file__).parent / "static"
 PROJECTS = Path(__file__).parent / "projects"
@@ -41,6 +43,40 @@ log = logging.getLogger(__name__)
 
 client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 running_servers = {}   # app_id -> asyncio.Process
+
+
+def get_server_host() -> str:
+    """Retourne l'adresse d'ecoute du serveur principal.
+
+    Par securite, l'application n'ecoute que sur localhost par defaut.
+    HOST permet de choisir explicitement une autre adresse.
+    """
+    return (os.getenv("HOST") or DEFAULT_HOST).strip() or DEFAULT_HOST
+
+
+def ensure_public_host_requires_secret(host: str, api_secret: str | None = None) -> None:
+    """Refuse une ecoute publique sans authentification API active."""
+    normalized_host = (host or "").strip().strip("[]")
+    secret = os.getenv("API_SECRET_KEY") if api_secret is None else api_secret
+    if normalized_host in PUBLIC_BIND_HOSTS and not (secret or "").strip():
+        raise RuntimeError(
+            "Refus de demarrer: HOST={} expose le serveur sur le reseau. "
+            "Definissez API_SECRET_KEY ou utilisez HOST=127.0.0.1.".format(host)
+        )
+
+
+def run_server() -> None:
+    """Point d'entree CLI teste: valide l'ecoute puis lance uvicorn."""
+    import uvicorn
+
+    host = get_server_host()
+    ensure_public_host_requires_secret(host)
+    uvicorn.run(
+        "orchestrator:app",
+        host=host,
+        port=int(os.getenv("PORT", "8000")),
+        reload=False,
+    )
 
 
 # ── Base de donnees ────────────────────────────────────────────────────────────
@@ -543,5 +579,4 @@ async def memory_page():
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("orchestrator:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+    run_server()
