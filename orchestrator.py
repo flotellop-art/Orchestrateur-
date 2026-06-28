@@ -195,6 +195,67 @@ def repair_json(s):
     return "".join(result)
 
 
+# ── Securite : on ne fait jamais confiance aux sorties du LLM ──────────────────
+# Le modele produit des fichiers + un requirements.txt qui sont ECRITS puis
+# EXECUTES. On borne donc strictement les noms de fichiers (anti path-traversal)
+# et le contenu de requirements.txt (anti installation de paquets arbitraires).
+ALLOWED_GENERATED_FILES = frozenset({"app.py", "requirements.txt"})
+ALLOWED_REQUIREMENTS = frozenset({"flask"})
+_REQ_FORBIDDEN_MARKERS = ("git+", "http://", "https://", "-e ", "--", "/", "\\", "@", ":")
+
+
+def safe_generated_path(base: Path, filename: str) -> Path:
+    """Resout le chemin d'un fichier genere par le LLM en bloquant le path
+    traversal. N'autorise que les noms exacts de ALLOWED_GENERATED_FILES et
+    verifie que le chemin resolu reste a l'interieur de `base`."""
+    if not filename or not isinstance(filename, str) or "\x00" in filename:
+        raise ValueError("Nom de fichier invalide.")
+    if filename not in ALLOWED_GENERATED_FILES:
+        raise ValueError("Fichier genere non autorise : " + str(filename))
+    base_resolved = base.resolve()
+    target = (base_resolved / filename).resolve()
+    try:
+        target.relative_to(base_resolved)
+    except ValueError:
+        raise ValueError("Chemin hors du dossier projet : " + str(filename))
+    return target
+
+
+def validate_requirements_txt(content: str) -> str:
+    """Valide le contenu de requirements.txt avant `pip install`.
+
+    Seules les dependances de ALLOWED_REQUIREMENTS sont permises. Toute URL,
+    reference VCS (git+...), option (-e, --extra-index-url...) ou chemin local
+    fait echouer la validation (ValueError)."""
+    clean: list[str] = []
+    for raw in (content or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        low = line.lower()
+        if any(marker in low for marker in _REQ_FORBIDDEN_MARKERS):
+            raise ValueError("Dependance interdite (URL/VCS/option/chemin) : " + line)
+        name = re.split(r"[<>=!~ ]", low, maxsplit=1)[0].strip()
+        if name not in ALLOWED_REQUIREMENTS:
+            raise ValueError("Dependance non autorisee : " + line)
+        clean.append(line)
+    return ("\n".join(clean) + "\n") if clean else "flask\n"
+
+
+def check_host_security(host: str, api_key: str) -> None:
+    """Refuse une exposition reseau sans authentification.
+
+    Si HOST ecoute hors de la boucle locale (0.0.0.0 / ::) alors qu'aucune cle
+    API n'est definie, demarrer exposerait l'API (creation/execution de code) a
+    tout le reseau sans protection : on leve une RuntimeError."""
+    if (host or "").strip() in {"0.0.0.0", "::"} and not (api_key or "").strip():
+        raise RuntimeError(
+            "Refus de demarrer : HOST=" + str(host) + " expose le serveur sur le "
+            "reseau sans authentification. Definissez API_SECRET_KEY dans .env, "
+            "ou laissez HOST sur 127.0.0.1 (valeur par defaut)."
+        )
+
+
 # ── Prompt systeme ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 Tu es un generateur d'applications web Python/Flask.
@@ -327,20 +388,35 @@ async def creation_pipeline(app_id, description, folder, port):
             yield evt("error", "Erreur de syntaxe non corrigee : " + syntax_error[:200])
             return
 
-    # Etape 3 : Ecriture des fichiers
+    # Etape 3 : Ecriture des fichiers (sorties LLM = non fiables)
     yield evt("step", "Sauvegarde des fichiers...")
     target = Path(folder)
     target.mkdir(parents=True, exist_ok=True)
     files_written = []
-    for f in app_data.get("files", []):
-        fp = target / f["filename"]
-        fp.write_text(f["content"], encoding="utf-8")
-        files_written.append(f["filename"])
+    try:
+        for f in app_data.get("files", []):
+            fp = safe_generated_path(target, f.get("filename", ""))
+            content = f.get("content", "")
+            if fp.name == "requirements.txt":
+                content = validate_requirements_txt(content)
+            fp.write_text(content, encoding="utf-8")
+            files_written.append(fp.name)
+    except ValueError as e:
+        await db_update(app_id, status="failed", error=str(e))
+        yield evt("error", "Fichier genere refuse : " + str(e))
+        return
     yield evt("files", "Fichiers : " + ", ".join(files_written), files=files_written)
 
     # Etape 4 : Installation des dependances
     req = target / "requirements.txt"
     if req.exists():
+        # Garde defensive : re-valider le fichier sur disque avant pip install.
+        try:
+            validate_requirements_txt(req.read_text(encoding="utf-8"))
+        except ValueError as e:
+            await db_update(app_id, status="failed", error=str(e))
+            yield evt("error", "requirements.txt refuse : " + str(e))
+            return
         yield evt("step", "Installation des composants...")
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -544,4 +620,9 @@ app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("orchestrator:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+    # Defaut sur la boucle locale ; exposition reseau (0.0.0.0/::) interdite sans
+    # API_SECRET_KEY. Surchargeable via la variable d'environnement HOST.
+    host = os.getenv("HOST", "127.0.0.1").strip()
+    port = int(os.getenv("PORT", "8000"))
+    check_host_security(host, os.getenv("API_SECRET_KEY", ""))
+    uvicorn.run("orchestrator:app", host=host, port=port, reload=False)
