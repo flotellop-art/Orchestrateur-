@@ -626,20 +626,39 @@ def _target_file(target_path: str, rel: str):
         return None
     if p != base and base not in p.parents:
         return None
+    # Chokepoint anti-fuite : refuse un fichier sensible — par son nom demande OU
+    # par sa cible reelle (alias/symlink vers .env, cles...). Protege TOUS les
+    # appelants : l'agent (read_file) ET l'endpoint HTTP /api/tasks/{id}/file.
+    if repo_guard.is_sensitive_target_file(rel):
+        return None
+    try:
+        if repo_guard.is_sensitive_target_file(str(p.relative_to(base))):
+            return None
+    except ValueError:
+        return None
     return p if p.is_file() else None
 
 
 def _list_target_files(target_path: str) -> list[str]:
-    base = Path(target_path) if target_path else None
+    base = Path(target_path).resolve() if target_path else None
     if not base or not base.exists():
         return []
     out = []
     for p in sorted(base.rglob("*")):
         rel = p.relative_to(base)
-        if (p.is_file()
-                and not any(part in _TARGET_IGNORE for part in rel.parts)
-                and not repo_guard.is_sensitive_target_file(str(rel))):
-            out.append(str(rel))
+        if not p.is_file() or any(part in _TARGET_IGNORE for part in rel.parts):
+            continue
+        if repo_guard.is_sensitive_target_file(str(rel)):
+            continue
+        try:
+            # Suit le symlink : ne pas exposer un alias vers un secret, ni un
+            # lien qui s'echappe du depot.
+            resolved_rel = str(p.resolve().relative_to(base))
+        except ValueError:
+            continue
+        if repo_guard.is_sensitive_target_file(resolved_rel):
+            continue
+        out.append(str(rel))
         if len(out) >= 400:
             break
     return out

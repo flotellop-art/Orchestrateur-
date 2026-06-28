@@ -18,13 +18,18 @@ from __future__ import annotations
 import re
 
 # ── 1. Fichiers sensibles : ni listes, ni lisibles ────────────────────────────
+_SENSITIVE_DIR_PARTS = frozenset({".git", ".svn", ".hg"})
 _SENSITIVE_NAMES = frozenset({
-    ".env", ".npmrc", ".netrc", ".pypirc", ".git-credentials",
-    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credentials",
+    ".env", ".npmrc", ".netrc", "_netrc", ".pypirc", ".git-credentials",
+    ".pgpass", ".htpasswd", ".dockercfg", "credentials",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
 })
 _SENSITIVE_SUFFIXES = (
     ".key", ".pem", ".pfx", ".p12", ".keystore", ".jks", ".secret", ".secrets",
+    ".asc", ".ppk",
 )
+# Gabarits publics tolere : .env.example, .env.sample... ne sont pas des secrets.
+_ENV_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist", ".tpl")
 
 
 def is_sensitive_target_file(rel: str) -> bool:
@@ -35,10 +40,18 @@ def is_sensitive_target_file(rel: str) -> bool:
     parts = [p for p in norm.split("/") if p and p not in (".", "..")]
     if not parts:
         return False
-    if ".git" in parts:
+    if any(part in _SENSITIVE_DIR_PARTS for part in parts):
         return True
     name = parts[-1]
-    if name in _SENSITIVE_NAMES or name.startswith(".env") or name.startswith("id_rsa"):
+    # Cles SSH : privee bloquee, cle PUBLIQUE (.pub) autorisee.
+    if name.startswith("id_") and not name.endswith(".pub"):
+        return True
+    # Fichiers d'environnement : .env / .env.<x> bloques, gabarits publics permis.
+    if name == ".env":
+        return True
+    if name.startswith(".env.") and not name.endswith(_ENV_TEMPLATE_SUFFIXES):
+        return True
+    if name in _SENSITIVE_NAMES:
         return True
     return name.endswith(_SENSITIVE_SUFFIXES)
 

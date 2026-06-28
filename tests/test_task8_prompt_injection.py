@@ -4,6 +4,7 @@ Les tests supposent un agent DEJA COMPROMIS : la defense doit tenir au niveau
 des outils, sans dependre de l'obeissance du modele. Aucun appel LLM ni reseau.
 """
 import asyncio
+import os
 
 import pytest
 
@@ -11,6 +12,14 @@ import team
 from patches.security import repo_guard
 
 SECRET = "API_SECRET=sk-live-DEADBEEF-supersecret"
+
+
+def _symlink(target, link) -> bool:
+    try:
+        os.symlink(target, link)
+        return True
+    except (OSError, NotImplementedError):
+        return False
 
 
 def _run(coro):
@@ -27,9 +36,29 @@ def test_fichiers_sensibles_detectes(rel):
     assert repo_guard.is_sensitive_target_file(rel) is True
 
 
-@pytest.mark.parametrize("rel", ["app.py", "README.md", "src/main.js", "schema.sql"])
+@pytest.mark.parametrize("rel", [
+    "app.py", "README.md", "src/main.js", "schema.sql",
+    ".env.example", ".env.sample", "id_rsa.pub",  # gabarits / cle publique : permis
+])
 def test_fichiers_normaux_non_sensibles(rel):
     assert repo_guard.is_sensitive_target_file(rel) is False
+
+
+# ── Chokepoint : _target_file protege TOUS les appelants (agent + HTTP) ───────
+def test_target_file_refuse_secret_direct(tmp_path):
+    (tmp_path / ".env").write_text(SECRET)
+    # protege aussi l'endpoint /api/tasks/{id}/file qui passe par _target_file
+    assert team._target_file(str(tmp_path), ".env") is None
+
+
+def test_symlink_alias_vers_secret_bloque(tmp_path):
+    (tmp_path / ".env").write_text(SECRET)
+    if not _symlink(".env", str(tmp_path / "notes.txt")):
+        pytest.skip("symlinks non supportes sur cette plateforme")
+    # lecture de l'alias -> bloquee (cible reelle sensible)
+    assert team._target_file(str(tmp_path), "notes.txt") is None
+    # et l'alias n'est meme pas liste
+    assert "notes.txt" not in team._list_target_files(str(tmp_path))
 
 
 # ── Critere B : le listing du depot cible exclut les fichiers sensibles ───────
