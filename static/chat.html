@@ -54,10 +54,33 @@ async function loadHistory() {
   } catch(e) {}
 }
 
+function appendFormattedText(container, text) {
+  const lines = String(text ?? '').split('\n');
+  lines.forEach((line, lineIndex) => {
+    if (lineIndex > 0) container.appendChild(document.createElement('br'));
+    const parts = line.split(/(\*\*.*?\*\*)/g);
+    parts.forEach(part => {
+      if (!part) return;
+      if (part.startsWith('**') && part.endsWith('**') && part.length >= 4) {
+        const strong = document.createElement('strong');
+        strong.textContent = part.slice(2, -2);
+        container.appendChild(strong);
+      } else {
+        container.appendChild(document.createTextNode(part));
+      }
+    });
+  });
+}
+
+function setMessageContent(element, text) {
+  element.textContent = '';
+  appendFormattedText(element, text);
+}
+
 function addMessage(role, content, cls='') {
   const div = document.createElement('div');
   div.className = `msg ${cls || role}`;
-  div.innerHTML = content.replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+  setMessageContent(div, content);
   messagesEl.appendChild(div);
   return div;
 }
@@ -111,7 +134,7 @@ async function sendMessage() {
             typing.remove();
             if (!assistantDiv) assistantDiv = addMessage('assistant', '');
             assistantText += evt.content || evt.text || '';
-            assistantDiv.innerHTML = assistantText.replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            setMessageContent(assistantDiv, assistantText);
             scrollBottom();
           } else if (evt.type === 'tool_start' || evt.type === 'tool_executing') {
             const toolName = evt.tool || evt.tool_name || 'outil';
@@ -127,15 +150,20 @@ async function sendMessage() {
             const cd = document.createElement('div');
             cd.className = 'msg confirm';
             const description = evt.description || `${evt.tool || evt.tool_name || 'outil'}(${JSON.stringify(evt.input || {}).substring(0,100)})`;
-            cd.innerHTML = `<strong>Action requise</strong><br>${description}<br>`;
+            const title = document.createElement('strong');
+            title.textContent = 'Action requise';
+            cd.appendChild(title);
+            cd.appendChild(document.createElement('br'));
+            cd.appendChild(document.createTextNode(description));
+            cd.appendChild(document.createElement('br'));
             const btns = document.createElement('div');
             btns.className = 'confirm-buttons';
             const yes = document.createElement('button');
             yes.className = 'btn-yes'; yes.textContent = '✓ Confirmer';
-            yes.onclick = () => { cd.innerHTML = '✅ Action confirmée (simulation)'; };
+            yes.onclick = () => { cd.textContent = '✅ Action confirmée (simulation)'; };
             const no = document.createElement('button');
             no.className = 'btn-no'; no.textContent = '✗ Annuler';
-            no.onclick = () => { cd.innerHTML = '❌ Action annulée'; };
+            no.onclick = () => { cd.textContent = '❌ Action annulée'; };
             btns.appendChild(yes); btns.appendChild(no);
             cd.appendChild(btns);
             messagesEl.appendChild(cd);
