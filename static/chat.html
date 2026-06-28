@@ -45,6 +45,19 @@ const messagesEl = document.getElementById('messages');
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 
+// Echappe le HTML avant toute insertion via innerHTML (anti-XSS). Le contenu
+// (message utilisateur OU sortie du modele) ne doit jamais etre interprete.
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+// Rendu "riche" mais sur : on echappe d'abord, puis on n'applique que des
+// transformations contraintes (sauts de ligne, **gras**) sur le texte echappe.
+function renderInline(s){
+  return esc(s).replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+}
+
 async function loadHistory() {
   try {
     const r = await fetch('/api/chat/history');
@@ -57,7 +70,7 @@ async function loadHistory() {
 function addMessage(role, content, cls='') {
   const div = document.createElement('div');
   div.className = `msg ${cls || role}`;
-  div.innerHTML = content.replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+  div.innerHTML = renderInline(content);
   messagesEl.appendChild(div);
   return div;
 }
@@ -111,7 +124,7 @@ async function sendMessage() {
             typing.remove();
             if (!assistantDiv) assistantDiv = addMessage('assistant', '');
             assistantText += evt.content;
-            assistantDiv.innerHTML = assistantText.replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            assistantDiv.innerHTML = renderInline(assistantText);
             scrollBottom();
           } else if (evt.type === 'tool_start') {
             typing.textContent = `Utilisation de l'outil: ${evt.tool}...`;
@@ -124,7 +137,7 @@ async function sendMessage() {
           } else if (evt.type === 'confirm') {
             const cd = document.createElement('div');
             cd.className = 'msg confirm';
-            cd.innerHTML = `<strong>Action requise</strong><br>${evt.tool}(${JSON.stringify(evt.input).substring(0,100)})<br>`;
+            cd.innerHTML = '<strong>Action requise</strong><br>' + esc(evt.tool) + '(' + esc(JSON.stringify(evt.input).substring(0,100)) + ')<br>';
             const btns = document.createElement('div');
             btns.className = 'confirm-buttons';
             const yes = document.createElement('button');

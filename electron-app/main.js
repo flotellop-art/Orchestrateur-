@@ -56,7 +56,6 @@ function buildMenu(){
     {label:'Vue',submenu:[{role:'reload',accelerator:'CmdOrCtrl+R'},{role:'zoomIn'},{role:'zoomOut'},{role:'resetZoom'},{type:'separator'},{role:'togglefullscreen',accelerator:'F11'},{type:'separator'},{role:'toggleDevTools',accelerator:'F12'}]},
     {label:'Navigation',submenu:[
       {label:'Tableau de bord',accelerator:'CmdOrCtrl+1',click:()=>win&&win.loadURL(BASE)},
-      {label:'Chat',accelerator:'CmdOrCtrl+2',click:()=>win&&win.loadURL(BASE+'/chat')},
       {type:'separator'},
       {label:'Ouvrir dans navigateur',click:()=>security.safeOpenExternal(BASE)}
     ]},
@@ -85,7 +84,6 @@ function createTray(){
       {label:TITLE,enabled:false},{type:'separator'},
       {label:'Afficher',click:()=>show()},
       {label:'Tableau de bord',click:()=>{show();win&&win.webContents.session.clearCache().then(()=>win.loadURL(BASE));}},
-      {label:'Chat',click:()=>{show();win&&win.loadURL(BASE+'/chat');}},
       {type:'separator'},{label:'Quitter',click:()=>quit()}
     ]));
     tray.on('double-click',()=>show());
