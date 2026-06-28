@@ -34,6 +34,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 DEFAULT_HOST = "127.0.0.1"
 PUBLIC_BIND_HOSTS = {"0.0.0.0", "::"}
 ALLOWED_GENERATED_FILES = frozenset({"app.py", "requirements.txt"})
+BLOCKED_REQUIREMENT_PREFIXES = ("git+", "http://", "https://", "-e", "--extra-index-url")
 DB_PATH  = Path(__file__).parent / "apps.db"
 STATIC   = Path(__file__).parent / "static"
 PROJECTS = Path(__file__).parent / "projects"
@@ -217,6 +218,33 @@ def collect_safe_generated_files(target: Path, files: list[dict]) -> list[tuple[
         destination = resolve_generated_file_path(target, filename)
         safe_files.append((filename, destination, generated.get("content", "")))
     return safe_files
+
+
+def validate_requirements_content(content: str) -> None:
+    """N'autorise que la dependance Flask dans requirements.txt."""
+    for line_number, raw_line in enumerate(content.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        lower = line.lower()
+        is_local_path = (
+            lower.startswith(("./", "../", "/", "~"))
+            or re.match(r"^[a-z]:[\\/]", lower) is not None
+        )
+        is_blocked_source = (
+            lower.startswith(BLOCKED_REQUIREMENT_PREFIXES)
+            or "://" in lower
+        )
+        if is_blocked_source or is_local_path or lower != "flask":
+            raise ValueError(
+                "ligne {} non autorisee dans requirements.txt: {!r}. "
+                "Seule la ligne 'flask' est acceptee.".format(line_number, raw_line)
+            )
+
+
+def validate_requirements_file(path: Path) -> None:
+    validate_requirements_content(path.read_text(encoding="utf-8"))
 
 def repair_json(s):
     """
@@ -413,6 +441,14 @@ async def creation_pipeline(app_id, description, folder, port):
     # Etape 4 : Installation des dependances
     req = target / "requirements.txt"
     if req.exists():
+        try:
+            validate_requirements_file(req)
+        except ValueError as e:
+            msg = "requirements.txt refuse : " + str(e)
+            await db_update(app_id, status="failed", error=msg)
+            yield evt("error", msg)
+            return
+
         yield evt("step", "Installation des composants...")
         try:
             proc = await asyncio.create_subprocess_exec(
