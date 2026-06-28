@@ -615,8 +615,27 @@ _TARGET_IGNORE = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pyte
                   "dist", "build", ".next", ".cache"}
 
 
+def _target_file_resolves_to_sensitive(target_path: str, rel: str) -> bool:
+    """True si le chemin demande OU sa cible resolue pointe vers un fichier sensible.
+
+    Couvre les alias/symlinks du depot cible (ex: README_LINK -> .env) : le modele
+    compromis ne doit pas contourner le filtre en lisant un autre nom de fichier.
+    """
+    if is_sensitive_target_path(rel):
+        return True
+    if not target_path:
+        return False
+    try:
+        base = Path(target_path).resolve()
+        p = (base / (rel or "")).resolve()
+        resolved_rel = str(p.relative_to(base))
+    except Exception:
+        return False
+    return is_sensitive_target_path(resolved_rel)
+
+
 def _target_file(target_path: str, rel: str):
-    """Resolution sure d'un fichier DANS le depot cible (lecture seule). None si hors/inexistant."""
+    """Resolution sure d'un fichier DANS le depot cible (lecture seule). None si hors/inexistant/sensible."""
     if not target_path:
         return None
     base = Path(target_path).resolve()
@@ -626,19 +645,30 @@ def _target_file(target_path: str, rel: str):
         return None
     if p != base and base not in p.parents:
         return None
+    if _target_file_resolves_to_sensitive(target_path, rel):
+        return None
     return p if p.is_file() else None
 
 
 def _list_target_files(target_path: str) -> list[str]:
-    base = Path(target_path) if target_path else None
+    base = Path(target_path).resolve() if target_path else None
     if not base or not base.exists():
         return []
     out = []
     for p in sorted(base.rglob("*")):
         rel = p.relative_to(base)
-        if p.is_file() and not any(part in _TARGET_IGNORE for part in rel.parts) \
-                and not is_sensitive_target_path(str(rel)):
-            out.append(str(rel))
+        if not p.is_file() or any(part in _TARGET_IGNORE for part in rel.parts):
+            continue
+        if is_sensitive_target_path(str(rel)):
+            continue
+        try:
+            resolved_rel = str(p.resolve().relative_to(base))
+        except Exception:
+            # Symlink hors depot : ne pas l'exposer dans la vue virtuelle.
+            continue
+        if is_sensitive_target_path(resolved_rel):
+            continue
+        out.append(str(rel))
         if len(out) >= 400:
             break
     return out
@@ -988,7 +1018,7 @@ async def execute_tool(task_id: int, folder: str, web_enabled: bool, act: dict,
             t = await db_get_task(task_id)
             if t and t.get("company_mode") and t.get("target_path"):
                 # Defense 1 : fichiers sensibles ni lisibles ni listes (.env, *.key...).
-                if is_sensitive_target_path(rel):
+                if _target_file_resolves_to_sensitive(t["target_path"], rel):
                     return ("Acces refuse : '" + str(rel) + "' est un fichier sensible "
                             "(secret/credential) du depot cible, non lisible.")
                 tp = _target_file(t["target_path"], rel)
@@ -2390,7 +2420,7 @@ async def task_file(task_id: int, path: str = Query(...)):
         return {"path": path, "content": p.read_text(encoding="utf-8", errors="replace")[:50000]}
     # Fallback lecture seule sur le depot cible (mode entreprise).
     if t.get("company_mode") and t.get("target_path"):
-        if is_sensitive_target_path(path):
+        if _target_file_resolves_to_sensitive(t["target_path"], path):
             raise HTTPException(403, "Fichier sensible du depot cible : acces refuse")
         tp = _target_file(t["target_path"], path)
         if tp:
