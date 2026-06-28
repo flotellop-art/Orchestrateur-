@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shlex
+from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -242,6 +244,23 @@ async def safe_run_command(
     tokens = _validate_command_string(cmd)  # leve CommandForbiddenError si invalide
 
     log.info("[SANDBOX] Execution autorisee : %s (cwd=%s)", tokens, cwd)
+
+    # Sous Windows, "ls" est souvent un alias PowerShell et pas un executable.
+    # On le garde disponible sans shell en fournissant une implementation
+    # interne strictement en lecture seule.
+    exe_base = tokens[0].lower().split('/')[-1].split('\\')[-1]
+    if exe_base.endswith('.exe'):
+        exe_base = exe_base[:-4]
+    if os.name == "nt" and exe_base == "ls" and len(tokens) == 1:
+        directory = Path(cwd or os.getcwd())
+        try:
+            entries = sorted(
+                child.name + ("/" if child.is_dir() else "")
+                for child in directory.iterdir()
+            )
+            return 0, "\n".join(entries) + ("\n" if entries else ""), ""
+        except OSError as exc:
+            return 1, "", f"Impossible de lister le dossier : {exc}"
 
     try:
         proc = await asyncio.create_subprocess_exec(

@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import shutil
 import sys
 import uuid
@@ -34,6 +33,11 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import managed_agents  # pont vers les Agents geres Anthropic (delegation depuis le chef)
+from patches.security.sandbox_commands import (
+    CommandForbiddenError,
+    get_safe_command_whitelist,
+    safe_run_command,
+)
 
 load_dotenv(Path(__file__).parent / ".env", override=False)
 log = logging.getLogger(__name__)
@@ -87,11 +91,7 @@ COMPANY_MAX_AGENTS = 24
 COMPANY_MAX_ITER = 300
 COMPANY_WORKER_STEPS = 40
 
-COMMAND_WHITELIST = {
-    "python", "python3", "pip", "pip3", "pytest",
-    "ls", "cat", "echo", "pwd", "head", "tail", "wc",
-    "node", "npm",
-}
+COMMAND_WHITELIST = get_safe_command_whitelist()
 # Outils strictement passifs -> executables en parallele (#15).
 # mcp_call exclu : certains serveurs MCP mutent l'etat (filesystem, memory...).
 PARALLEL_SAFE_TOOLS = {"web_search", "read_file", "search_knowledge"}
@@ -698,30 +698,16 @@ async def _clone_repo(url, token=None):
 
 async def _run_cmd(folder: str, cmd: str, timeout: int = 60) -> str:
     try:
-        parts = shlex.split(cmd or "")
-    except ValueError:
-        return "Commande invalide (guillemets non fermes)."
-    if not parts:
-        return "Commande vide."
-    if parts[0] not in COMMAND_WHITELIST:
-        return "Commande refusee (hors liste blanche): " + parts[0]
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *parts, cwd=folder,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return (out.decode("utf-8", errors="replace") or "(vide)")[:2500]
-    except asyncio.TimeoutError:
-        if proc:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        return "TIMEOUT apres " + str(timeout) + "s."
-    except FileNotFoundError:
-        return "Programme introuvable: " + parts[0]
+        rc, out, err = await safe_run_command(cmd or "", cwd=folder, timeout=timeout)
+    except CommandForbiddenError as e:
+        return "Commande refusee: " + str(e)
+
+    output = (out or "") + (("\n" + err) if err else "")
+    if not output.strip():
+        output = "(vide)"
+    if rc != 0:
+        output = "Code retour {}. ".format(rc) + output
+    return output[:2500]
 
 
 async def _run_pytest(folder: str, timeout: int = 120) -> str:
