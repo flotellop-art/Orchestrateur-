@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 import team
 import api_control
 import managed_agents  # pont vers les Agents geres Anthropic
+import chat_agent
 from auth_middleware import add_auth_middleware
 from patches.security.cors_config import add_cors_middleware
 
@@ -522,6 +523,7 @@ add_auth_middleware(app)
 # servie en meme origine, cela n'affecte pas son fonctionnement.
 add_cors_middleware(app)
 app.include_router(team.router)
+app.include_router(chat_agent.router)
 # Centre de controle : endpoints d'agregation/monitoring/SSE (chemins nouveaux).
 # Inclus APRES team.router : pour GET /api/tasks, la route de team (liste) reste
 # prioritaire ; control.html sait lire ce format.
