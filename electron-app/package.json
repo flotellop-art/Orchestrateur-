@@ -31,9 +31,7 @@
           "chat_agent.py",
           "run.py",
           "requirements_orchestrator.txt",
-          ".env",
-          "static/**",
-          "*.db"
+          "static/**"
         ]
       }
     ],
