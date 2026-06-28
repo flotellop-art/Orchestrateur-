@@ -33,6 +33,7 @@ load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 DEFAULT_HOST = "127.0.0.1"
 PUBLIC_BIND_HOSTS = {"0.0.0.0", "::"}
+ALLOWED_GENERATED_FILES = frozenset({"app.py", "requirements.txt"})
 DB_PATH  = Path(__file__).parent / "apps.db"
 STATIC   = Path(__file__).parent / "static"
 PROJECTS = Path(__file__).parent / "projects"
@@ -188,6 +189,34 @@ def verify_python_syntax(code):
             os.unlink(tmp)
         except Exception:
             pass
+
+
+def resolve_generated_file_path(target: Path, filename: str) -> Path:
+    """Valide et resout un fichier genere sans sortie du dossier cible."""
+    if not isinstance(filename, str) or filename not in ALLOWED_GENERATED_FILES:
+        raise ValueError(
+            "Nom de fichier genere non autorise: {!r}. Fichiers autorises: {}".format(
+                filename, ", ".join(sorted(ALLOWED_GENERATED_FILES))
+            )
+        )
+
+    base = target.resolve()
+    destination = (base / filename).resolve()
+    try:
+        destination.relative_to(base)
+    except ValueError as exc:
+        raise ValueError("Chemin genere hors du dossier cible: {!r}".format(filename)) from exc
+    return destination
+
+
+def collect_safe_generated_files(target: Path, files: list[dict]) -> list[tuple[str, Path, str]]:
+    """Valide tous les fichiers avant la moindre ecriture sur disque."""
+    safe_files = []
+    for generated in files:
+        filename = generated.get("filename")
+        destination = resolve_generated_file_path(target, filename)
+        safe_files.append((filename, destination, generated.get("content", "")))
+    return safe_files
 
 def repair_json(s):
     """
@@ -367,11 +396,18 @@ async def creation_pipeline(app_id, description, folder, port):
     yield evt("step", "Sauvegarde des fichiers...")
     target = Path(folder)
     target.mkdir(parents=True, exist_ok=True)
+    try:
+        generated_files = collect_safe_generated_files(target, app_data.get("files", []))
+    except ValueError as e:
+        msg = "Fichier genere refuse : " + str(e)
+        await db_update(app_id, status="failed", error=msg)
+        yield evt("error", msg)
+        return
+
     files_written = []
-    for f in app_data.get("files", []):
-        fp = target / f["filename"]
-        fp.write_text(f["content"], encoding="utf-8")
-        files_written.append(f["filename"])
+    for filename, fp, content in generated_files:
+        fp.write_text(content, encoding="utf-8")
+        files_written.append(filename)
     yield evt("files", "Fichiers : " + ", ".join(files_written), files=files_written)
 
     # Etape 4 : Installation des dependances
