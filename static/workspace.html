@@ -97,6 +97,14 @@ textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
 .msg ul { margin: 6px 0 0 18px; font-size: .85rem; line-height: 1.5; }
 .msg.user { border-left: 4px solid var(--purple); background: #f3effa; }
 .msg.user .who { color: var(--purple); }
+.permission-area { margin-bottom: 12px; }
+.permission-card { background: #fff8e8; border: 2px solid #e6a23c; border-radius: 10px;
+  padding: 13px 14px; margin-bottom: 10px; box-shadow: var(--sh); }
+.permission-title { font-weight: 800; color: #8a4b08; margin-bottom: 5px; }
+.permission-meta { font-size: .82rem; color: var(--grey); line-height: 1.45; }
+.permission-reason { margin-top: 7px; white-space: pre-wrap; word-break: break-word; }
+.permission-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+.permission-actions button:disabled { opacity: .55; cursor: wait; }
 .chat-bar { position: sticky; bottom: 0; display: flex; gap: 7px; background: var(--bg);
   padding: 10px 0; border-top: 1px solid var(--border); margin-top: 10px; }
 .chat-bar input { flex: 1; }
@@ -172,7 +180,20 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
         <label for="max-cost">Budget max ($, 0 = illimite)</label>
         <input type="number" id="max-cost" value="0" min="0" step="0.5">
       </div>
+      <div>
+        <label for="install-policy">Droit d'installation</label>
+        <select id="install-policy">
+          <option value="blocked">Aucune installation</option>
+          <option value="ask" selected>Demander avant chaque dépendance</option>
+          <option value="project">Dépendances du projet automatiques</option>
+          <option value="user">Projet automatique + applications du compte sur accord</option>
+          <option value="admin">Projet automatique + ordinateur entier sur accord</option>
+        </select>
+      </div>
     </div>
+    <p class="muted">Le serveur calcule toujours le niveau réel. Chaque modification du compte ou de
+      l'ordinateur demande un nouvel accord. Une dépendance reste du code exécuté avec vos droits :
+      elle n'est pas encore isolée dans un conteneur.</p>
 
     <div class="checkbox-row">
       <input type="checkbox" id="web-enabled" checked>
@@ -237,6 +258,7 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
       <button class="btn btn-ghost btn-small" onclick="runBuild()">Build &amp; Test</button>
       <button class="btn btn-ghost btn-small" onclick="newTask()">Nouvel objectif</button>
     </div>
+    <div id="permission-area" class="permission-area" aria-live="assertive"></div>
     <div id="result-area"></div>
     <div id="launch-area"></div>
     <div id="build-area"></div>
@@ -305,12 +327,18 @@ if ('serviceWorker' in navigator) {
 }
 var taskId = null;
 var evtSource = null;
+var evtReconnectTimer = null;
 var seedCount = 0;
 var teamNames = {};
 var designImageData = null;   // data URL de la maquette (#17)
 var currentFile = null;       // fichier ouvert dans l'editeur (#13)
 var graphAgents = [];         // noms d'agents pour le graphe (#11)
 var activeAgent = null;
+var currentTaskStatus = null;
+var resolvedPermissionIds = {};
+
+function activeTaskStorageKey() { return 'ORCH_ACTIVE_TASK_ID'; }
+function eventCursorStorageKey(id) { return 'ORCH_TASK_' + String(id) + '_LAST_EVENT'; }
 
 // ── Mode Entreprise Tech ────────────────────────────────────────────────────────
 function toggleCompany() {
@@ -401,6 +429,7 @@ async function launch() {
     max_iterations: parseInt(document.getElementById('max-iter').value) || 15,
     max_agents: parseInt(document.getElementById('max-agents').value) || 4,
     max_cost_usd: parseFloat(document.getElementById('max-cost').value) || 0,
+    install_policy: document.getElementById('install-policy').value,
     image: designImageData,
     company_mode: company,
     target_path: company ? (targetPath || null) : null,
@@ -416,6 +445,7 @@ async function launch() {
     if (!r.ok) { throw new Error((await r.json()).detail || 'Erreur'); }
     var d = await r.json();
     taskId = d.id;
+    try { sessionStorage.setItem(activeTaskStorageKey(), String(taskId)); } catch (_) {}
     await fetch('/api/tasks/' + taskId + '/start', {method: 'POST'});
     startLive();
   } catch(e) {
@@ -434,6 +464,7 @@ function startLive() {
   document.getElementById('result-area').innerHTML = '';
   document.getElementById('launch-area').innerHTML = '';
   document.getElementById('build-area').innerHTML = '';
+  document.getElementById('permission-area').innerHTML = '';
   document.getElementById('chat-input').value = '';
   document.getElementById('file-edit').style.display = 'none';
   document.getElementById('editor-bar').style.display = 'none';
@@ -441,9 +472,11 @@ function startLive() {
   teamNames = {};
   graphAgents = [];
   activeAgent = null;
+  resolvedPermissionIds = {};
   currentFile = null;
   setStatus('running');
   connectStream();
+  loadPendingPermissions();
   refreshFiles();
   showCompanyInfo();
 }
@@ -470,14 +503,29 @@ document.addEventListener('keydown', function(e) {
 });
 
 function connectStream() {
+  if (evtReconnectTimer) { clearTimeout(evtReconnectTimer); evtReconnectTimer = null; }
   if (evtSource) evtSource.close();
-  evtSource = new SecureEventSource('/api/tasks/' + taskId + '/stream');
+  var cursor = '0';
+  try { cursor = sessionStorage.getItem(eventCursorStorageKey(taskId)) || '0'; } catch (_) {}
+  if (!/^\d+$/.test(cursor)) cursor = '0';
+  evtSource = new SecureEventSource('/api/tasks/' + taskId + '/stream?after_id=' + encodeURIComponent(cursor));
   evtSource.onmessage = function(e) {
     var ev;
     try { ev = JSON.parse(e.data); } catch(_) { return; }
+    if (ev.id) {
+      try { sessionStorage.setItem(eventCursorStorageKey(taskId), String(ev.id)); } catch (_) {}
+    }
     handleEvent(ev);
   };
-  evtSource.onerror = function() { /* le navigateur retente automatiquement */ };
+  evtSource.onerror = function() {
+    var failedSource = evtSource;
+    failedSource.close();
+    if (evtReconnectTimer) return;
+    evtReconnectTimer = setTimeout(function() {
+      evtReconnectTimer = null;
+      if (taskId && evtSource === failedSource) connectStream();
+    }, 1000);
+  };
 }
 
 function feedAdd(html) {
@@ -523,6 +571,16 @@ function handleEvent(ev) {
       feedAdd('<div class="msg tool"><details><summary>' + esc(ev.tool)
         + ' : resultat</summary><pre>' + esc(ev.output) + '</pre></details></div>');
       break;
+    case 'permission_requested':
+      renderPermissionRequest(ev);
+      break;
+    case 'permission_resolved':
+      resolvePermissionRequest(ev.request_id, ev.decision || ev.status || 'resolved');
+      break;
+    case 'installation_result':
+      resolvePermissionRequest(ev.request_id, ev.ok ? 'Installation terminée' : 'Installation échouée');
+      feedAdd('<div class="msg ' + (ev.ok ? 'sys' : 'err') + '">' + esc(ev.message || '') + '</div>');
+      break;
     case 'challenge_round':
       feedAdd('<div class="msg turn" style="background:var(--purple)">Challenge &mdash; round '
         + ev.round + '/' + ev.total + '</div>');
@@ -553,21 +611,139 @@ function handleEvent(ev) {
       break;
     case 'paused': setStatus('paused'); break;
     case 'resumed': setStatus('running'); break;
-    case 'stopped': setStatus('stopped'); break;
+    case 'stopped':
+      document.getElementById('permission-area').innerHTML = '';
+      setStatus('stopped');
+      break;
     case 'done':
       document.getElementById('result-area').innerHTML =
         '<div class="result-box"><h4>Objectif termine</h4><div>' + esc(ev.summary) + '</div></div>';
       setStatus('done');
+      document.getElementById('permission-area').innerHTML = '';
       break;
     case 'error':
       feedAdd('<div class="msg err">Erreur : ' + esc(ev.msg) + '</div>');
+      document.getElementById('permission-area').innerHTML = '';
       setStatus('failed');
       break;
     case 'end':
       if (evtSource) evtSource.close();
+      document.getElementById('permission-area').innerHTML = '';
       if (ev.status && ev.status !== 'done') setStatus(ev.status);
       break;
   }
+}
+
+function installAccessLabel(level) {
+  return ({project:'Dans ce projet', user:'Pour votre compte', admin:'Ordinateur / administrateur'})[level]
+    || String(level || 'Installation');
+}
+
+function renderPermissionRequest(req) {
+  if (!req || !req.request_id || !taskId) return;
+  if (resolvedPermissionIds[req.request_id]) return;
+  var area = document.getElementById('permission-area');
+  var cardId = 'permission-' + String(req.request_id).replace(/[^A-Za-z0-9_-]/g, '');
+  if (document.getElementById(cardId)) return;
+
+  var card = document.createElement('div');
+  card.className = 'permission-card';
+  card.id = cardId;
+
+  var title = document.createElement('div');
+  title.className = 'permission-title';
+  title.textContent = 'Demande d’installation — ' + installAccessLabel(req.access_level);
+  card.appendChild(title);
+
+  var meta = document.createElement('div');
+  meta.className = 'permission-meta';
+  meta.textContent = String(req.agent || 'Agent') + ' demande ' + String(req.package || '')
+    + ' ' + String(req.version || '') + ' depuis ' + String(req.source || req.manager || 'source officielle')
+    + '. Destination : ' + String(req.destination || 'définie par le serveur') + '.';
+  card.appendChild(meta);
+
+  var reason = document.createElement('div');
+  reason.className = 'permission-reason';
+  reason.textContent = 'Pourquoi l’agent le demande : ' + String(req.reason || 'Aucune raison fournie.');
+  card.appendChild(reason);
+
+  if (req.risk_reason) {
+    var risk = document.createElement('div');
+    risk.className = 'permission-meta';
+    risk.textContent = 'Ce que cela autorise : ' + String(req.risk_reason);
+    card.appendChild(risk);
+  }
+
+  if (req.command_preview) {
+    var details = document.createElement('details');
+    var summary = document.createElement('summary');
+    summary.textContent = 'Détails';
+    var preview = document.createElement('div');
+    preview.className = 'permission-meta';
+    preview.textContent = Array.isArray(req.command_preview)
+      ? req.command_preview.join(' ') : String(req.command_preview);
+    details.appendChild(summary); details.appendChild(preview); card.appendChild(details);
+  }
+
+  var actions = document.createElement('div');
+  actions.className = 'permission-actions';
+  function button(label, decision, primary) {
+    var b = document.createElement('button');
+    b.className = 'btn ' + (primary ? 'btn-primary' : 'btn-ghost') + ' btn-small';
+    b.textContent = label;
+    b.onclick = function() { decidePermission(req.request_id, decision, card); };
+    actions.appendChild(b);
+  }
+  button('Autoriser une fois', 'allow_once', true);
+  button('Refuser', 'deny', false);
+  card.appendChild(actions);
+  area.appendChild(card);
+}
+
+async function decidePermission(requestId, decision, card) {
+  var buttons = card.querySelectorAll('button');
+  buttons.forEach(function(button) { button.disabled = true; });
+  try {
+    var response = await fetch('/api/tasks/' + taskId + '/install-requests/'
+      + encodeURIComponent(requestId) + '/decision', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({decision: decision})
+      });
+    if (!response.ok) {
+      var detail = (await response.json()).detail || 'Décision refusée';
+      if (response.status === 409 || response.status === 410) {
+        resolvePermissionRequest(requestId, detail);
+        await loadPendingPermissions();
+        return;
+      }
+      throw new Error(detail);
+    }
+    resolvePermissionRequest(requestId, decision === 'deny' ? 'Refusée' : 'Autorisée');
+  } catch (error) {
+    buttons.forEach(function(button) { button.disabled = false; });
+    feedAdd('<div class="msg err">Décision impossible : ' + esc(error.message) + '</div>');
+  }
+}
+
+function resolvePermissionRequest(requestId, label) {
+  resolvedPermissionIds[requestId] = true;
+  var cardId = 'permission-' + String(requestId || '').replace(/[^A-Za-z0-9_-]/g, '');
+  var card = document.getElementById(cardId);
+  if (!card) return;
+  card.querySelectorAll('button').forEach(function(button) { button.disabled = true; });
+  var title = card.querySelector('.permission-title');
+  if (title) title.textContent = String(label || 'Demande traitée');
+  setTimeout(function() { if (card.parentNode) card.parentNode.removeChild(card); }, 1800);
+}
+
+async function loadPendingPermissions() {
+  if (!taskId) return;
+  try {
+    var response = await fetch('/api/tasks/' + taskId + '/install-requests?status=pending');
+    if (!response.ok) return;
+    var data = await response.json();
+    (data.requests || []).forEach(renderPermissionRequest);
+  } catch (_) {}
 }
 
 function addTeamCard(name, role, model) {
@@ -585,6 +761,7 @@ function addTeamCard(name, role, model) {
 }
 
 function setStatus(s) {
+  currentTaskStatus = s;
   var labels = {running:'En cours', paused:'En pause', stopped:'Arrete', done:'Termine', failed:'Echec'};
   var b = document.getElementById('status-badge');
   b.style.display = '';
@@ -840,21 +1017,32 @@ async function newTaskFromMessage() {
   if (!t) return;
   inp.value = '';
   var chefSel = document.getElementById('chef-model');
+  if (taskId && (currentTaskStatus === 'running' || currentTaskStatus === 'paused')) {
+    try { await fetch('/api/tasks/' + taskId + '/stop', {method: 'POST'}); } catch (_) {}
+  }
   var body = {
     objective: t, chef_model: chefSel ? chefSel.value : 'claude-opus-4-8',
-    web_enabled: true, max_iterations: 15, max_agents: 4
+    web_enabled: true, max_iterations: 15, max_agents: 4,
+    install_policy: document.getElementById('install-policy').value
   };
   var d = await (await fetch('/api/tasks', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
   })).json();
   taskId = d.id;
+  try { sessionStorage.setItem(activeTaskStorageKey(), String(taskId)); } catch (_) {}
   await fetch('/api/tasks/' + taskId + '/start', {method: 'POST'});
   startLive();
 }
 
-function newTask() {
+async function newTask() {
+  if (taskId && (currentTaskStatus === 'running' || currentTaskStatus === 'paused')) {
+    try { await fetch('/api/tasks/' + taskId + '/stop', {method: 'POST'}); } catch (_) {}
+  }
   if (evtSource) evtSource.close();
+  if (evtReconnectTimer) { clearTimeout(evtReconnectTimer); evtReconnectTimer = null; }
+  try { sessionStorage.removeItem(activeTaskStorageKey()); } catch (_) {}
   taskId = null;
+  currentTaskStatus = null;
   designImageData = null;
   var di = document.getElementById('design-image'); if (di) di.value = '';
   var dp = document.getElementById('design-preview'); if (dp) dp.innerHTML = '';
@@ -868,6 +1056,24 @@ function newTask() {
   var cm = document.getElementById('company-mode');
   if (cm) { cm.checked = false; toggleCompany(); }
 }
+
+async function restoreActiveTask() {
+  var stored = null;
+  try { stored = sessionStorage.getItem(activeTaskStorageKey()); } catch (_) {}
+  if (!stored || !/^\d+$/.test(stored)) return;
+  try {
+    var response = await fetch('/api/tasks/' + stored);
+    if (!response.ok) throw new Error('introuvable');
+    var task = await response.json();
+    taskId = parseInt(stored, 10);
+    startLive();
+    setStatus(task.status || 'running');
+  } catch (_) {
+    try { sessionStorage.removeItem(activeTaskStorageKey()); } catch (_) {}
+  }
+}
+
+restoreActiveTask();
 </script>
 </body>
 </html>

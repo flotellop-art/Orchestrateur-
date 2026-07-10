@@ -41,6 +41,22 @@ dépôt ou d'une consigne non fiable. L'étape de durcissement suivante doit lan
 chaque projet dans un conteneur ou un compte restreint, avec un dossier monté,
 le réseau coupé par défaut et des limites de mémoire, CPU et durée.
 
+## Installations demandées par les agents
+
+Dans l'espace de travail multi-agents, les installations passent par une
+demande structurée. La politique choisie pour la tâche distingue les
+dépendances du projet, les applications du compte courant et les modifications
+de tout l'ordinateur. Les deux derniers niveaux demandent un accord visible à
+chaque fois. Aucun accord manuel n'est mémorisé. Les demandes expirent et sont
+annulées à l'arrêt de la tâche.
+
+Ce contrôle est une règle de consentement, pas encore une isolation du système
+d'exploitation. Tant que le code des agents ne tourne pas dans un conteneur ou
+sous un compte restreint, un programme généré peut tenter de contourner le
+courtier, appeler lui-même l'API locale ou modifier la base. Le détail du
+fonctionnement et de cette limite se trouve dans
+[`docs/INSTALL_PERMISSIONS.md`](docs/INSTALL_PERMISSIONS.md).
+
 ## Critères de contrôle
 
 - une requête distante sans clé reçoit un refus ;
@@ -50,3 +66,7 @@ le réseau coupé par défaut et des limites de mémoire, CPU et durée.
 - une dépendance générée autre que Flask est rejetée ;
 - un chemin local hors des racines déclarées est rejeté ;
 - les processus enfants ne reçoivent pas les clés et jetons du serveur.
+- les formes directes usuelles de pip ou npm sont réorientées vers le courtier ;
+- une demande expirée, rejouée ou liée à une autre tâche est refusée ;
+- aucun accord manuel ne peut être mémorisé ;
+- le build ne lance pas d'installation issue de `requirements.txt`.

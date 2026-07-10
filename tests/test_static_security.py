@@ -39,6 +39,7 @@ class StaticSecurityRegressionTests(unittest.TestCase):
         self.assertNotIn('".env",', package)
         self.assertNotIn('"*.db"', package)
         self.assertIn('"security_policy.py"', package)
+        self.assertIn('"install_permissions.py"', package)
 
     def test_tunnel_launcher_requires_a_strong_key_and_remote_host(self):
         launcher = (ROOT / "start_tunnel.bat").read_text(encoding="utf-8")
@@ -49,6 +50,21 @@ class StaticSecurityRegressionTests(unittest.TestCase):
         team = (ROOT / "team.py").read_text(encoding="utf-8")
         self.assertNotIn('"https://" + token + "@"', team)
         self.assertIn('"GIT_CONFIG_VALUE_0"', team)
+
+    def test_workspace_has_real_tiered_install_decisions(self):
+        workspace = (ROOT / "static" / "workspace.html").read_text(encoding="utf-8")
+        self.assertIn('id="install-policy"', workspace)
+        for value in ("blocked", "ask", "project", "user", "admin"):
+            self.assertIn('value="' + value + '"', workspace)
+        self.assertIn("/install-requests/", workspace)
+        self.assertIn("allow_once", workspace)
+        self.assertNotIn("allow_task", workspace)
+        self.assertIn("textContent = 'Pourquoi", workspace)
+        self.assertIn("sessionStorage.setItem(activeTaskStorageKey()", workspace)
+        self.assertIn("install_policy: document.getElementById('install-policy').value", workspace)
+        self.assertIn("after_id=", workspace)
+        self.assertIn("failedSource.close()", workspace)
+        self.assertIn("if (taskId && evtSource === failedSource) connectStream()", workspace)
 
 
 if __name__ == "__main__":
