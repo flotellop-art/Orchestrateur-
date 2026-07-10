@@ -513,7 +513,8 @@ async def delete_app(app_id: int):
 
 @app.get("/")
 async def index():
-    content = (STATIC / "index.html").read_bytes()
+    # La page d'accueil est le centre de controle multi-agents (= /static/control.html).
+    content = (STATIC / "control.html").read_bytes()
     return Response(
         content=content,
         media_type="text/html",

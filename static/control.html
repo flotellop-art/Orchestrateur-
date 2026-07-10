@@ -7,8 +7,8 @@
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
-:root{--c-bg:#0f1117;--c-bg-elev:#1a1d27;--c-bg-elev-2:#222633;--c-border:#2a2f3d;--c-border-soft:#1f2330;--c-text:#e6e8ee;--c-text-mut:#8a93a6;--c-text-faint:#5a6175;--c-primary:#6366f1;--c-primary-h:#4f52d6;--c-primary-soft:rgba(99,102,241,.15);--c-accent:#e8825a;--c-success:#22c55e;--c-warning:#f59e0b;--c-danger:#ef4444;--c-info:#38bdf8;--c-claude:#a855f7;--c-gemini:#3b82f6;--c-openai:#10b981;--f-sans:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;--f-mono:ui-monospace,'JetBrains Mono',Consolas,monospace;--fs-xs:11px;--fs-sm:12px;--fs-md:14px;--fs-lg:16px;--fs-xl:20px;--fs-2xl:26px;--r-sm:6px;--r-md:8px;--r-lg:12px;--sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;--sp-6:24px;--sp-8:32px;--shadow-lg:0 8px 32px rgba(0,0,0,.35);--t-fast:.15s ease;--t:.2s ease;--sidebar-w:240px;--topbar-h:56px}
-[data-theme="light"]{--c-bg:#f6f7fb;--c-bg-elev:#fff;--c-bg-elev-2:#f1f3f9;--c-border:#e2e6ef;--c-border-soft:#eef0f6;--c-text:#171a23;--c-text-mut:#5a6275;--c-text-faint:#9099ad;--c-primary-soft:rgba(99,102,241,.12);--shadow-lg:0 8px 32px rgba(15,17,23,.12)}
+:root{--c-bg:#0f1117;--c-bg-elev:#1a1d27;--c-bg-elev-2:#222633;--c-border:#2a2f3d;--c-border-soft:#1f2330;--c-text:#e6e8ee;--c-text-mut:#8a93a6;--c-text-faint:#5a6175;--c-primary:#e8825a;--c-primary-h:#c96840;--c-primary-soft:rgba(232,130,90,.16);--c-accent:#e8825a;--c-success:#22c55e;--c-warning:#f59e0b;--c-danger:#ef4444;--c-info:#38bdf8;--c-claude:#a855f7;--c-gemini:#3b82f6;--c-openai:#10b981;--f-sans:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;--f-mono:ui-monospace,'JetBrains Mono',Consolas,monospace;--fs-xs:11px;--fs-sm:12px;--fs-md:14px;--fs-lg:16px;--fs-xl:20px;--fs-2xl:26px;--r-sm:6px;--r-md:8px;--r-lg:12px;--sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;--sp-6:24px;--sp-8:32px;--shadow-lg:0 8px 32px rgba(0,0,0,.35);--t-fast:.15s ease;--t:.2s ease;--sidebar-w:240px;--topbar-h:56px}
+[data-theme="light"]{--c-bg:#f6f7fb;--c-bg-elev:#fff;--c-bg-elev-2:#f1f3f9;--c-border:#e2e6ef;--c-border-soft:#eef0f6;--c-text:#171a23;--c-text-mut:#5a6275;--c-text-faint:#9099ad;--c-primary-soft:rgba(232,130,90,.12);--shadow-lg:0 8px 32px rgba(15,17,23,.12)}
 body{font-family:var(--f-sans);font-size:var(--fs-md);color:var(--c-text);background:var(--c-bg);-webkit-font-smoothing:antialiased;overflow:hidden}
 button,input,textarea,select{font:inherit;color:inherit}
 button{cursor:pointer;background:none;border:none}
@@ -100,7 +100,7 @@ main{grid-area:main;overflow-y:auto;padding:var(--sp-6);position:relative}
 .timeline-item.completed::before{background:var(--c-info);border-color:var(--c-info)}
 .agent-card{position:relative;background:var(--c-bg-elev);border:1px solid var(--c-border);border-radius:var(--r-lg);padding:var(--sp-4);transition:border-color var(--t),transform var(--t)}
 .agent-card:hover{border-color:var(--c-primary);transform:translateY(-2px)}
-.agent-card.active{border-color:rgba(99,102,241,.4)}
+.agent-card.active{border-color:rgba(232,130,90,.4)}
 .agent-head{display:flex;align-items:flex-start;gap:var(--sp-3);margin-bottom:var(--sp-3)}
 .agent-avatar{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;flex-shrink:0;background:var(--c-primary)}
 .agent-info{flex:1;min-width:0}
@@ -171,7 +171,6 @@ main{grid-area:main;overflow-y:auto;padding:var(--sp-6);position:relative}
    <a class="nav-item" href="#tasks" data-route="tasks"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>Tâches<span class="nav-badge" id="badge-tasks">0</span></a>
    <a class="nav-item" href="#chat" data-route="chat"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>Chat</a>
    <a class="nav-item" href="#monitoring" data-route="monitoring"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Monitoring</a>
-   <a class="nav-item" href="#apps" data-route="apps"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>Apps<span class="nav-badge" id="badge-apps">0</span></a>
    <div class="nav-section-title">Travail</div>
    <a class="nav-item" href="/workspace" title="Ouvre l'espace de travail multi-agents"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14L21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>Espace agents</a>
    <div class="nav-section-title">Système</div>
@@ -195,7 +194,6 @@ main{grid-area:main;overflow-y:auto;padding:var(--sp-6);position:relative}
    <div class="grid grid-kpi" style="margin-bottom:var(--sp-6)">
     <div class="card"><div class="kpi-icon">◉</div><div class="card-title">Agents actifs</div><div class="card-value" id="kpi-agents">—</div><div class="card-delta" id="kpi-agents-sub">total connectés</div></div>
     <div class="card"><div class="kpi-icon" style="background:rgba(34,197,94,.15);color:var(--c-success)">▶</div><div class="card-title">Tâches en cours</div><div class="card-value" id="kpi-tasks">—</div><div class="card-delta" id="kpi-tasks-sub">running</div></div>
-    <div class="card"><div class="kpi-icon" style="background:rgba(232,130,90,.15);color:var(--c-accent)">▤</div><div class="card-title">Apps créées</div><div class="card-value" id="kpi-apps">—</div><div class="card-delta" id="kpi-apps-sub">total</div></div>
     <div class="card"><div class="kpi-icon" style="background:rgba(245,158,11,.15);color:var(--c-warning)">$</div><div class="card-title">Tokens 24h</div><div class="card-value" id="kpi-tokens">—</div><div class="card-delta" id="kpi-tokens-sub">in/out cumulé</div></div>
    </div>
    <div class="grid grid-2" style="margin-bottom:var(--sp-6)">
@@ -274,11 +272,6 @@ main{grid-area:main;overflow-y:auto;padding:var(--sp-6);position:relative}
     <div class="card"><div class="card-title">Utilisation horaire</div><div class="activity-chart" id="mon-chart"></div><div class="chart-x-labels" id="mon-chart-labels"></div></div>
    </div>
    <div class="card" style="margin-top:var(--sp-4)"><div class="card-title">Erreurs récentes</div><div id="mon-errors"><div class="empty">Aucune erreur récente.</div></div></div>
-  </section>
-
-  <section class="panel" id="panel-apps" data-route="apps">
-   <div class="panel-header"><div><h1 class="panel-title">Apps</h1><p class="panel-subtitle">Applications générées par l'orchestrateur</p></div></div>
-   <div class="task-list" id="apps-list"><div class="skeleton"></div></div>
   </section>
 
   <section class="panel" id="panel-settings" data-route="settings">
@@ -412,26 +405,22 @@ function toast(title, body, level){
 async function loadOverview(){
   const ov = await apiSafe('/api/overview', null);
   if(!ov){
-    ['#kpi-agents','#kpi-tasks','#kpi-apps','#kpi-tokens'].forEach(s=>{ const e=$(s); if(e) e.textContent='—'; });
+    ['#kpi-agents','#kpi-tasks','#kpi-tokens'].forEach(s=>{ const e=$(s); if(e) e.textContent='—'; });
     const rec=$('#recent-tasks'); if(rec) rec.innerHTML='<div class="empty">Endpoint /api/overview indisponible. Vérifiez la clé API dans Settings.</div>';
     return;
   }
   const tasksRunning = (ov.tasks && ov.tasks.by_status && (ov.tasks.by_status.running || 0)) || 0;
   const tasksTotal = (ov.tasks && ov.tasks.total) || 0;
-  const appsTotal = (ov.apps && ov.apps.total) || 0;
   const tok24 = ov.tokens_24h || {input:0,output:0,total:0,cost_usd:0};
 
   $('#kpi-agents').textContent = ov.active_agents != null ? ov.active_agents : '—';
   $('#kpi-tasks').textContent = tasksRunning;
   $('#kpi-tasks-sub').textContent = tasksTotal + ' total';
-  $('#kpi-apps').textContent = appsTotal;
-  $('#kpi-apps-sub').textContent = appsTotal + ' total';
   $('#kpi-tokens').textContent = fmtNum(tok24.total || ((tok24.input||0)+(tok24.output||0)));
   $('#kpi-tokens-sub').textContent = fmtNum(tok24.input||0)+' in · '+fmtNum(tok24.output||0)+' out · '+fmtMoney(tok24.cost_usd||0);
 
   const ba = $('#badge-agents'); if(ba) ba.textContent = ov.active_agents||0;
   const bt = $('#badge-tasks'); if(bt) bt.textContent = tasksRunning;
-  const bp = $('#badge-apps'); if(bp) bp.textContent = appsTotal;
 
   const upStr = fmtSeconds(ov.uptime_seconds||0);
   const up = $('#app-uptime'); if(up) up.textContent = upStr;
@@ -592,7 +581,7 @@ async function loadAgents(){
     const lastMsg = a.last_message ? '<div style="margin-top:8px;font-size:var(--fs-xs);color:var(--c-text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+escapeHtml(a.last_message)+'">'+escapeHtml(a.last_message)+'</div>' : '';
     return '<div class="agent-card '+(isActive?'active':'')+'">'+
       '<div class="agent-head">'+
-      '<div class="agent-avatar" style="background:var(--c-'+(p==='claude'||p==='gemini'||p==='openai'?p:'primary')+')">'+escapeHtml(initial)+'</div>'+
+      '<div class="agent-avatar" style="background:'+(isActive?'var(--c-primary)':'var(--c-text-faint)')+'">'+escapeHtml(initial)+'</div>'+
       '<div class="agent-info">'+
       '<div class="agent-name"><span class="status-dot '+escapeHtml(status)+'"></span> '+escapeHtml(dispName)+'</div>'+
       '<div class="agent-model">'+providerBadge(p)+' '+escapeHtml(a.model||'')+'</div>'+
@@ -676,26 +665,6 @@ async function loadMonitoring(){
       '<div><strong>'+escapeHtml(e.endpoint||'?')+'</strong> <span class="badge">'+escapeHtml(e.error_type||'')+'</span>'+
       '<div style="color:var(--c-text-mut);font-size:var(--fs-xs);margin-top:2px">'+escapeHtml(e.message||'')+'</div></div></div>';
   }).join('') : '<div class="empty">Aucune erreur récente.</div>';
-}
-
-// ============================================================
-// APPS
-// ============================================================
-async function loadApps(){
-  const res = await apiSafe('/api/apps', {items:[]});
-  let items = [];
-  if(Array.isArray(res)) items = res;
-  else if(Array.isArray(res.items)) items = res.items;
-  else if(Array.isArray(res.apps)) items = res.apps;
-  const list = $('#apps-list');
-  if(!items.length){ list.innerHTML='<div class="empty"><div class="empty-title">Aucune app</div><div>Lancez une création via le chat ou l\\\'API.</div></div>'; return; }
-  list.innerHTML = items.map(a=>{
-    const status = (a.status||'idle').toLowerCase();
-    return '<div class="task-row"><span class="status-dot '+escapeHtml(status)+'"></span>'+
-      '<div class="task-meta"><div class="task-name">'+escapeHtml(a.name||a.title||('App #'+a.id))+'</div>'+
-      '<div class="task-sub"><span>#'+escapeHtml(a.id)+'</span>'+(a.port?'·<span>port '+escapeHtml(a.port)+'</span>':'')+'·<span>'+escapeHtml(status)+'</span></div></div>'+
-      '<div class="task-time">'+fmtTime(a.created_at)+'</div></div>';
-  }).join('');
 }
 
 // ============================================================
@@ -875,7 +844,7 @@ function handleSseEvent(payload){
 // ============================================================
 // ROUTER
 // ============================================================
-const ROUTES = ['overview','agents','tasks','chat','monitoring','apps','settings'];
+const ROUTES = ['overview','agents','tasks','chat','monitoring','settings'];
 function currentRoute(){
   const h = (location.hash||'').replace(/^#\/?/, '').split('/')[0];
   return ROUTES.includes(h) ? h : 'overview';
@@ -884,13 +853,12 @@ function navigate(){
   const route = currentRoute();
   $$('.panel').forEach(p=>p.classList.toggle('active', p.getAttribute('data-route')===route));
   $$('.nav-item').forEach(a=>{ if(a.getAttribute('data-route')===route) a.setAttribute('aria-current','page'); else a.removeAttribute('aria-current'); });
-  const ttl=$('#section-title'); if(ttl) ttl.textContent = ({overview:'Overview',agents:'Agents',tasks:'Tâches',chat:'Chat',monitoring:'Monitoring',apps:'Apps',settings:'Settings'}[route]||route);
+  const ttl=$('#section-title'); if(ttl) ttl.textContent = ({overview:'Overview',agents:'Agents',tasks:'Tâches',chat:'Chat',monitoring:'Monitoring',settings:'Settings'}[route]||route);
   $('#sidebar').classList.remove('open'); $('#sidebar-backdrop').classList.remove('show');
   if(route==='overview') loadOverview();
   else if(route==='agents') loadAgents();
   else if(route==='tasks') loadTasks();
   else if(route==='monitoring') loadMonitoring();
-  else if(route==='apps') loadApps();
 }
 window.addEventListener('hashchange', navigate);
 

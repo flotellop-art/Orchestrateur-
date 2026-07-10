@@ -41,10 +41,10 @@ build_desktop.bat      # Cree un .exe dans electron-app/dist/
 
 Au demarrage, Electron:
 1. Affiche un splash screen
-2. Cherche si le serveur Python tourne deja (port 8001)
-3. Si non: lance automatiquement `python run.py`
+2. Cherche si le serveur Python tourne deja (GET http://127.0.0.1:8000/health)
+3. Si non: lance automatiquement `python orchestrator.py`
 4. Attend que le serveur soit pret (max 30s)
-5. Ouvre la fenetre principale sur http://localhost:8001
+5. Ouvre la fenetre principale sur http://127.0.0.1:8000 (tableau de bord multi-agents)
 
 ## Icone
 
@@ -61,7 +61,8 @@ Outil en ligne: https://convertio.co/svg-ico/
 | Raccourci | Action |
 |-----------|--------|
 | Ctrl+1 | Tableau de bord |
-| Ctrl+2 | Chat |
+| Ctrl+2 | Espace agents |
+| Ctrl+3 | Chat |
 | Ctrl+R | Recharger |
 | Ctrl+Q | Quitter |
 | F12 | DevTools |

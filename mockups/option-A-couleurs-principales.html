@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Tableau de bord multi-agents — couleurs principales</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  /* Couleurs principales de l'app : orange + navy foncé */
+  --c-bg:#14141f;--c-bg-elev:#1f1f2e;--c-bg-elev-2:#2a2a3d;--c-border:#33334a;
+  --c-text:#ececf2;--c-text-mut:#9a9ab0;--c-text-faint:#6a6a82;
+  --c-primary:#e8825a;--c-primary-h:#c96840;--c-primary-soft:rgba(232,130,90,.16);
+  --c-success:#27ae60;--c-warning:#f59e0b;
+  --f-sans:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  --r-md:8px;--r-lg:12px;
+}
+body{font-family:var(--f-sans);font-size:14px;color:var(--c-text);background:var(--c-bg)}
+.app{display:grid;grid-template-columns:240px 1fr;grid-template-rows:56px 1fr;min-height:100vh}
+.sidebar{grid-row:1/3;background:var(--c-bg-elev);border-right:1px solid var(--c-border);padding:16px 0;display:flex;flex-direction:column}
+.brand{padding:0 20px 20px;display:flex;align-items:center;gap:12px}
+.brand-logo{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,var(--c-primary),var(--c-primary-h));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700}
+.brand-name{font-weight:600}
+.brand-sub{font-size:11px;color:var(--c-text-faint)}
+.nav{display:flex;flex-direction:column;gap:2px;padding:0 12px}
+.nav-section-title{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--c-text-faint);padding:16px 12px 8px}
+.nav-item{display:flex;align-items:center;gap:12px;padding:9px 12px;border-radius:8px;color:var(--c-text-mut);font-size:14px}
+.nav-item.active{background:var(--c-primary-soft);color:var(--c-primary);font-weight:500}
+.nav-badge{margin-left:auto;background:var(--c-bg-elev-2);color:var(--c-text-mut);font-size:11px;padding:1px 7px;border-radius:999px}
+.nav-item.active .nav-badge{background:var(--c-primary);color:#fff}
+.dot{width:18px;height:18px;display:inline-block;border-radius:4px;background:var(--c-bg-elev-2)}
+.topbar{display:flex;align-items:center;gap:16px;padding:0 20px;background:var(--c-bg-elev);border-bottom:1px solid var(--c-border)}
+.topbar-title{font-size:16px;font-weight:600}
+.spacer{flex:1}
+.conn{display:flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;background:var(--c-bg-elev-2);font-size:12px;color:var(--c-text-mut)}
+.conn-dot{width:8px;height:8px;border-radius:50%;background:var(--c-success);box-shadow:0 0 0 3px rgba(39,174,96,.18)}
+main{padding:24px;overflow:auto}
+.panel-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+.panel-title{font-size:26px;font-weight:700}
+.panel-subtitle{color:var(--c-text-mut);margin-top:2px}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:8px;background:var(--c-bg-elev-2);color:var(--c-text);font-size:12px;font-weight:500;border:1px solid var(--c-border)}
+.btn-primary{background:var(--c-primary);color:#fff;border-color:var(--c-primary)}
+.grid-kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.card{background:var(--c-bg-elev);border:1px solid var(--c-border);border-radius:12px;padding:20px}
+.kpi-icon{width:34px;height:34px;border-radius:8px;background:var(--c-primary-soft);color:var(--c-primary);display:flex;align-items:center;justify-content:center;font-size:16px;margin-bottom:12px}
+.card-title{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--c-text-mut);margin-bottom:8px;font-weight:600}
+.card-value{font-size:26px;font-weight:700}
+.card-delta{font-size:11px;color:var(--c-text-faint);margin-top:4px}
+.section-title{font-size:16px;font-weight:600;margin:8px 0 16px}
+.grid-agents{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.agent-card{background:var(--c-bg-elev);border:1px solid var(--c-border);border-radius:12px;padding:16px}
+.agent-card.active{border-color:rgba(232,130,90,.4)}
+.agent-head{display:flex;align-items:flex-start;gap:12px;margin-bottom:12px}
+.agent-avatar{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff}
+.agent-name{font-weight:600;display:flex;align-items:center;gap:6px}
+.agent-model{font-size:11px;color:var(--c-text-mut);margin-top:2px}
+.badge{font-size:10px;padding:2px 8px;border-radius:999px;font-weight:600}
+.b-run{background:rgba(39,174,96,.16);color:var(--c-success)}
+.b-idle{background:var(--c-bg-elev-2);color:var(--c-text-mut)}
+.agent-task{font-size:12px;color:var(--c-text-mut);margin-top:8px;padding:8px 12px;background:var(--c-bg-elev-2);border-radius:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agent-stats{display:flex;justify-content:space-between;margin-top:12px;font-size:11px;color:var(--c-text-mut)}
+.agent-actions{display:flex;gap:6px;margin-top:12px}
+.btn-sm{padding:5px 10px;font-size:11px}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">O</div>
+      <div><div class="brand-name">Orchestrator</div><div class="brand-sub">Multi-agents</div></div>
+    </div>
+    <nav class="nav">
+      <a class="nav-item active"><span class="dot"></span>Overview</a>
+      <a class="nav-item"><span class="dot"></span>Agents<span class="nav-badge">5</span></a>
+      <a class="nav-item"><span class="dot"></span>Tâches<span class="nav-badge">3</span></a>
+      <a class="nav-item"><span class="dot"></span>Chat</a>
+      <a class="nav-item"><span class="dot"></span>Monitoring</a>
+      <div class="nav-section-title">Travail</div>
+      <a class="nav-item"><span class="dot"></span>Espace agents</a>
+      <div class="nav-section-title">Système</div>
+      <a class="nav-item"><span class="dot"></span>Réglages</a>
+    </nav>
+  </aside>
+
+  <header class="topbar">
+    <div class="topbar-title">Tableau de bord</div>
+    <div class="spacer"></div>
+    <div class="conn"><span class="conn-dot"></span>En ligne</div>
+  </header>
+
+  <main>
+    <div class="panel-header">
+      <div>
+        <div class="panel-title">Tableau de bord</div>
+        <div class="panel-subtitle">Gestion multi-agents en temps réel</div>
+      </div>
+      <button class="btn btn-primary">+ Nouvel agent</button>
+    </div>
+
+    <div class="grid-kpi">
+      <div class="card"><div class="kpi-icon">◉</div><div class="card-title">Agents actifs</div><div class="card-value">3 / 5</div><div class="card-delta">total connectés</div></div>
+      <div class="card"><div class="kpi-icon" style="background:rgba(39,174,96,.16);color:var(--c-success)">▶</div><div class="card-title">Tâches en cours</div><div class="card-value">3</div><div class="card-delta">running</div></div>
+      <div class="card"><div class="kpi-icon">⟳</div><div class="card-title">Tâches terminées</div><div class="card-value">27</div><div class="card-delta">aujourd'hui</div></div>
+      <div class="card"><div class="kpi-icon" style="background:rgba(245,158,11,.16);color:var(--c-warning)">$</div><div class="card-title">Tokens 24h</div><div class="card-value">1.2M</div><div class="card-delta">in/out cumulé</div></div>
+    </div>
+
+    <div class="section-title">Agents</div>
+    <div class="grid-agents">
+      <div class="agent-card active">
+        <div class="agent-head">
+          <div class="agent-avatar" style="background:#e8825a">CH</div>
+          <div style="flex:1">
+            <div class="agent-name">Chef d'orchestre <span class="badge b-run">● actif</span></div>
+            <div class="agent-model">claude-opus-4-8</div>
+          </div>
+        </div>
+        <div class="agent-task">Coordination : refonte page d'accueil</div>
+        <div class="agent-stats"><span>12 tâches</span><span>~0,42 $</span></div>
+        <div class="agent-actions"><button class="btn btn-sm">Voir</button><button class="btn btn-sm">Pause</button></div>
+      </div>
+
+      <div class="agent-card active">
+        <div class="agent-head">
+          <div class="agent-avatar" style="background:#c96840">DV</div>
+          <div style="flex:1">
+            <div class="agent-name">Développeur <span class="badge b-run">● actif</span></div>
+            <div class="agent-model">claude-sonnet-4-6</div>
+          </div>
+        </div>
+        <div class="agent-task">Écriture du composant de navigation</div>
+        <div class="agent-stats"><span>8 tâches</span><span>~0,18 $</span></div>
+        <div class="agent-actions"><button class="btn btn-sm">Voir</button><button class="btn btn-sm">Pause</button></div>
+      </div>
+
+      <div class="agent-card active">
+        <div class="agent-head">
+          <div class="agent-avatar" style="background:#b06a4a">RV</div>
+          <div style="flex:1">
+            <div class="agent-name">Relecteur <span class="badge b-run">● actif</span></div>
+            <div class="agent-model">claude-sonnet-4-6</div>
+          </div>
+        </div>
+        <div class="agent-task">Revue qualité du code généré</div>
+        <div class="agent-stats"><span>5 tâches</span><span>~0,09 $</span></div>
+        <div class="agent-actions"><button class="btn btn-sm">Voir</button><button class="btn btn-sm">Pause</button></div>
+      </div>
+
+      <div class="agent-card">
+        <div class="agent-head">
+          <div class="agent-avatar" style="background:#4a4a60">TS</div>
+          <div style="flex:1">
+            <div class="agent-name">Testeur <span class="badge b-idle">◯ idle</span></div>
+            <div class="agent-model">claude-haiku-4-5</div>
+          </div>
+        </div>
+        <div class="agent-task">En attente de tâche…</div>
+        <div class="agent-stats"><span>0 tâche</span><span>~0,00 $</span></div>
+        <div class="agent-actions"><button class="btn btn-sm">Assigner</button></div>
+      </div>
+
+      <div class="agent-card">
+        <div class="agent-head">
+          <div class="agent-avatar" style="background:#4a4a60">DC</div>
+          <div style="flex:1">
+            <div class="agent-name">Documentaliste <span class="badge b-idle">◯ idle</span></div>
+            <div class="agent-model">claude-sonnet-4-6</div>
+          </div>
+        </div>
+        <div class="agent-task">En attente de tâche…</div>
+        <div class="agent-stats"><span>3 tâches</span><span>~0,05 $</span></div>
+        <div class="agent-actions"><button class="btn btn-sm">Assigner</button></div>
+      </div>
+    </div>
+  </main>
+</div>
+</body>
+</html>

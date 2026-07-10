@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Option B — Accueil épuré axé multi-agents</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#f8f9fa;--white:#fff;--dark:#1a1a2e;--orange:#e8825a;--orange-d:#c96840;
+  --green:#27ae60;--grey:#6c757d;--border:#dee2e6;--sh:0 4px 20px rgba(0,0,0,.08);--r:12px;
+}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--dark);min-height:100vh}
+header{background:var(--dark);color:#fff;padding:18px 32px;display:flex;align-items:center;justify-content:space-between}
+header h1{font-size:1.2rem;font-weight:700}
+header h1 span{color:var(--orange)}
+.hdr-stats{display:flex;gap:20px;font-size:.82rem;color:#aaa;align-items:center}
+.hdr-stat strong{color:#fff;font-size:1rem}
+.hdr-stats a{color:var(--orange);text-decoration:none;font-weight:600}
+/* Hero */
+.hero{max-width:920px;margin:56px auto 0;padding:0 20px;text-align:center}
+.hero h2{font-size:2rem;font-weight:700;margin-bottom:12px}
+.hero h2 span{color:var(--orange)}
+.hero p{color:var(--grey);font-size:1.05rem;margin-bottom:36px;line-height:1.6}
+/* Raccourcis */
+.shortcuts{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:920px;margin:0 auto;padding:0 20px}
+.shortcut{background:var(--white);border-radius:16px;box-shadow:var(--sh);padding:28px;text-align:left;display:flex;flex-direction:column;gap:10px;border:2px solid transparent;transition:border-color .15s}
+.shortcut:hover{border-color:var(--orange)}
+.shortcut .ico{width:48px;height:48px;border-radius:12px;background:#fef0eb;color:var(--orange);display:flex;align-items:center;justify-content:center;font-size:1.5rem}
+.shortcut h3{font-size:1.15rem;font-weight:700}
+.shortcut p{color:var(--grey);font-size:.9rem;line-height:1.5}
+.shortcut .go{margin-top:auto;color:var(--orange);font-weight:700;font-size:.92rem}
+/* Agents */
+.agents-section{max-width:1100px;margin:48px auto 40px;padding:0 20px}
+.agents-section h3{font-size:.85rem;font-weight:700;margin-bottom:20px;color:var(--grey);text-transform:uppercase;letter-spacing:.5px}
+.agents-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:18px}
+.agent-card{background:var(--white);border-radius:var(--r);box-shadow:var(--sh);padding:20px;display:flex;flex-direction:column;gap:12px}
+.agent-card-header{display:flex;align-items:center;justify-content:space-between}
+.agent-id{display:flex;align-items:center;gap:10px}
+.agent-avatar{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:.85rem}
+.agent-name{font-weight:700;font-size:1rem}
+.agent-model{font-size:.76rem;color:var(--grey)}
+.status-dot{width:10px;height:10px;border-radius:50%}
+.dot-run{background:var(--green);box-shadow:0 0 0 3px rgba(39,174,96,.2)}
+.dot-idle{background:var(--border)}
+.agent-task{color:var(--grey);font-size:.85rem;line-height:1.5}
+.agent-status-text{font-size:.78rem;font-weight:600;padding:3px 10px;border-radius:20px;width:fit-content}
+.st-run{background:#eafaf1;color:var(--green)}
+.st-idle{background:#f5f5f5;color:var(--grey)}
+.agent-actions{display:flex;gap:8px;margin-top:4px}
+.btn{border:none;border-radius:7px;padding:8px 16px;font-size:.84rem;font-weight:600;cursor:pointer}
+.btn-open{background:var(--dark);color:#fff}
+.btn-stop{background:#f0f0f0;color:var(--dark)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🤖 Multi-Agent <span>Orchestrator</span></h1>
+  <div class="hdr-stats">
+    <div><strong>3</strong> agents actifs</div>
+    <div><strong>5</strong> au total</div>
+    <a href="#">Gérer la mémoire →</a>
+  </div>
+</header>
+
+<div class="hero">
+  <h2>Gestion <span>multi-agents</span></h2>
+  <p>Pilotez votre équipe d'agents IA : coordination, tâches et suivi en temps réel.</p>
+</div>
+
+<div class="shortcuts">
+  <a class="shortcut">
+    <div class="ico">🎛️</div>
+    <h3>Centre de contrôle</h3>
+    <p>Vue d'ensemble, agents, tâches, chat et monitoring dans un tableau de bord complet.</p>
+    <span class="go">Ouvrir le centre de contrôle →</span>
+  </a>
+  <a class="shortcut">
+    <div class="ico">🗂️</div>
+    <h3>Espace agents</h3>
+    <p>L'espace de travail collaboratif où vos agents produisent, relisent et livrent.</p>
+    <span class="go">Ouvrir l'espace agents →</span>
+  </a>
+</div>
+
+<div class="agents-section">
+  <h3>Mes agents</h3>
+  <div class="agents-grid">
+
+    <div class="agent-card">
+      <div class="agent-card-header">
+        <div class="agent-id">
+          <div class="agent-avatar" style="background:#a855f7">CH</div>
+          <div><div class="agent-name">Chef d'orchestre</div><div class="agent-model">claude-opus-4-8</div></div>
+        </div>
+        <span class="status-dot dot-run"></span>
+      </div>
+      <div class="agent-task">Coordination : refonte de la page d'accueil</div>
+      <span class="agent-status-text st-run">● Actif</span>
+      <div class="agent-actions"><button class="btn btn-open">Voir</button><button class="btn btn-stop">⏸ Pause</button></div>
+    </div>
+
+    <div class="agent-card">
+      <div class="agent-card-header">
+        <div class="agent-id">
+          <div class="agent-avatar" style="background:#10b981">DV</div>
+          <div><div class="agent-name">Développeur</div><div class="agent-model">claude-sonnet-4-6</div></div>
+        </div>
+        <span class="status-dot dot-run"></span>
+      </div>
+      <div class="agent-task">Écriture du composant de navigation</div>
+      <span class="agent-status-text st-run">● Actif</span>
+      <div class="agent-actions"><button class="btn btn-open">Voir</button><button class="btn btn-stop">⏸ Pause</button></div>
+    </div>
+
+    <div class="agent-card">
+      <div class="agent-card-header">
+        <div class="agent-id">
+          <div class="agent-avatar" style="background:#3b82f6">RV</div>
+          <div><div class="agent-name">Relecteur</div><div class="agent-model">gemini-2.5-pro</div></div>
+        </div>
+        <span class="status-dot dot-run"></span>
+      </div>
+      <div class="agent-task">Revue qualité du code généré</div>
+      <span class="agent-status-text st-run">● Actif</span>
+      <div class="agent-actions"><button class="btn btn-open">Voir</button><button class="btn btn-stop">⏸ Pause</button></div>
+    </div>
+
+    <div class="agent-card">
+      <div class="agent-card-header">
+        <div class="agent-id">
+          <div class="agent-avatar" style="background:#64748b">TS</div>
+          <div><div class="agent-name">Testeur</div><div class="agent-model">claude-haiku-4-5</div></div>
+        </div>
+        <span class="status-dot dot-idle"></span>
+      </div>
+      <div class="agent-task">En attente de tâche…</div>
+      <span class="agent-status-text st-idle">◯ Inactif</span>
+      <div class="agent-actions"><button class="btn btn-open">Assigner</button></div>
+    </div>
+
+  </div>
+</div>
+
+</body>
+</html>
