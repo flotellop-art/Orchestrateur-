@@ -275,6 +275,7 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
   </div>
 </div>
 
+<script src="/static/secure-sse.js"></script>
 <script>
 // Si une cle API est definie (page /control -> Reglages, stockee dans localStorage),
 // on l'attache automatiquement a toutes les requetes. Transparent si aucune cle.
@@ -286,22 +287,15 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
     if (k) {
       init = init || {};
       var h = new Headers(init.headers || (input && input.headers) || {});
-      if (!h.has('X-API-Key')) h.set('X-API-Key', k);
+      var rawUrl = input && input.url ? input.url : input;
+      var requestUrl = new URL(rawUrl, window.location.href);
+      if (requestUrl.origin === window.location.origin && !h.has('X-API-Key')) {
+        h.set('X-API-Key', k);
+      }
       init.headers = h;
     }
     return _fetch(input, init);
   };
-  var _ES = window.EventSource;
-  if (_ES) {
-    window.EventSource = function (url, cfg) {
-      var k = key();
-      if (k && typeof url === 'string' && url.indexOf('api_key=') < 0) {
-        url += (url.indexOf('?') < 0 ? '?' : '&') + 'api_key=' + encodeURIComponent(k);
-      }
-      return new _ES(url, cfg);
-    };
-    window.EventSource.prototype = _ES.prototype;
-  }
 })();
 // Enregistre le service worker (rend l'app installable en PWA, et garde l'UI hors-ligne).
 if ('serviceWorker' in navigator) {
@@ -477,7 +471,7 @@ document.addEventListener('keydown', function(e) {
 
 function connectStream() {
   if (evtSource) evtSource.close();
-  evtSource = new EventSource('/api/tasks/' + taskId + '/stream');
+  evtSource = new SecureEventSource('/api/tasks/' + taskId + '/stream');
   evtSource.onmessage = function(e) {
     var ev;
     try { ev = JSON.parse(e.data); } catch(_) { return; }

@@ -4,6 +4,20 @@
 - Compte Cloudflare avec le domaine `tryarty.com`
 - `cloudflared` installé (déjà fait)
 
+## Sécurité obligatoire
+
+Le tunnel donne accès à des fonctions capables de créer et lancer du code.
+Avant de l'ouvrir, configurez une clé forte et le domaine autorisé dans `.env` :
+
+```dotenv
+API_SECRET_KEY=<cle-generee-avec-secrets-token_urlsafe>
+ORCHESTRATOR_ALLOWED_HOSTS=localhost,127.0.0.1,::1,agent.tryarty.com
+```
+
+Pour un tunnel temporaire, remplacez le dernier hôte par
+`*.trycloudflare.com`. `start_tunnel.bat` refuse désormais de démarrer si la
+clé API est absente ou vide.
+
 ---
 
 ## Étapes pour créer le tunnel permanent
@@ -35,7 +49,7 @@ credentials-file: C:\Users\Tellop\.cloudflared\<UUID-DU-TUNNEL>.json
 
 ingress:
   - hostname: agent.tryarty.com
-    service: http://localhost:8002
+    service: http://localhost:8000
   - service: http_status:404
 ```
 
@@ -56,7 +70,7 @@ cloudflared tunnel route dns agent-tryarty agent.tryarty.com
 cloudflared tunnel run agent-tryarty
 ```
 
-Puis tester : `curl https://agent.tryarty.com/api/stats`
+Puis tester : `curl -H "X-API-Key: VOTRE_CLE" https://agent.tryarty.com/api/stats`
 
 ### 6. Installer comme service Windows (démarrage automatique)
 

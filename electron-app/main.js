@@ -20,7 +20,7 @@ function pyPath(){
 
 function checkServer(){
   return new Promise(res=>{
-    const r=http.get(BASE+'/api/stats',resp=>{res(resp.statusCode===200);});
+    const r=http.get(BASE+'/health',resp=>{res(resp.statusCode===200);});
     r.on('error',()=>res(false));
     r.setTimeout(2000,()=>{r.destroy();res(false);});
   });

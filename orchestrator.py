@@ -3,6 +3,7 @@ App Creator - Orchestrateur principal
 Pipeline garanti : description -> code -> verification -> demarrage -> navigateur
 """
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +28,7 @@ import api_control
 import managed_agents  # pont vers les Agents geres Anthropic
 from auth_middleware import add_auth_middleware
 from patches.security.cors_config import add_cors_middleware
+from security_policy import build_child_environment, validate_generated_app
 
 load_dotenv()
 
@@ -281,7 +284,9 @@ async def creation_pipeline(app_id, description, folder, port):
                 yield evt("step", "Correction en cours (tentative {}/3)...".format(attempt + 1))
             else:
                 yield evt("step", "Ecriture du code...")
-            app_data = await generate_app_code(description, port, last_error)
+            app_data = validate_generated_app(
+                await generate_app_code(description, port, last_error)
+            )
             break
         except Exception as e:
             last_error = str(e)
@@ -313,7 +318,9 @@ async def creation_pipeline(app_id, description, folder, port):
             yield evt("step", "Correction d'une erreur de syntaxe ({}/2)...".format(attempt + 1))
             last_error = "Erreur de syntaxe dans app.py :\n" + syntax_error
             try:
-                app_data = await generate_app_code(description, port, last_error)
+                app_data = validate_generated_app(
+                    await generate_app_code(description, port, last_error)
+                )
                 for f in app_data.get("files", []):
                     if f.get("filename") == "app.py":
                         app_code = f.get("content", "")
@@ -332,26 +339,18 @@ async def creation_pipeline(app_id, description, folder, port):
     target = Path(folder)
     target.mkdir(parents=True, exist_ok=True)
     files_written = []
-    for f in app_data.get("files", []):
+    for f in app_data["files"]:
         fp = target / f["filename"]
         fp.write_text(f["content"], encoding="utf-8")
         files_written.append(f["filename"])
     yield evt("files", "Fichiers : " + ", ".join(files_written), files=files_written)
 
-    # Etape 4 : Installation des dependances
-    req = target / "requirements.txt"
-    if req.exists():
-        yield evt("step", "Installation des composants...")
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "pip", "install", "-r", "requirements.txt", "-q",
-                cwd=str(target),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            await proc.wait()
-        except Exception as e:
-            yield evt("step", "Avertissement installation : " + str(e))
+    # Etape 4 : dependance fixe, installee avec l'orchestrateur lui-meme.
+    # Le contenu genere ne pilote plus jamais pip a l'execution.
+    if importlib.util.find_spec("flask") is None:
+        await db_update(app_id, status="failed", error="Flask absent de l'environnement")
+        yield evt("error", "Flask est absent. Reinstallez requirements_orchestrator.txt.")
+        return
 
     # Etape 5 : Demarrage du serveur
     yield evt("step", "Demarrage de votre application...")
@@ -361,6 +360,7 @@ async def creation_pipeline(app_id, description, folder, port):
             cwd=str(target),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=build_child_environment(),
         )
         running_servers[app_id] = proc
     except Exception as e:
@@ -407,8 +407,8 @@ async def lifespan(app):
     log.info("App Creator arrete.")
 
 app = FastAPI(title="App Creator", lifespan=lifespan)
-# Protection par cle API : ACTIVE uniquement si API_SECRET_KEY est defini (.env).
-# Sans cle -> no-op total, l'app demarre comme avant (aucun risque de blocage).
+# Sans cle API, seuls les appels directs depuis la machine locale sont acceptes.
+# Les tunnels et acces reseau exigent API_SECRET_KEY.
 add_auth_middleware(app)
 # CORS restreint a localhost (configurable via CORS_ALLOWED_ORIGINS) ; l'UI etant
 # servie en meme origine, cela n'affecte pas son fonctionnement.
@@ -452,7 +452,9 @@ async def create_app(request: Request):
         raise HTTPException(400, "Description manquante")
 
     port   = await find_free_port(3000)
-    folder = str(PROJECTS / "app_{}".format(datetime.utcnow().strftime("%Y%m%d_%H%M%S")))
+    folder = str(PROJECTS / "app_{}_{}".format(
+        datetime.utcnow().strftime("%Y%m%d_%H%M%S"), uuid.uuid4().hex[:8]
+    ))
     app_id = await db_create(description, folder, port)
 
     async def stream():
@@ -480,6 +482,7 @@ async def start_app(app_id: int):
         cwd=a["folder"],
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=build_child_environment(),
     )
     running_servers[app_id] = proc
     ok = await wait_for_server(a["port"], timeout=20)
@@ -544,4 +547,9 @@ app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("orchestrator:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+    uvicorn.run(
+        "orchestrator:app",
+        host=os.getenv("ORCHESTRATOR_HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", "8000")),
+        reload=False,
+    )

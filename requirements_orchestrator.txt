@@ -3,6 +3,7 @@ uvicorn
 anthropic
 python-dotenv
 aiosqlite
+flask>=3.0,<4
 google-genai
 openai
 claude-agent-sdk

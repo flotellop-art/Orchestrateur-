@@ -45,9 +45,33 @@ const messagesEl = document.getElementById('messages');
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function renderMessage(content) {
+  return escapeHtml(content)
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\n/g, '<br>');
+}
+
+function apiFetch(url, options={}) {
+  const headers = new Headers(options.headers || {});
+  try {
+    const requestUrl = new URL(url, window.location.href);
+    if (requestUrl.origin === window.location.origin) {
+      const key = localStorage.getItem('ORCH_API_KEY') || '';
+      if (key) headers.set('X-API-Key', key);
+    }
+  } catch (_) {}
+  return fetch(url, Object.assign({}, options, {headers}));
+}
+
 async function loadHistory() {
   try {
-    const r = await fetch('/api/chat/history');
+    const r = await apiFetch('/api/chat/history');
     const data = await r.json();
     data.messages.forEach(m => addMessage(m.role, m.content));
     scrollBottom();
@@ -57,7 +81,7 @@ async function loadHistory() {
 function addMessage(role, content, cls='') {
   const div = document.createElement('div');
   div.className = `msg ${cls || role}`;
-  div.innerHTML = content.replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+  div.innerHTML = renderMessage(content);
   messagesEl.appendChild(div);
   return div;
 }
@@ -90,7 +114,7 @@ async function sendMessage() {
   let assistantText = '';
 
   try {
-    const resp = await fetch('/api/chat', {
+    const resp = await apiFetch('/api/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({message: text})
@@ -111,7 +135,7 @@ async function sendMessage() {
             typing.remove();
             if (!assistantDiv) assistantDiv = addMessage('assistant', '');
             assistantText += evt.content;
-            assistantDiv.innerHTML = assistantText.replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            assistantDiv.innerHTML = renderMessage(assistantText);
             scrollBottom();
           } else if (evt.type === 'tool_start') {
             typing.textContent = `Utilisation de l'outil: ${evt.tool}...`;
@@ -124,15 +148,23 @@ async function sendMessage() {
           } else if (evt.type === 'confirm') {
             const cd = document.createElement('div');
             cd.className = 'msg confirm';
-            cd.innerHTML = `<strong>Action requise</strong><br>${evt.tool}(${JSON.stringify(evt.input).substring(0,100)})<br>`;
+            const title = document.createElement('strong');
+            title.textContent = 'Action requise';
+            const details = document.createTextNode(
+              String(evt.tool || '') + '(' + String(JSON.stringify(evt.input) || '').substring(0, 100) + ')'
+            );
+            cd.appendChild(title);
+            cd.appendChild(document.createElement('br'));
+            cd.appendChild(details);
+            cd.appendChild(document.createElement('br'));
             const btns = document.createElement('div');
             btns.className = 'confirm-buttons';
             const yes = document.createElement('button');
             yes.className = 'btn-yes'; yes.textContent = '✓ Confirmer';
-            yes.onclick = () => { cd.innerHTML = '✅ Action confirmée (simulation)'; };
+            yes.onclick = () => { cd.textContent = '✅ Action confirmée (simulation)'; };
             const no = document.createElement('button');
             no.className = 'btn-no'; no.textContent = '✗ Annuler';
-            no.onclick = () => { cd.innerHTML = '❌ Action annulée'; };
+            no.onclick = () => { cd.textContent = '❌ Action annulée'; };
             btns.appendChild(yes); btns.appendChild(no);
             cd.appendChild(btns);
             messagesEl.appendChild(cd);

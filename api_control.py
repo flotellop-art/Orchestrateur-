@@ -18,7 +18,7 @@ Contraintes respectées :
   - Broadcaster SSE via asyncio.Queue (fanout sur N clients)
   - Heartbeat SSE toutes les 30 s
   - Format SSE : event: <type>\\ndata: {json}\\n\\n  (compatible addEventListener)
-  - api_key accepté en query param pour EventSource (pas de header custom)
+  - authentification SSE par header X-API-Key via fetch streaming
 
 Intégration dans orchestrator.py — voir api_control_install.md
 """
@@ -970,26 +970,13 @@ async def stop_agent(agent_id: int):
 
 # ── GET /api/events (SSE) ─────────────────────────────────────────────────────
 @router.get("/api/events")
-async def sse_events(
-    request: Request,
-    api_key: Annotated[
-        Optional[str],
-        Query(
-            description=(
-                "Clé API (alternative au header X-API-Key). "
-                "Nécessaire car EventSource JS ne supporte pas les headers custom. "
-                "Le middleware d'auth doit accepter ce paramètre — voir install.md."
-            )
-        ),
-    ] = None,
-):
+async def sse_events(request: Request):
     """Flux Server-Sent Events unifié pour le temps réel.
 
     Authentification :
-        Header `X-API-Key` pour les requêtes fetch ordinaires.
-        Query param `?api_key=` pour EventSource (pas de header custom possible).
-        Le middleware d'auth (middleware_auth.py) doit lire le query param
-        `api_key` en priorité 3 — voir api_control_install.md section 4.
+        Header `X-API-Key` ou `Authorization: Bearer` avec fetch streaming.
+        Les clés dans les URL sont volontairement refusées pour éviter leur
+        enregistrement dans les journaux de proxy et l'historique navigateur.
 
     Événements émis (format `event: <type>\\ndata: {json}\\n\\n`) :
         connected             — confirmation de connexion
@@ -1003,17 +990,10 @@ async def sse_events(
     Utilisation JS ::
 
         const key = localStorage.getItem('ORCH_API_KEY') || '';
-        const url = '/api/events' + (key ? '?api_key=' + key : '');
-        const es  = new EventSource(url);
-
-        es.addEventListener('task_update', e => {
-            const d = JSON.parse(e.data);
-            console.log('task:', d.task_id, d.status);
+        const response = await fetch('/api/events', {
+            headers: {'Accept': 'text/event-stream', 'X-API-Key': key}
         });
-        es.onmessage = e => {   // reçoit TOUS les events
-            const d = JSON.parse(e.data);
-            if (d.type === 'heartbeat') return;
-        };
+        // Lire response.body avec getReader() et parser les trames SSE.
     """
     queue = broadcaster.subscribe()
 

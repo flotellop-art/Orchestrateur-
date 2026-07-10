@@ -34,6 +34,11 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import managed_agents  # pont vers les Agents geres Anthropic (delegation depuis le chef)
+from security_policy import (
+    build_child_environment,
+    resolve_allowed_target_path,
+    validate_github_repo_url,
+)
 
 load_dotenv(Path(__file__).parent / ".env", override=False)
 log = logging.getLogger(__name__)
@@ -653,9 +658,7 @@ def _rmtree_force(path):
 async def _clone_repo(url, token=None):
     """Clone un depot GitHub en LECTURE SEULE dans un cache local, et renvoie son chemin.
     Le token (depot prive) sert au clone puis est scrubbe (remote supprime) ; jamais stocke/log."""
-    url = (url or "").strip().rstrip("/")
-    if not re.match(r"^https://", url):
-        raise ValueError("URL invalide : une URL https est requise.")
+    url = validate_github_repo_url(url)
     m = re.search(r"github\.com/([^/]+)/([^/]+?)(?:\.git)?$", url)
     name = (m.group(1) + "_" + m.group(2)) if m else re.sub(r"[^A-Za-z0-9_.-]", "_", url)[-40:]
     dest = PROJECTS / ".repos" / name
@@ -665,10 +668,24 @@ async def _clone_repo(url, token=None):
         if not ok and dest.exists():
             # dernier recours : cloner dans un dossier voisin unique
             dest = PROJECTS / ".repos" / (name + "_" + uuid.uuid4().hex[:6])
-    auth_url = url.replace("https://", "https://" + token + "@", 1) if token else url
+    clone_env = build_child_environment()
+    clone_env["GIT_TERMINAL_PROMPT"] = "0"
+    credentials = None
+    if token:
+        # Git reads this one-shot config from the child environment. The token
+        # is therefore absent from both the process command line and remote URL.
+        credentials = base64.b64encode(
+            ("x-access-token:" + token).encode("utf-8")
+        ).decode("ascii")
+        clone_env.update({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.extraHeader",
+            "GIT_CONFIG_VALUE_0": "Authorization: Basic " + credentials,
+        })
     proc = await asyncio.create_subprocess_exec(
-        "git", "clone", "--depth", "1", auth_url, str(dest),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        "git", "clone", "--depth", "1", url, str(dest),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        env=clone_env)
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
     except asyncio.TimeoutError:
@@ -683,13 +700,16 @@ async def _clone_repo(url, token=None):
         msg = out.decode("utf-8", "replace")
         if token:
             msg = msg.replace(token, "***")  # ne jamais fuiter le token
+        if credentials:
+            msg = msg.replace(credentials, "***")
         raise ValueError(msg.strip()[-300:] or "echec inconnu")
     # Scrubber le remote : aucune trace du token dans .git/config.
     if (dest / ".git").exists():
         try:
             p2 = await asyncio.create_subprocess_exec(
                 "git", "-C", str(dest), "remote", "remove", "origin",
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                env=build_child_environment())
             await p2.communicate()
         except Exception:
             pass
@@ -710,6 +730,7 @@ async def _run_cmd(folder: str, cmd: str, timeout: int = 60) -> str:
         proc = await asyncio.create_subprocess_exec(
             *parts, cwd=folder,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=build_child_environment(),
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return (out.decode("utf-8", errors="replace") or "(vide)")[:2500]
@@ -730,6 +751,7 @@ async def _run_pytest(folder: str, timeout: int = 120) -> str:
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "pytest", "-q", cwd=folder,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=build_child_environment(),
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return (out.decode("utf-8", errors="replace") or "(vide)")[:2500]
@@ -796,7 +818,8 @@ OFFICIAL_MCP = {
 async def _pip_install(pkg):
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "pip", "install", "-q", pkg,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        env=build_child_environment())
     out, _ = await asyncio.wait_for(proc.communicate(), timeout=240)
     if proc.returncode != 0:
         raise RuntimeError("pip install " + pkg + " a echoue : "
@@ -858,6 +881,7 @@ class MCPServer:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=build_child_environment(),
         )
         await self._send("initialize", {
             "protocolVersion": "2024-11-05",
@@ -1780,8 +1804,11 @@ async def create_task(body: TaskCreate):
                 target_path = await _clone_repo(body.target_repo_url, body.github_token)
             except Exception as e:
                 raise HTTPException(400, "Connexion au depot GitHub impossible : " + str(e)[:300])
-        elif body.target_path and Path(body.target_path).exists():
-            target_path = str(Path(body.target_path).resolve())
+        elif body.target_path:
+            try:
+                target_path = str(resolve_allowed_target_path(body.target_path))
+            except (OSError, ValueError) as e:
+                raise HTTPException(400, str(e)[:300])
         else:
             raise HTTPException(400, "Mode entreprise : fournis une URL GitHub (target_repo_url) "
                                      "OU un chemin local existant (target_path).")
@@ -1950,7 +1977,8 @@ async def _launch_python_app(task_id, base, name):
     await _stop_launched(task_id)
     proc = await asyncio.create_subprocess_exec(
         sys.executable, name, cwd=str(base),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        env=build_child_environment())
     launched_apps[task_id] = {"proc": proc, "url": None, "output": []}
     url, lines = None, []
     for _ in range(15):
@@ -2099,7 +2127,8 @@ async def _proc_run(args, cwd, timeout):
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=build_child_environment())
     except FileNotFoundError:
         return 1, "Programme introuvable: " + str(args[0])
     try:
@@ -2133,7 +2162,7 @@ async def _build_ping(folder, py_exe):
     # PYTHONUNBUFFERED : stdout non bufferise -> on lit l'URL de demarrage en temps reel.
     # FLASK_DEBUG=0 : decourage le reloader. On NE met PAS WERKZEUG_RUN_MAIN (sinon Werkzeug
     # cherche WERKZEUG_SERVER_FD -> KeyError fatale au demarrage).
-    env = os.environ.copy()
+    env = build_child_environment()
     env["PYTHONUNBUFFERED"] = "1"
     env["FLASK_DEBUG"] = "0"
     proc = None

@@ -19,6 +19,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "electron_hardening.js",
       "assets/**",
       "node_modules/**"
     ],
@@ -28,12 +29,18 @@
         "to": "app",
         "filter": [
           "orchestrator.py",
+          "team.py",
+          "api_control.py",
+          "managed_agents.py",
+          "memory.py",
+          "auth_middleware.py",
+          "security_policy.py",
           "chat_agent.py",
           "run.py",
           "requirements_orchestrator.txt",
-          ".env",
+          ".env.example",
           "static/**",
-          "*.db"
+          "patches/**"
         ]
       }
     ],

@@ -1,25 +1,16 @@
-"""auth_middleware.py — Protection par cle API, DESACTIVEE par defaut.
+"""HTTP security boundary for the orchestrator.
 
-Principe : tant que `API_SECRET_KEY` est vide/absente dans l'environnement, le
-middleware n'est meme pas monte — l'application se comporte exactement comme
-avant (aucun risque de blocage). Des qu'une cle est definie, l'API exige cette
-cle (sinon 401/403), avec un rate-limit par IP.
+Local mode stays zero-configuration, but it is deliberately limited to direct
+loopback requests.  A reverse proxy, tunnel or remote peer must use an API key.
+The Host header is always checked to prevent DNS-rebinding attacks.
 
-Active uniquement si `API_SECRET_KEY` est non vide :
-- Header `X-API-Key: <cle>` OU `Authorization: Bearer <cle>`
-- Query param `?api_key=<cle>` (indispensable pour EventSource/SSE qui ne sait
-  pas envoyer de header personnalise)
-- Pages d'UI et fichiers statiques restent publics (l'auth porte sur l'API ;
-  les pages portent la cle via leurs requetes fetch/SSE)
-- Rate-limit en memoire par IP (defaut 120 req / 60 s, configurable)
+Authentication accepts only headers:
 
-Integration (orchestrator.py) ::
+* ``X-API-Key: <key>``
+* ``Authorization: Bearer <key>``
 
-    from auth_middleware import add_auth_middleware
-    add_auth_middleware(app)   # no-op si API_SECRET_KEY est vide
-
-Pour activer : definir API_SECRET_KEY dans .env et coller la MEME cle dans la
-page de reglages de control.html (champ « Cle API »).
+Secrets in query parameters are rejected by omission because URLs are commonly
+recorded by browsers, proxies and access logs.
 """
 from __future__ import annotations
 
@@ -27,7 +18,7 @@ import hmac
 import logging
 import os
 import time
-from collections import defaultdict
+from collections import OrderedDict, deque
 from typing import Callable, Optional
 
 from fastapi import FastAPI, Request, Response
@@ -35,11 +26,18 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
+from security_policy import (
+    is_allowed_host,
+    is_unproxied_local_request,
+    parse_allowed_hosts,
+)
+
+
 log = logging.getLogger(__name__)
 
 
 def get_api_secret() -> str:
-    """Cle API courante (chaine vide = protection desactivee)."""
+    """Current API key (empty means local-only mode)."""
     return os.getenv("API_SECRET_KEY", "").strip()
 
 
@@ -47,8 +45,17 @@ def is_auth_enabled() -> bool:
     return bool(get_api_secret())
 
 
-# Pages et ressources toujours accessibles sans cle : ce sont des coquilles
-# statiques ; leurs appels /api/... portent la cle (header ou ?api_key=).
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        log.warning("[AUTH] %s invalide ; valeur par defaut %d.", name, default)
+        return default
+    return value if value > 0 else default
+
+
+# The UI shell remains readable. Sensitive operations all live outside these
+# paths and are protected by local-only mode or the configured API key.
 PUBLIC_PATHS: set[str] = {
     "/", "/control", "/workspace", "/sw.js",
     "/favicon.ico", "/manifest.webmanifest", "/static/manifest.webmanifest",
@@ -56,25 +63,37 @@ PUBLIC_PATHS: set[str] = {
 }
 PUBLIC_PREFIXES: tuple[str, ...] = ("/static/",)
 
-RATE_LIMIT_REQUESTS: int = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
-RATE_LIMIT_WINDOW: int = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
-_rate_counters: dict[str, list[float]] = defaultdict(list)
+RATE_LIMIT_REQUESTS = _positive_env_int("RATE_LIMIT_REQUESTS", 120)
+RATE_LIMIT_WINDOW = _positive_env_int("RATE_LIMIT_WINDOW", 60)
+RATE_LIMIT_MAX_CLIENTS = _positive_env_int("RATE_LIMIT_MAX_CLIENTS", 4096)
+MIN_API_SECRET_LENGTH = 24
+
+# LRU of fixed-size, expiring deques. The peer IP comes from the socket, never
+# from a caller-controlled X-Forwarded-For header.
+_rate_counters: OrderedDict[str, deque[float]] = OrderedDict()
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("X-Forwarded-For")
-    if fwd:
-        return fwd.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
-def _rate_ok(ip: str) -> bool:
-    now = time.monotonic()
-    window_start = now - RATE_LIMIT_WINDOW
-    _rate_counters[ip] = [t for t in _rate_counters[ip] if t > window_start]
-    if len(_rate_counters[ip]) >= RATE_LIMIT_REQUESTS:
+def _rate_ok(ip: str, now: float | None = None) -> bool:
+    current = time.monotonic() if now is None else now
+    window_start = current - RATE_LIMIT_WINDOW
+    bucket = _rate_counters.get(ip)
+    if bucket is None:
+        if len(_rate_counters) >= RATE_LIMIT_MAX_CLIENTS:
+            _rate_counters.popitem(last=False)
+        bucket = deque()
+        _rate_counters[ip] = bucket
+    else:
+        _rate_counters.move_to_end(ip)
+
+    while bucket and bucket[0] <= window_start:
+        bucket.popleft()
+    if len(bucket) >= RATE_LIMIT_REQUESTS:
         return False
-    _rate_counters[ip].append(now)
+    bucket.append(current)
     return True
 
 
@@ -85,55 +104,86 @@ def _extract_token(request: Request) -> Optional[str]:
     auth = request.headers.get("Authorization", "").strip()
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
-    # Indispensable pour EventSource (SSE) : impossible d'y mettre un header.
-    qp = request.query_params.get("api_key", "").strip()
-    if qp:
-        return qp
     return None
 
 
 def _is_public(path: str) -> bool:
-    if path in PUBLIC_PATHS:
-        return True
-    return any(path.startswith(p) for p in PUBLIC_PREFIXES)
+    return path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES)
+
+
+def _json_error(status: int, detail: str, **headers: str) -> JSONResponse:
+    response_headers = {"Cache-Control": "no-store", **headers}
+    return JSONResponse(status_code=status, content={"detail": detail}, headers=response_headers)
 
 
 class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: ASGIApp, api_secret: str) -> None:
+    def __init__(self, app: ASGIApp, api_secret: str, allowed_hosts: tuple[str, ...]) -> None:
         super().__init__(app)
         self._api_secret = api_secret
+        self._allowed_hosts = allowed_hosts
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        host = request.headers.get("host")
+        if not is_allowed_host(host, self._allowed_hosts):
+            log.warning("[AUTH] Host refuse=%r peer=%s", host, _client_ip(request))
+            return _json_error(400, "Hote HTTP non autorise.")
+
         path = request.url.path
         if _is_public(path):
             return await call_next(request)
 
-        ip = _client_ip(request)
-        if not _rate_ok(ip):
-            log.warning("[AUTH] rate-limit IP=%s path=%s", ip, path)
-            return JSONResponse(status_code=429, content={"detail": "Too Many Requests"},
-                                headers={"Retry-After": str(RATE_LIMIT_WINDOW)})
+        peer_ip = _client_ip(request)
+        if not self._api_secret:
+            if is_unproxied_local_request(peer_ip, request.headers):
+                return await call_next(request)
+            log.warning("[AUTH] acces distant refuse sans cle peer=%s path=%s", peer_ip, path)
+            return _json_error(
+                403,
+                "Acces distant refuse : configurez API_SECRET_KEY.",
+            )
+
+        if not _rate_ok(peer_ip):
+            log.warning("[AUTH] rate-limit peer=%s path=%s", peer_ip, path)
+            return _json_error(
+                429,
+                "Too Many Requests",
+                **{"Retry-After": str(RATE_LIMIT_WINDOW)},
+            )
 
         token = _extract_token(request)
         if token is None:
-            return JSONResponse(status_code=401,
-                                content={"detail": "Cle API requise (X-API-Key, Bearer ou ?api_key=)."})
+            return _json_error(401, "Cle API requise (X-API-Key ou Bearer).")
         if not hmac.compare_digest(token, self._api_secret):
-            log.warning("[AUTH] cle invalide IP=%s path=%s", ip, path)
-            return JSONResponse(status_code=403, content={"detail": "Cle API invalide."})
+            log.warning("[AUTH] cle invalide peer=%s path=%s", peer_ip, path)
+            return _json_error(403, "Cle API invalide.")
         return await call_next(request)
 
 
 def add_auth_middleware(app: FastAPI) -> bool:
-    """Monte la protection SI une cle est definie. Retourne True si active.
-
-    No-op (rien monte, aucun risque) quand API_SECRET_KEY est vide.
-    """
+    """Always mount the security boundary; return whether key auth is active."""
     secret = get_api_secret()
-    if not secret:
-        log.info("[AUTH] protection API desactivee (API_SECRET_KEY vide).")
-        return False
-    app.add_middleware(APIKeyAuthMiddleware, api_secret=secret)
-    log.info("[AUTH] protection API ACTIVE. Rate-limit %d req/%ds.",
-             RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
-    return True
+    if secret and len(secret) < MIN_API_SECRET_LENGTH:
+        raise RuntimeError(
+            "API_SECRET_KEY est trop courte (minimum {} caracteres).".format(
+                MIN_API_SECRET_LENGTH
+            )
+        )
+    allowed_hosts = parse_allowed_hosts(os.getenv("ORCHESTRATOR_ALLOWED_HOSTS"))
+    app.add_middleware(
+        APIKeyAuthMiddleware,
+        api_secret=secret,
+        allowed_hosts=allowed_hosts,
+    )
+    if secret:
+        log.info(
+            "[AUTH] protection API active. Rate-limit %d req/%ds, hotes=%s.",
+            RATE_LIMIT_REQUESTS,
+            RATE_LIMIT_WINDOW,
+            ",".join(allowed_hosts),
+        )
+    else:
+        log.warning(
+            "[AUTH] API_SECRET_KEY vide : API limitee aux acces loopback directs, hotes=%s.",
+            ",".join(allowed_hosts),
+        )
+    return bool(secret)

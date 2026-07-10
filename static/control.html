@@ -313,6 +313,7 @@ main{grid-area:main;overflow-y:auto;padding:var(--sp-6);position:relative}
  </main>
 </div>
 <div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="false"></div>
+<script src="/static/secure-sse.js"></script>
 <script>
 /* ============================================================
    Centre de contrôle Orchestrator — JS inline.
@@ -787,8 +788,7 @@ async function sendChat(){
 // SSE (B-INC-03) — backend envoie data:{type:'...'} sans event:
 // Types possibles : task_started, task_completed, task_failed, agent_message,
 //   agent_status_change, error, monitoring_reset, heartbeat, connected.
-// EventSource ne supporte pas les headers custom → on passe api_key en query string
-// (suppose que le middleware d'auth accepte ?api_key= pour /api/events).
+// Flux SSE lu avec fetch afin de garder la cle dans le header X-API-Key.
 // ============================================================
 let sseSource=null, sseBackoff=1000, sseHeartbeat=0, sseStaleTimer=null;
 function setConn(state){
@@ -800,10 +800,8 @@ function setConn(state){
 function connectSSE(){
   if(sseSource){ try{ sseSource.close(); }catch(_){ } sseSource=null; }
   setConn('connecting');
-  // Auth en query string car EventSource ne supporte pas les headers custom
-  const url = '/api/events' + (CONFIG.apiKey ? ('?api_key='+encodeURIComponent(CONFIG.apiKey)) : '');
   let src;
-  try{ src = new EventSource(url); }catch(e){ setConn('offline'); return; }
+  try{ src = new SecureEventSource('/api/events', {apiKey:()=>CONFIG.apiKey}); }catch(e){ setConn('offline'); return; }
   sseSource = src;
   src.onopen = ()=>{ sseBackoff=1000; sseHeartbeat=Date.now(); setConn('online'); };
   src.onerror = ()=>{

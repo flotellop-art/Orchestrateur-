@@ -189,6 +189,25 @@ header h1 span { color: var(--orange); }
 var currentUrl = null;
 var creationRunning = false;
 
+// Ajoute la cle configuree dans /control a tous les appels du tableau de bord.
+(function () {
+  var nativeFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    init = init || {};
+    var headers = new Headers(init.headers || (input && input.headers) || {});
+    try {
+      var rawUrl = input && input.url ? input.url : input;
+      var requestUrl = new URL(rawUrl, window.location.href);
+      if (requestUrl.origin === window.location.origin) {
+        var key = localStorage.getItem('ORCH_API_KEY') || '';
+        if (key && !headers.has('X-API-Key')) headers.set('X-API-Key', key);
+      }
+    } catch (_) {}
+    init.headers = headers;
+    return nativeFetch(input, init);
+  };
+})();
+
 // ── Exemples ──────────────────────────────────────────────────────────────────
 var EXAMPLES = {
   'Liste de tâches': 'Une application de liste de tâches avec la possibilité d\'ajouter des tâches, les cocher comme faites, et les supprimer. Interface moderne et claire.',
