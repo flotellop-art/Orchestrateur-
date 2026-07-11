@@ -22,12 +22,14 @@ nouvelle application du compte ou de la machine entraîne une nouvelle question.
 
 ## Installations prises en charge
 
-- Python : version exacte demandée à PyPI dans `.orchestrator/python`, avec des
-  paquets binaires uniquement et sans toucher au Python de l'Orchestrateur. Une
-  politique globale imposée par l'administrateur de la machine peut rediriger
-  cet index.
-- npm : version exacte dans un espace privé de la tâche, avec configuration
-  vierge, registre officiel imposé et scripts toujours refusés.
+- Python : version exacte demandée à PyPI, paquets binaires uniquement. En mode
+  Docker, les fichiers sont écrits dans
+  `.orchestrator/python-packages` du dossier de la tâche. En mode local, ils
+  utilisent un environnement privé sans toucher au Python d'Orchestrateur.
+- npm : version exacte dans `.orchestrator/npm`, avec configuration vierge,
+  registre officiel imposé et scripts toujours refusés. En mode Docker,
+  l'installation a lieu dans un conteneur temporaire puis son résultat est
+  conservé dans le dossier de la tâche.
 - winget : identifiant et version exacts depuis la source officielle Windows,
   pour le compte courant ou toute la machine.
 
@@ -67,32 +69,33 @@ tâche et dix demandes au maximum peuvent attendre.
 La mise à jour d'une demande est atomique : une seconde réponse, une réponse
 ancienne ou une réponse destinée à une autre tâche est refusée.
 
-## Limite de sécurité connue
+## Limites de sécurité connues
 
-Ce mécanisme rend les demandes visibles et évite les installations accidentelles,
-mais ce n'est pas encore une frontière système infranchissable. Un agent peut
-écrire un programme Python ou Node puis l'exécuter ; ce programme tourne encore
-avec les droits du compte qui héberge l'Orchestrateur et peut tenter de
-télécharger, installer, appeler lui-même les routes HTTP locales ou modifier la
-base. Sans clé API, un programme hostile possédant les mêmes droits peut même
-tenter d'approuver sa propre demande. Le système protège donc les erreurs et les
-agents coopératifs, pas du code hostile.
+En mode Docker, les commandes Python/npm et le programme qui utilise leurs
+résultats restent dans le conteneur de la tâche. Le réseau n'est ouvert pendant
+l'installation que si
+`ORCHESTRATOR_SANDBOX_ALLOW_INSTALL_NETWORK=true`, puis il est à nouveau coupé
+pour les commandes et tests ordinaires. L'absence de Docker ou de l'image
+approuvée provoque un refus, jamais un retour silencieux vers le mode local.
+
+Le mode `local` ne possède pas cette frontière : le programme généré agit avec
+les droits du compte qui héberge Orchestrateur. Il doit rester réservé au
+développement et aux projets de confiance.
 
 Une source officielle ne garantit pas qu'un paquet ou son éditeur est fiable.
 Une application winget est installée pour l'utilisateur mais n'est pas lancée
 automatiquement par l'agent. Une installation machine peut afficher l'accord
 natif Windows ou échouer si l'élévation n'est pas disponible.
 
-Pour rendre ces niveaux impossibles à contourner, une étape future devra lancer
-le code des agents dans un conteneur ou sous un compte Windows restreint. Le
-courtier d'installation devra rester en dehors de cet espace isolé et être le
-seul composant autorisé à installer. Les installations administrateur devront
-alors passer par un petit composant dédié et par l'autorisation native Windows.
+WinGet reste volontairement un courtier de l'hôte : il installe une application
+Windows hors du conteneur après un accord ponctuel. Avant une version stable,
+les installations administrateur devraient passer par un petit composant dédié
+et par l'autorisation native Windows, avec une identité d'éditeur vérifiée.
 
 ## Points à réévaluer
 
 - ajout de Homebrew, Flatpak ou apt sur d'autres systèmes ;
 - vérification de l'éditeur, de la taille et des dépendances avant accord ;
 - désinstallation et retour arrière ;
-- remplacement de l'arrêt « au mieux » par un Job Object Windows dédié ;
+- journal d'audit externe et inviolable des décisions sensibles ;
 - quotas globaux de disque, de temps et d'installations simultanées.

@@ -174,6 +174,8 @@ main{grid-area:main;overflow-y:auto;padding:var(--sp-6);position:relative}
    <a class="nav-item" href="#apps" data-route="apps"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>Apps<span class="nav-badge" id="badge-apps">0</span></a>
    <div class="nav-section-title">Travail</div>
    <a class="nav-item" href="/workspace" title="Ouvre l'espace de travail multi-agents"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14L21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>Espace agents</a>
+   <a class="nav-item" href="/automations">Programmations</a>
+   <a class="nav-item" href="/skills">Comp&eacute;tences</a>
    <div class="nav-section-title">Système</div>
    <a class="nav-item" href="#settings" data-route="settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1"/></svg>Settings</a>
   </nav>
@@ -733,7 +735,6 @@ async function sendChat(){
   const text = (input.value||'').trim();
   if(!text) return;
   input.value=''; input.style.height='auto';
-  const model = $('#chat-model').value;
   chatHistory.push({role:'user', content:text});
   chatAppend('user', text);
   const asstEl = chatAppend('assistant', '…');
@@ -742,7 +743,7 @@ async function sendChat(){
     const resp = await apiFetch('/api/chat', {
       method:'POST',
       headers:{'Accept':'text/event-stream'},
-      body: JSON.stringify({ model, messages: chatHistory, stream:true })
+      body: JSON.stringify({message:text, session_id:'control'})
     });
     if(resp.status===401||resp.status===403){
       toast('Authentification requise','Saisissez votre clé API dans Settings.','error');
@@ -767,7 +768,20 @@ async function sendChat(){
           if(raw==='[DONE]') continue;
           try{
             const j = JSON.parse(raw);
-            const delta = j.delta || j.content || (j.choices && j.choices[0] && (j.choices[0].delta?j.choices[0].delta.content:j.choices[0].text)) || '';
+            if(j.type==='tool_executing'){
+              asstEl.innerHTML = '<em>Outil en cours : '+escapeHtml(j.tool_name||'')+'</em>';
+              continue;
+            }
+            if(j.type==='tool_result'){
+              chatAppend('assistant', 'Résultat '+String(j.tool_name||'outil')+' : '+String(j.result||''));
+              continue;
+            }
+            if(j.type==='confirmation_needed'){
+              asstEl.innerHTML = renderMarkdown((acc?acc+'\n\n':'')+'Une autorisation est nécessaire : '+String(j.description||j.tool_name||'action')+'. Ouvrez la page Chat pour accepter ou refuser.');
+              continue;
+            }
+            if(j.type==='error') throw new Error(j.message||'Erreur du chat');
+            const delta = (j.type==='text_delta' ? j.text : '') || j.delta || j.content || (j.choices && j.choices[0] && (j.choices[0].delta?j.choices[0].delta.content:j.choices[0].text)) || '';
             if(delta){ acc += delta; asstEl.innerHTML = renderMarkdown(acc); $('#chat-stream').scrollTop = $('#chat-stream').scrollHeight; }
           }catch(_){ acc += raw; asstEl.innerHTML = renderMarkdown(acc); }
         }

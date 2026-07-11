@@ -1,7 +1,7 @@
 // Service worker minimal pour l'installation PWA + cache du "shell" de l'UI.
 // IMPORTANT : on ne touche JAMAIS aux appels /api/ (SSE, POST, streaming) -> toujours reseau direct.
-const CACHE = 'orchestrateur-v1';
-const SHELL = ['/workspace', '/static/workspace.html', '/static/manifest.webmanifest', '/static/icon-app.svg'];
+const CACHE = 'orchestrateur-v2';
+const SHELL = ['/workspace', '/skills', '/automations', '/static/workspace.html', '/static/manifest.webmanifest', '/static/icon-app.svg'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL).catch(() => {})));

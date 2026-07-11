@@ -4,15 +4,15 @@ Pipeline garanti : description -> code -> verification -> demarrage -> navigateu
 """
 import asyncio
 import importlib.util
+import hmac
 import json
 import logging
 import os
 import re
-import subprocess
 import sys
-import tempfile
+import traceback
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 
@@ -23,20 +23,25 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from app_paths import APP_ROOT, DATA_ROOT, DB_PATH, PROJECTS_ROOT, STATIC_ROOT
+from app_version import __version__
 import team
 import api_control
 import managed_agents  # pont vers les Agents geres Anthropic
+import chat_agent
+import automation_api
+import skills_api
 from auth_middleware import add_auth_middleware
 from patches.security.cors_config import add_cors_middleware
 from security_policy import build_child_environment, validate_generated_app
 
-load_dotenv()
+load_dotenv(APP_ROOT / ".env", override=False)
+load_dotenv(DATA_ROOT / ".env", override=False)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-DB_PATH  = Path(__file__).parent / "apps.db"
-STATIC   = Path(__file__).parent / "static"
-PROJECTS = Path(__file__).parent / "projects"
+STATIC   = STATIC_ROOT
+PROJECTS = PROJECTS_ROOT
 PROJECTS.mkdir(exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -141,20 +146,11 @@ async def wait_for_server(port, timeout=25):
 
 def verify_python_syntax(code):
     """Verifie la syntaxe Python. Retourne l'erreur ou None si OK."""
-    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", encoding="utf-8", delete=False) as f:
-        f.write(code)
-        tmp = f.name
     try:
-        r = subprocess.run(
-            [sys.executable, "-m", "py_compile", tmp],
-            capture_output=True, text=True, timeout=10
-        )
-        return r.stderr.replace(tmp, "app.py") if r.returncode != 0 else None
-    finally:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
+        compile(code, "app.py", "exec", dont_inherit=True)
+        return None
+    except (SyntaxError, ValueError, TypeError) as exc:
+        return "".join(traceback.format_exception_only(type(exc), exc)).strip()
 
 def repair_json(s):
     """
@@ -354,15 +350,26 @@ async def creation_pipeline(app_id, description, folder, port):
 
     # Etape 5 : Demarrage du serveur
     yield evt("step", "Demarrage de votre application...")
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "app.py",
-            cwd=str(target),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=build_child_environment(),
+    if not team.sandbox_app_network_allowed():
+        message = (
+            "Apercu dynamique desactive : Docker bridge autorise aussi les sorties "
+            "reseau. Activez ORCHESTRATOR_SANDBOX_ALLOW_APP_NETWORK uniquement "
+            "si vous acceptez ce risque."
         )
-        running_servers[app_id] = proc
+        await db_update(app_id, status="stopped", error=message)
+        yield evt("error", message)
+        return
+    try:
+        handle = await team.get_sandbox_runtime().launch(
+            "app-" + str(app_id),
+            target,
+            ("python", "app.py"),
+            env={"PORT": str(port), "PYTHONUNBUFFERED": "1"},
+            network_enabled=True,
+            published_ports={port: port},
+            lifetime_seconds=3600,
+        )
+        running_servers[app_id] = handle
     except Exception as e:
         await db_update(app_id, status="failed", error=str(e))
         yield evt("error", "Impossible de demarrer : " + str(e))
@@ -373,11 +380,9 @@ async def creation_pipeline(app_id, description, folder, port):
     ok = await wait_for_server(port, timeout=25)
 
     if not ok:
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
-            err_msg = out.decode("utf-8", errors="replace")[:300]
-        except Exception:
-            err_msg = "Le serveur n'a pas repondu dans les delais."
+        await team.get_sandbox_runtime().stop("app-" + str(app_id), strict=False)
+        running_servers.pop(app_id, None)
+        err_msg = "Le serveur isole n'a pas repondu dans les delais."
         await db_update(app_id, status="failed", error=err_msg)
         yield evt("error", "L'application n'a pas demarree. " + err_msg[:150])
         return
@@ -397,16 +402,21 @@ async def lifespan(app):
     await api_control.init_control_db()
     import memory
     await memory.init_memory_db()
+    await team.start_runtime_services()
     log.info("App Creator demarre.")
-    yield
-    for proc in running_servers.values():
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-    log.info("App Creator arrete.")
+    try:
+        yield
+    finally:
+        for app_id in list(running_servers):
+            with suppress(Exception):
+                await team.get_sandbox_runtime().stop(
+                    "app-" + str(app_id), strict=False
+                )
+        running_servers.clear()
+        await team.stop_runtime_services()
+        log.info("App Creator arrete.")
 
-app = FastAPI(title="App Creator", lifespan=lifespan)
+app = FastAPI(title="Orchestrateur", lifespan=lifespan)
 # Sans cle API, seuls les appels directs depuis la machine locale sont acceptes.
 # Les tunnels et acces reseau exigent API_SECRET_KEY.
 add_auth_middleware(app)
@@ -419,6 +429,9 @@ app.include_router(team.router)
 # prioritaire ; control.html sait lire ce format.
 app.include_router(api_control.router)
 app.include_router(managed_agents.router)  # GET /api/managed-agents + /environment
+app.include_router(chat_agent.router)
+app.include_router(automation_api.router)
+app.include_router(skills_api.router)
 import memory as _memory_mod
 if _memory_mod.router is not None:
     app.include_router(_memory_mod.router)
@@ -426,9 +439,42 @@ if _memory_mod.router is not None:
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
-async def health_check():
+async def health_check(request: Request):
     # Endpoint public (jamais protege) : verif d'etat (Electron, supervision).
-    return {"status": "ok"}
+    expected_instance = os.getenv("ORCHESTRATOR_INSTANCE_TOKEN", "")
+    supplied_instance = request.headers.get("X-Orchestrator-Instance", "")
+    instance_verified = bool(
+        expected_instance
+        and supplied_instance
+        and hmac.compare_digest(expected_instance, supplied_instance)
+    )
+    return {
+        "status": "ok",
+        "version": __version__,
+        # Le jeton n'est jamais renvoye au navigateur. Electron prouve qu'il
+        # connait le secret ephemere fourni au processus enfant.
+        "instance": instance_verified,
+    }
+
+
+@app.post("/api/runtime/prepare-shutdown")
+async def prepare_runtime_shutdown(request: Request):
+    """Libere baux et conteneurs avant l'arret force du processus Windows."""
+    expected = os.getenv("ORCHESTRATOR_INSTANCE_TOKEN", "")
+    supplied = request.headers.get("X-Orchestrator-Instance", "")
+    if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+        raise HTTPException(404, "Endpoint indisponible")
+    for app_id in list(running_servers):
+        with suppress(Exception):
+            await team.get_sandbox_runtime().stop("app-" + str(app_id), strict=False)
+    running_servers.clear()
+    await team.stop_runtime_services()
+    return {"status": "ready"}
+
+
+@app.get("/api/version")
+async def version_info():
+    return {"version": __version__, "stage": "beta"}
 
 @app.get("/api/stats")
 async def stats():
@@ -476,32 +522,61 @@ async def start_app(app_id: int):
         return {"status": "already_running", "url": "http://localhost:{}".format(a["port"])}
     if not (Path(a["folder"]) / "app.py").exists():
         raise HTTPException(400, "Fichiers introuvables")
+    if not team.sandbox_app_network_allowed():
+        raise HTTPException(
+            409,
+            "Apercu dynamique desactive tant qu'un reseau Docker interne "
+            "sans sortie Internet n'est pas configure.",
+        )
 
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, "app.py",
-        cwd=a["folder"],
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env=build_child_environment(),
-    )
-    running_servers[app_id] = proc
+    try:
+        handle = await team.get_sandbox_runtime().launch(
+            "app-" + str(app_id),
+            a["folder"],
+            ("python", "app.py"),
+            env={"PORT": str(a["port"]), "PYTHONUNBUFFERED": "1"},
+            network_enabled=True,
+            published_ports={int(a["port"]): int(a["port"])},
+            lifetime_seconds=3600,
+        )
+    except Exception as exc:
+        raise HTTPException(409, "Lancement isole refuse : " + str(exc)[:500])
+    running_servers[app_id] = handle
     ok = await wait_for_server(a["port"], timeout=20)
     if ok:
         await db_update(app_id, status="running")
         return {"status": "running", "url": "http://localhost:{}".format(a["port"])}
     else:
+        runtime = team.get_sandbox_runtime()
+        cleanup = await runtime.stop("app-" + str(app_id), strict=False)
+        running_servers.pop(app_id, None)
         await db_update(app_id, status="failed")
+        if cleanup.failed:
+            runtime.block_execution(
+                "Le conteneur de l'application n'a pas pu etre nettoye."
+            )
+            raise HTTPException(500, "Le conteneur de l'application a resiste au nettoyage.")
         return {"status": "failed"}
 
 @app.post("/api/apps/{app_id}/stop")
 async def stop_app(app_id: int):
-    proc = running_servers.pop(app_id, None)
-    if proc:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+    app_record = await db_get(app_id)
+    if not app_record:
+        raise HTTPException(404, "Application introuvable")
+    running_servers.pop(app_id, None)
+    if app_record.get("status") != "running":
+        await db_update(app_id, status="stopped")
+        return {"status": "stopped"}
+    runtime = team.get_sandbox_runtime()
+    try:
+        cleanup = await runtime.stop("app-" + str(app_id), strict=False)
+    except team.SandboxError as exc:
+        runtime.block_execution("Le nettoyage Docker de l'application est incomplet.")
+        raise HTTPException(503, str(exc)[:500]) from None
     await db_update(app_id, status="stopped")
+    if cleanup.failed:
+        runtime.block_execution("Le nettoyage Docker de l'application est incomplet.")
+        raise HTTPException(500, "Le conteneur de l'application a resiste au nettoyage.")
     return {"status": "stopped"}
 
 @app.delete("/api/apps/{app_id}")
@@ -509,8 +584,14 @@ async def delete_app(app_id: int):
     await stop_app(app_id)
     a = await db_get(app_id)
     if a:
-        import shutil
-        shutil.rmtree(a["folder"], ignore_errors=True)
+        folder = Path(a["folder"]).resolve(strict=False)
+        projects_root = PROJECTS.resolve()
+        if folder != projects_root and projects_root in folder.parents:
+            if not await asyncio.to_thread(team._rmtree_force, folder):
+                raise HTTPException(500, "Le dossier de l'application n'a pas pu etre supprime.")
+        else:
+            log.error("Suppression du dossier d'application refusee : %s", folder)
+            raise HTTPException(400, "Dossier d'application invalide ; suppression refusee.")
     await db_delete(app_id)
     return {"deleted": True}
 
@@ -548,7 +629,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "orchestrator:app",
+        app,
         host=os.getenv("ORCHESTRATOR_HOST", "127.0.0.1"),
         port=int(os.getenv("PORT", "8000")),
         reload=False,

@@ -33,13 +33,53 @@ class StaticSecurityRegressionTests(unittest.TestCase):
         main = (ROOT / "electron-app" / "main.js").read_text(encoding="utf-8")
         self.assertIn("BASE+'/health'", main)
         self.assertNotIn("BASE+'/api/stats'", main)
+        self.assertIn("'X-Orchestrator-Instance':INSTANCE_TOKEN", main)
+        self.assertIn("data.instance===true", main)
+
+    def test_electron_releases_runtime_before_killing_windows_backend(self):
+        main = (ROOT / "electron-app" / "main.js").read_text(encoding="utf-8")
+        self.assertIn("/api/runtime/prepare-shutdown", main)
+        self.assertLess(main.index("await prepareBackendShutdown()"), main.index("child.kill('SIGTERM')"))
+
+    def test_packaged_backend_contains_claude_sdk_binary_data(self):
+        spec = (ROOT / "orchestrator.spec").read_text(encoding="utf-8")
+        self.assertIn('collect_data_files(', spec)
+        self.assertIn('includes=["_bundled/*"]', spec)
+
+    def test_generated_pages_keep_their_stricter_sandbox_csp(self):
+        team = (ROOT / "team.py").read_text(encoding="utf-8")
+        hardening = (ROOT / "electron-app" / "electron_hardening.js").read_text(encoding="utf-8")
+        self.assertIn("sandbox allow-scripts; default-src 'none'", team)
+        self.assertIn("const existingCsp", hardening)
+        self.assertIn("if (!existingCsp || existingCsp.length === 0)", hardening)
+
+    def test_general_chat_cannot_execute_host_commands(self):
+        chat_agent = (ROOT / "chat_agent.py").read_text(encoding="utf-8")
+        self.assertNotIn('{"name": "run_command"', chat_agent)
+        self.assertNotIn("safe_run_command_sync", chat_agent)
 
     def test_desktop_package_does_not_embed_runtime_secrets(self):
         package = (ROOT / "electron-app" / "package.json").read_text(encoding="utf-8")
         self.assertNotIn('".env",', package)
         self.assertNotIn('"*.db"', package)
-        self.assertIn('"security_policy.py"', package)
-        self.assertIn('"install_permissions.py"', package)
+        self.assertIn('"backend/orchestrator-backend/"', package)
+        self.assertNotIn('"security_policy.py"', package)
+        self.assertNotIn('"install_permissions.py"', package)
+
+    def test_desktop_uses_the_packaged_backend_and_user_data(self):
+        main = (ROOT / "electron-app" / "main.js").read_text(encoding="utf-8")
+        self.assertIn("ORCHESTRATOR_DATA_DIR", main)
+        self.assertIn("orchestrator-backend.exe", main)
+        self.assertIn("windowsHide:true", main)
+
+    def test_versions_are_synchronized_and_dependencies_are_pinned(self):
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        package = (ROOT / "electron-app" / "package.json").read_text(encoding="utf-8")
+        requirements = (ROOT / "requirements_orchestrator.txt").read_text(encoding="utf-8")
+        self.assertIn('"version": "' + version + '"', package)
+        for line in requirements.splitlines():
+            if line.strip() and not line.lstrip().startswith("#"):
+                self.assertIn("==", line)
 
     def test_tunnel_launcher_requires_a_strong_key_and_remote_host(self):
         launcher = (ROOT / "start_tunnel.bat").read_text(encoding="utf-8")

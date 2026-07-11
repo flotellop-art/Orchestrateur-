@@ -1,6 +1,7 @@
 @echo off
+setlocal
 echo ==========================================
-echo   Installation - Multi-Agent Desktop App
+echo   Preparation du developpement Orchestrateur
 echo ==========================================
 echo.
 
@@ -16,8 +17,15 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-for /f "tokens=*" %%i in ('"C:\Program Files\nodejs\node.exe" --version 2^>nul') do set NODE_VER=%%i
+for /f "tokens=*" %%i in ('node --version 2^>nul') do set NODE_VER=%%i
 echo [OK] Node.js detecte : %NODE_VER%
+
+where npm >nul 2>nul
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERREUR] npm n'est pas disponible dans le PATH.
+    pause
+    exit /b 1
+)
 
 :: Verifier Python
 python --version >nul 2>nul
@@ -32,18 +40,23 @@ echo [OK] Python detecte.
 echo.
 echo [INSTALL] Installation des dependances Python...
 cd /d "%~dp0"
-python -m pip install -r requirements_orchestrator.txt -q
+python -m pip install -r requirements-dev.txt
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERREUR] Installation Python impossible.
+    pause
+    exit /b 1
+)
 
 :: Installer les dependances npm
 echo.
 echo [INSTALL] Installation des dependances npm (Electron)...
 cd /d "%~dp0electron-app"
-"C:\Program Files\nodejs\npm.cmd" install --include=dev
-
-:: Generer les icones
-echo.
-echo [ICONS] Generation des icones...
-python generate_icon.py
+call npm ci
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERREUR] Installation Electron impossible.
+    pause
+    exit /b 1
+)
 
 echo.
 echo ==========================================

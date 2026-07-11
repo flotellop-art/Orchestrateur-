@@ -1,18 +1,21 @@
 {
   "name": "multi-agent-orchestrator",
-  "version": "1.0.0",
+  "version": "0.2.0-beta.1",
   "description": "Multi-Agent Orchestrator - Application Desktop",
+  "author": "flotellop-art",
+  "license": "MIT",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
     "build": "electron-builder --win",
     "build:mac": "electron-builder --mac",
     "build:linux": "electron-builder --linux",
-    "install-deps": "npm install"
+    "install-deps": "npm ci"
   },
   "build": {
     "appId": "com.telop.orchestrator",
     "productName": "Multi-Agent Orchestrator",
+    "asar": true,
     "directories": {
       "output": "dist"
     },
@@ -25,27 +28,35 @@
     ],
     "extraResources": [
       {
-        "from": "../",
-        "to": "app",
+        "from": "backend/orchestrator-backend/",
+        "to": "backend/orchestrator-backend/",
         "filter": [
-          "orchestrator.py",
-          "team.py",
-          "api_control.py",
-          "managed_agents.py",
-          "memory.py",
-          "auth_middleware.py",
-          "security_policy.py",
-          "install_permissions.py",
-          "chat_agent.py",
-          "run.py",
-          "requirements_orchestrator.txt",
-          ".env.example",
-          "static/**",
-          "patches/**"
+          "**/*"
         ]
+      },
+      {
+        "from": "../.env.example",
+        "to": ".env.example"
+      },
+      {
+        "from": "../VERSION",
+        "to": "VERSION"
+      },
+      {
+        "from": "../LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "../sandbox/",
+        "to": "sandbox/"
+      },
+      {
+        "from": "../scripts/build_sandbox.ps1",
+        "to": "tools/build_sandbox.ps1"
       }
     ],
     "win": {
+      "icon": "assets/icon.png",
       "target": [
         {
           "target": "nsis"
@@ -54,6 +65,11 @@
           "target": "portable"
         }
       ]
+    },
+    "nsis": {
+      "license": "../LICENSE",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
     },
     "linux": {
       "target": [
@@ -71,7 +87,7 @@
     }
   },
   "devDependencies": {
-    "electron": "^28.0.0",
-    "electron-builder": "^24.13.3"
+    "electron": "43.1.0",
+    "electron-builder": "26.15.3"
   }
 }

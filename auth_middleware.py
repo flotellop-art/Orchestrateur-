@@ -20,6 +20,7 @@ import os
 import time
 from collections import OrderedDict, deque
 from typing import Callable, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -59,7 +60,7 @@ def _positive_env_int(name: str, default: int) -> int:
 PUBLIC_PATHS: set[str] = {
     "/", "/control", "/workspace", "/sw.js",
     "/favicon.ico", "/manifest.webmanifest", "/static/manifest.webmanifest",
-    "/health", "/api/health",
+    "/health", "/api/health", "/api/runtime/prepare-shutdown",
 }
 PUBLIC_PREFIXES: tuple[str, ...] = ("/static/",)
 
@@ -116,6 +117,33 @@ def _json_error(status: int, detail: str, **headers: str) -> JSONResponse:
     return JSONResponse(status_code=status, content={"detail": detail}, headers=response_headers)
 
 
+def _browser_mutation_allowed(request: Request, host: str | None) -> bool:
+    """Bloque les commandes aveugles envoyees par une autre origine locale."""
+    if request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+        return True
+    origin = request.headers.get("origin", "").strip()
+    fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+    # Les clients non navigateur (CLI/API) n'envoient aucun de ces en-tetes.
+    if not origin and not fetch_site:
+        return True
+    if fetch_site != "same-origin" or not origin or not host:
+        return False
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        return False
+    return hmac.compare_digest(parsed.netloc.casefold(), host.casefold())
+
+
 class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: ASGIApp, api_secret: str, allowed_hosts: tuple[str, ...]) -> None:
         super().__init__(app)
@@ -127,6 +155,13 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
         if not is_allowed_host(host, self._allowed_hosts):
             log.warning("[AUTH] Host refuse=%r peer=%s", host, _client_ip(request))
             return _json_error(400, "Hote HTTP non autorise.")
+
+        if not _browser_mutation_allowed(request, host):
+            log.warning(
+                "[AUTH] requete navigateur inter-origine refusee peer=%s path=%s",
+                _client_ip(request), request.url.path,
+            )
+            return _json_error(403, "Requete inter-origine refusee.")
 
         path = request.url.path
         if _is_public(path):

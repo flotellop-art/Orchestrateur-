@@ -42,7 +42,7 @@ _VERSION = "1.1.0"
 # ── Chemin de la base de données (même que orchestrator.py / team.py) ─────────
 # Résolu dynamiquement depuis l'emplacement de *ce* fichier une fois monté.
 # Peut être surchargé avant import si la DB est ailleurs.
-DB_PATH = Path(__file__).parent / "apps.db"
+from app_paths import DB_PATH
 
 # ── Table des prix approximatifs par modèle ($/1 000 tokens) ─────────────────
 # Source : tarifs publics mai 2026 — à mettre à jour si nécessaire.

@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Travaux programmés · Orchestrateur</title>
+  <style>
+    :root {
+      --bg: #f6f7fa; --card: #fff; --ink: #1a1a2e; --muted: #667085;
+      --accent: #d96f45; --accent-dark: #b75531; --border: #dfe3ea;
+      --good: #18794e; --warn: #9a6700; --bad: #b42318; --radius: 14px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); min-height: 100vh; }
+    header { background: var(--ink); color: white; padding: 18px 24px; }
+    .header-inner { max-width: 1120px; margin: auto; display: flex; gap: 18px;
+      align-items: center; justify-content: space-between; }
+    h1 { margin: 0; font-size: 1.2rem; }
+    header a { color: #ffae8b; text-decoration: none; font-weight: 700; }
+    main { max-width: 1120px; margin: 28px auto; padding: 0 18px 48px;
+      display: grid; grid-template-columns: minmax(280px, 390px) minmax(0, 1fr); gap: 22px; }
+    .panel { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 22px; box-shadow: 0 8px 30px rgba(25, 35, 55, .06); }
+    h2 { margin: 0 0 6px; font-size: 1.18rem; }
+    .intro, .hint { color: var(--muted); line-height: 1.45; }
+    .intro { margin: 0 0 20px; }
+    .hint { margin: 6px 0 0; font-size: .82rem; }
+    label { display: block; font-weight: 750; font-size: .86rem; margin: 15px 0 6px; }
+    input, select { width: 100%; border: 1px solid var(--border); border-radius: 9px;
+      padding: 10px 11px; background: white; color: var(--ink); font: inherit; }
+    input:focus, select:focus, button:focus-visible { outline: 3px solid rgba(217,111,69,.25);
+      border-color: var(--accent); }
+    .schedule-fields[hidden] { display: none; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    button { border: 0; border-radius: 9px; padding: 10px 14px; font: inherit;
+      font-weight: 750; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .primary { width: 100%; margin-top: 20px; background: var(--accent); color: white; }
+    .primary:hover { background: var(--accent-dark); }
+    .secondary { background: #eef1f5; color: var(--ink); }
+    .danger { background: #feeceb; color: var(--bad); }
+    .toolbar { display: flex; justify-content: space-between; gap: 12px; align-items: center;
+      margin-bottom: 14px; }
+    .toolbar h2 { margin: 0; }
+    #automation-list { display: grid; gap: 12px; }
+    .automation-card { border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+    .card-head { display: flex; gap: 10px; justify-content: space-between; align-items: start; }
+    .card-title { font-weight: 800; overflow-wrap: anywhere; }
+    .badge { border-radius: 999px; padding: 3px 9px; font-size: .74rem; font-weight: 800;
+      white-space: nowrap; background: #edf3ff; color: #245ea8; }
+    .badge.paused { background: #fff5d6; color: var(--warn); }
+    .badge.cancelled { background: #f2f2f2; color: var(--muted); }
+    .meta { color: var(--muted); font-size: .84rem; line-height: 1.5; margin-top: 7px;
+      overflow-wrap: anywhere; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 13px; }
+    .actions button { padding: 7px 10px; font-size: .82rem; }
+    .empty { color: var(--muted); padding: 26px 4px; text-align: center; }
+    #status { min-height: 22px; margin: 12px 0 0; color: var(--muted); font-size: .86rem; }
+    #status.error { color: var(--bad); }
+    @media (max-width: 800px) {
+      main { grid-template-columns: 1fr; }
+      .header-inner { align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>Travaux programmés</h1>
+      <a href="/workspace">Retour à l’équipe</a>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" aria-labelledby="create-title">
+      <h2 id="create-title">Programmer une tâche</h2>
+      <p class="intro">Choisissez une tâche existante et le moment où Orchestrateur doit la relancer.</p>
+
+      <form id="automation-form">
+        <label for="name">Nom de la programmation</label>
+        <input id="name" name="name" maxlength="120" required autocomplete="off"
+          placeholder="Ex. Rapport du lundi">
+
+        <label for="task-id">Tâche à exécuter</label>
+        <select id="task-id" name="task_id" required></select>
+
+        <label for="schedule-type">Rythme</label>
+        <select id="schedule-type" name="schedule_type">
+          <option value="interval">À intervalle régulier</option>
+          <option value="daily">Chaque jour</option>
+          <option value="weekly">Chaque semaine</option>
+        </select>
+
+        <div id="interval-fields" class="schedule-fields">
+          <label for="interval-seconds">Toutes les… (secondes)</label>
+          <input id="interval-seconds" type="number" min="60" max="31536000" value="3600" required>
+          <p class="hint">La première exécution aura lieu après cet intervalle.</p>
+        </div>
+
+        <div id="daily-fields" class="schedule-fields" hidden>
+          <label for="daily-time">Heure UTC</label>
+          <input id="daily-time" type="time" value="08:00" required>
+        </div>
+
+        <div id="weekly-fields" class="schedule-fields" hidden>
+          <div class="row">
+            <div>
+              <label for="weekday">Jour</label>
+              <select id="weekday">
+                <option value="0">Lundi</option><option value="1">Mardi</option>
+                <option value="2">Mercredi</option><option value="3">Jeudi</option>
+                <option value="4">Vendredi</option><option value="5">Samedi</option>
+                <option value="6">Dimanche</option>
+              </select>
+            </div>
+            <div>
+              <label for="weekly-time">Heure UTC</label>
+              <input id="weekly-time" type="time" value="09:00" required>
+            </div>
+          </div>
+        </div>
+
+        <label for="notification-channel">Notification après exécution</label>
+        <select id="notification-channel">
+          <option value="">Aucune notification</option>
+        </select>
+        <p class="hint">Seuls les canaux préparés par l’administrateur sont proposés.</p>
+
+        <button id="create-button" class="primary" type="submit" disabled>Programmer</button>
+      </form>
+      <p id="status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="list-title">
+      <div class="toolbar">
+        <h2 id="list-title">Programmations</h2>
+        <button id="refresh-button" class="secondary" type="button">Actualiser</button>
+      </div>
+      <div id="automation-list" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <script>
+    'use strict';
+
+    var pendingIdempotencyKey = null;
+    var elements = {
+      form: document.getElementById('automation-form'),
+      name: document.getElementById('name'),
+      task: document.getElementById('task-id'),
+      type: document.getElementById('schedule-type'),
+      interval: document.getElementById('interval-seconds'),
+      dailyTime: document.getElementById('daily-time'),
+      weekday: document.getElementById('weekday'),
+      weeklyTime: document.getElementById('weekly-time'),
+      channel: document.getElementById('notification-channel'),
+      status: document.getElementById('status'),
+      list: document.getElementById('automation-list'),
+      createButton: document.getElementById('create-button'),
+      refreshButton: document.getElementById('refresh-button')
+    };
+
+    function apiKey() {
+      try { return localStorage.getItem('ORCH_API_KEY') || ''; } catch (_) { return ''; }
+    }
+
+    async function apiFetch(url, options) {
+      var config = Object.assign({}, options || {});
+      var headers = new Headers(config.headers || {});
+      var key = apiKey();
+      if (key) headers.set('X-API-Key', key);
+      config.headers = headers;
+      var response = await fetch(url, config);
+      var data = null;
+      try { data = await response.json(); } catch (_) {}
+      if (!response.ok) {
+        var message = data && data.detail ? String(data.detail) : 'La demande a échoué.';
+        throw new Error(message);
+      }
+      return data;
+    }
+
+    function setStatus(message, isError) {
+      elements.status.textContent = message || '';
+      elements.status.className = isError ? 'error' : '';
+    }
+
+    function option(value, label) {
+      var node = document.createElement('option');
+      node.value = String(value);
+      node.textContent = String(label);
+      return node;
+    }
+
+    function shortObjective(task) {
+      var objective = String(task.objective || 'Tâche sans titre').replace(/\s+/g, ' ').trim();
+      if (objective.length > 72) objective = objective.slice(0, 69) + '…';
+      var mode = task.execution_mode === 'docker' ? 'Docker isolé' : 'Local non isolé';
+      return '#' + String(task.id) + ' · ' + mode + ' · ' + objective;
+    }
+
+    async function loadChoices() {
+      var results = await Promise.all([
+        apiFetch('/api/tasks'),
+        apiFetch('/api/automations/channels')
+      ]);
+      var taskData = results[0];
+      var tasks = Array.isArray(taskData) ? taskData : ((taskData && taskData.tasks) || []);
+      elements.task.replaceChildren();
+      var validTasks = 0;
+      tasks.forEach(function (task) {
+        if (Number.isInteger(task.id) && task.id > 0 && task.execution_mode === 'docker') {
+          elements.task.appendChild(option(task.id, shortObjective(task)));
+          validTasks += 1;
+        }
+      });
+      if (!validTasks) {
+        elements.task.appendChild(option('', 'Aucune tâche disponible'));
+        elements.task.disabled = true;
+        elements.createButton.disabled = true;
+      } else {
+        elements.task.disabled = false;
+        elements.createButton.disabled = false;
+      }
+
+      var currentChannel = elements.channel.value;
+      elements.channel.replaceChildren(option('', 'Aucune notification'));
+      ((results[1] && results[1].channels) || []).forEach(function (name) {
+        if (typeof name === 'string') elements.channel.appendChild(option(name, name));
+      });
+      if (Array.from(elements.channel.options).some(function (item) { return item.value === currentChannel; })) {
+        elements.channel.value = currentChannel;
+      }
+    }
+
+    function updateScheduleFields() {
+      var selected = elements.type.value;
+      document.getElementById('interval-fields').hidden = selected !== 'interval';
+      document.getElementById('daily-fields').hidden = selected !== 'daily';
+      document.getElementById('weekly-fields').hidden = selected !== 'weekly';
+    }
+
+    function clock(value) {
+      var parts = String(value || '').split(':');
+      return {hour: Number(parts[0]), minute: Number(parts[1] || 0), second: 0};
+    }
+
+    function schedulePayload() {
+      if (elements.type.value === 'interval') {
+        return {
+          type: 'interval',
+          seconds: Number(elements.interval.value),
+          anchor: new Date().toISOString()
+        };
+      }
+      var selectedClock = clock(
+        elements.type.value === 'daily' ? elements.dailyTime.value : elements.weeklyTime.value
+      );
+      if (elements.type.value === 'daily') {
+        return {type: 'daily', hour: selectedClock.hour, minute: selectedClock.minute, second: 0};
+      }
+      return {
+        type: 'weekly', weekday: Number(elements.weekday.value),
+        hour: selectedClock.hour, minute: selectedClock.minute, second: 0
+      };
+    }
+
+    function newIdempotencyKey() {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return 'ui:' + window.crypto.randomUUID();
+      }
+      return 'ui:' + Date.now() + ':' + Math.random().toString(16).slice(2);
+    }
+
+    function scheduleLabel(schedule) {
+      if (!schedule || typeof schedule !== 'object') return 'Calendrier inconnu';
+      if (schedule.type === 'interval') return 'Toutes les ' + String(schedule.seconds) + ' secondes';
+      var hh = String(schedule.hour).padStart(2, '0');
+      var mm = String(schedule.minute).padStart(2, '0');
+      if (schedule.type === 'daily') return 'Chaque jour à ' + hh + ':' + mm + ' UTC';
+      var days = ['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'dimanche'];
+      return 'Chaque ' + (days[schedule.weekday] || 'semaine') + ' à ' + hh + ':' + mm + ' UTC';
+    }
+
+    function stateLabel(state) {
+      return {enabled: 'Active', paused: 'En pause', cancelled: 'Annulée'}[state] || 'Inconnue';
+    }
+
+    function formatUtc(value) {
+      var date = new Date(value);
+      if (Number.isNaN(date.getTime())) return 'date inconnue';
+      return new Intl.DateTimeFormat('fr-FR', {
+        dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC'
+      }).format(date) + ' UTC';
+    }
+
+    function makeButton(label, className, action, id) {
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = className;
+      button.textContent = label;
+      button.addEventListener('click', function () { changeState(id, action, button); });
+      return button;
+    }
+
+    function renderAutomation(item) {
+      var card = document.createElement('article');
+      card.className = 'automation-card';
+      var head = document.createElement('div');
+      head.className = 'card-head';
+      var title = document.createElement('div');
+      title.className = 'card-title';
+      title.textContent = String(item.name || 'Sans nom');
+      var badge = document.createElement('span');
+      badge.className = 'badge ' + String(item.state || '');
+      badge.textContent = stateLabel(item.state);
+      head.append(title, badge);
+
+      var meta = document.createElement('div');
+      meta.className = 'meta';
+      var lines = [
+        'Tâche #' + String(item.payload && item.payload.task_id),
+        scheduleLabel(item.schedule),
+        'Prochaine exécution : ' + formatUtc(item.next_run_at)
+      ];
+      if (item.payload && item.payload.notification_channel) {
+        lines.push('Notification : ' + String(item.payload.notification_channel));
+      }
+      lines.forEach(function (line) {
+        var row = document.createElement('div');
+        row.textContent = line;
+        meta.appendChild(row);
+      });
+
+      var actions = document.createElement('div');
+      actions.className = 'actions';
+      if (item.state === 'enabled') {
+        actions.appendChild(makeButton('Mettre en pause', 'secondary', 'pause', item.id));
+      } else if (item.state === 'paused') {
+        actions.appendChild(makeButton('Reprendre', 'secondary', 'resume', item.id));
+      }
+      if (item.state !== 'cancelled') {
+        actions.appendChild(makeButton('Annuler', 'danger', 'cancel', item.id));
+      }
+      card.append(head, meta, actions);
+      return card;
+    }
+
+    async function loadAutomations() {
+      elements.refreshButton.disabled = true;
+      try {
+        var data = await apiFetch('/api/automations');
+        var items = (data && data.automations) || [];
+        elements.list.replaceChildren();
+        if (!items.length) {
+          var empty = document.createElement('p');
+          empty.className = 'empty';
+          empty.textContent = 'Aucun travail programmé.';
+          elements.list.appendChild(empty);
+        } else {
+          items.forEach(function (item) { elements.list.appendChild(renderAutomation(item)); });
+        }
+      } catch (error) {
+        elements.list.replaceChildren();
+        var failure = document.createElement('p');
+        failure.className = 'empty';
+        failure.textContent = error.message;
+        elements.list.appendChild(failure);
+      } finally {
+        elements.refreshButton.disabled = false;
+      }
+    }
+
+    async function changeState(id, action, button) {
+      if (action === 'cancel' && !window.confirm('Annuler cette programmation ?')) return;
+      button.disabled = true;
+      try {
+        await apiFetch('/api/automations/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
+        setStatus('La programmation a été mise à jour.', false);
+        await loadAutomations();
+      } catch (error) {
+        setStatus(error.message, true);
+        button.disabled = false;
+      }
+    }
+
+    elements.form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      elements.createButton.disabled = true;
+      setStatus('Enregistrement…', false);
+      if (!pendingIdempotencyKey) pendingIdempotencyKey = newIdempotencyKey();
+      var payload = {task_id: Number(elements.task.value)};
+      if (elements.channel.value) payload.notification_channel = elements.channel.value;
+      var body = {
+        name: elements.name.value,
+        job_kind: 'run_task',
+        payload: payload,
+        schedule: schedulePayload(),
+        idempotency_key: pendingIdempotencyKey
+      };
+      try {
+        await apiFetch('/api/automations', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(body)
+        });
+        pendingIdempotencyKey = null;
+        elements.name.value = '';
+        setStatus('La tâche est programmée.', false);
+        await loadAutomations();
+      } catch (error) {
+        setStatus(error.message, true);
+      } finally {
+        elements.createButton.disabled = elements.task.disabled;
+      }
+    });
+
+    elements.type.addEventListener('change', updateScheduleFields);
+    elements.refreshButton.addEventListener('click', loadAutomations);
+    updateScheduleFields();
+    Promise.all([loadChoices(), loadAutomations()]).catch(function (error) {
+      setStatus(error.message, true);
+    });
+  </script>
+</body>
+</html>

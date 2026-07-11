@@ -8,7 +8,7 @@ const T = {
     clearBtn: '🗑 Effacer tout',
     launchTitle: 'Lancer un agent', roleLabel: 'Rôle',
     instrLabel: 'Instructions', instrPh: 'Décris la tâche à accomplir...',
-    modelLabel: 'Modèle', launchBtn: "Lancer l'agent", artyBtn: '3 agents Arty',
+    modelLabel: 'Modèle', launchBtn: "Lancer l'agent", artyBtn: '3 agents Orchestrateur',
     appTitle: "Lancer l'application", appUrlLabel: 'URL de l\'application',
     appBtn: "Ouvrir l'application", dashBtn: 'Ouvrir dans le navigateur',
     tabAgents: 'Agents', tabChat: 'Chat', sendBtn: 'Envoyer',
@@ -25,7 +25,7 @@ const T = {
     clearBtn: '🗑 Clear all',
     launchTitle: 'Launch an agent', roleLabel: 'Role',
     instrLabel: 'Instructions', instrPh: 'Describe the task...',
-    modelLabel: 'Model', launchBtn: 'Launch agent', artyBtn: '3 Arty agents',
+    modelLabel: 'Model', launchBtn: 'Launch agent', artyBtn: '3 Orchestrator agents',
     appTitle: 'Launch application', appUrlLabel: 'Application URL',
     appBtn: 'Open application', dashBtn: 'Open in browser',
     tabAgents: 'Agents', tabChat: 'Chat', sendBtn: 'Send',
@@ -225,9 +225,9 @@ async function launchAgent() {
 
 async function launch3Agents() {
   var agents = [
-    { role: 'Codeur', model: 'claude-sonnet-4-6', prompt: 'Analyse la structure du projet Arty, identifie les composants principaux et propose des améliorations concrètes.' },
-    { role: 'Testeur', model: 'claude-sonnet-4-6', prompt: 'Génère une suite de tests unitaires et d\'intégration pour le projet Arty.' },
-    { role: 'Bug Hunter', model: 'claude-sonnet-4-6', prompt: 'Analyse la sécurité et la qualité du projet Arty, identifie les bugs et vulnérabilités.' }
+    { role: 'Codeur', model: 'claude-sonnet-4-6', prompt: 'Analyse la structure du projet Orchestrateur, identifie les composants principaux et propose des améliorations concrètes.' },
+    { role: 'Testeur', model: 'claude-sonnet-4-6', prompt: 'Génère une suite de tests unitaires et d\'intégration pour le projet Orchestrateur.' },
+    { role: 'Bug Hunter', model: 'claude-sonnet-4-6', prompt: 'Analyse la sécurité et la qualité du projet Orchestrateur, identifie les bugs et vulnérabilités.' }
   ];
   try {
     await Promise.all(agents.map(function(a) {

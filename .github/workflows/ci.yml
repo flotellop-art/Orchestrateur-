@@ -1,0 +1,64 @@
+name: Verification continue
+
+on:
+  push:
+    branches: [main, "agent/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements_orchestrator.txt
+            requirements-dev.txt
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: electron-app/package-lock.json
+      - name: Installer les dependances Python
+        run: python -m pip install -r requirements-dev.txt
+      - name: Lancer les tests
+        run: python -m pytest -q
+      - name: Verifier la syntaxe Python
+        run: python -m compileall -q .
+      - name: Verifier JavaScript et le paquet desktop
+        run: |
+          node --check static/secure-sse.js
+          node --check electron-app/main.js
+          node --check electron-app/preload.js
+          node --check electron-app/electron_hardening.js
+          node -e "JSON.parse(require('fs').readFileSync('electron-app/package.json','utf8'))"
+
+  backend-windows:
+    name: Executable autonome Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Installer les dependances de build
+        run: python -m pip install -r requirements-dev.txt
+      - name: Construire le serveur autonome
+        shell: pwsh
+        run: ./scripts/build_backend.ps1 -Python python
+      - name: Tester le serveur empaquete
+        run: python scripts/smoke_backend.py electron-app/backend/orchestrator-backend/orchestrator-backend.exe

@@ -68,6 +68,20 @@ class AuthMiddlewareTests(unittest.IsolatedAsyncioTestCase):
     async def test_bad_host_is_rejected_even_from_loopback(self):
         self.assertEqual(await call_middleware(host="evil.example"), 400)
 
+    async def test_browser_mutations_require_the_same_origin(self):
+        self.assertEqual(await call_middleware(extra_headers={
+            "Origin": "http://127.0.0.1:5000",
+            "Sec-Fetch-Site": "same-site",
+        }), 403)
+        self.assertEqual(await call_middleware(extra_headers={
+            "Origin": "http://localhost",
+            "Sec-Fetch-Site": "same-origin",
+        }), 200)
+        self.assertEqual(await call_middleware(extra_headers={
+            "Origin": "null",
+            "Sec-Fetch-Site": "cross-site",
+        }), 403)
+
     async def test_configured_key_must_be_in_a_header(self):
         self.assertEqual(await call_middleware(
             secret="correct-key", query=b"api_key=correct-key"

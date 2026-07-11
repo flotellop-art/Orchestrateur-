@@ -32,14 +32,19 @@ ORCHESTRATOR_TARGET_ROOTS=C:\Users\vous\repos;D:\travail
 Les URL distantes sont limitées aux dépôts `https://github.com/...` et le jeton
 Git n'est pas placé dans la ligne de commande ni dans l'URL du dépôt.
 
-## Limite importante
+## Frontière d'exécution
 
-Les clés API sont retirées de l'environnement des programmes générés, mais ces
-programmes ne sont pas encore isolés du disque et du réseau par le système
-d'exploitation. N'utilisez pas l'Orchestrateur pour exécuter le contenu d'un
-dépôt ou d'une consigne non fiable. L'étape de durcissement suivante doit lancer
-chaque projet dans un conteneur ou un compte restreint, avec un dossier monté,
-le réseau coupé par défaut et des limites de mémoire, CPU et durée.
+Le mode `docker` exécute les commandes, tests et applications du projet dans un
+conteneur non administrateur. Il ne monte que le dossier de la tâche, coupe le
+réseau ordinaire, impose des limites de mémoire, processeur, processus et durée,
+et échoue si Docker ou l'image approuvée manque. Les clés API du serveur ne sont
+pas transmises au conteneur et les outils MCP sont refusés dans ce mode.
+
+Le mode `local` n'offre pas ces protections et reste réservé au développement.
+Docker réduit fortement l'impact du code hostile, mais ce n'est pas une machine
+virtuelle : maintenez Docker à jour et traitez les fichiers produits comme non
+fiables. L'aperçu d'une application web utilise le réseau Docker `bridge`, qui
+permet aussi des sorties Internet ; il est désactivé par défaut.
 
 ## Installations demandées par les agents
 
@@ -50,11 +55,12 @@ de tout l'ordinateur. Les deux derniers niveaux demandent un accord visible à
 chaque fois. Aucun accord manuel n'est mémorisé. Les demandes expirent et sont
 annulées à l'arrêt de la tâche.
 
-Ce contrôle est une règle de consentement, pas encore une isolation du système
-d'exploitation. Tant que le code des agents ne tourne pas dans un conteneur ou
-sous un compte restreint, un programme généré peut tenter de contourner le
-courtier, appeler lui-même l'API locale ou modifier la base. Le détail du
-fonctionnement et de cette limite se trouve dans
+Ce contrôle est une règle de consentement distincte de l'isolation. En mode
+Docker, Python et npm restent dans le conteneur et écrivent leurs fichiers dans
+le dossier de la tâche. Une installation WinGet agit en revanche sur Windows,
+hors du conteneur, uniquement après l'accord ponctuel exigé par son niveau. En
+mode `local`, le code possède les droits du compte qui lance Orchestrateur. Le
+détail du fonctionnement et de ces limites se trouve dans
 [`docs/INSTALL_PERMISSIONS.md`](docs/INSTALL_PERMISSIONS.md).
 
 ## Critères de contrôle
@@ -70,3 +76,7 @@ fonctionnement et de cette limite se trouve dans
 - une demande expirée, rejouée ou liée à une autre tâche est refusée ;
 - aucun accord manuel ne peut être mémorisé ;
 - le build ne lance pas d'installation issue de `requirements.txt`.
+- une tâche Docker ne revient jamais silencieusement au mode local ;
+- les commandes et tests Docker ordinaires n'ont pas de réseau ;
+- les conteneurs suivis sont arrêtés à l'arrêt du serveur et récupérés au
+  démarrage suivant.

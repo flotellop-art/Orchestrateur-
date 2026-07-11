@@ -131,6 +131,7 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 .result-box h4 { color: var(--green); margin-bottom: 6px; }
 .badge { font-size: .72rem; padding: 2px 9px; border-radius: 12px; font-weight: 700; }
 .badge.running { background: #eafaf1; color: var(--green); }
+.badge.queued { background: #eef3ff; color: #3459a6; }
 .badge.paused { background: #fff3e0; color: var(--orange-d); }
 .badge.stopped { background: #f5f5f5; color: var(--grey); }
 .badge.done { background: #eafaf1; color: var(--green); }
@@ -142,6 +143,8 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 <header>
   <h1>Equipe d'<span>agents</span> autonomes</h1>
   <div style="display:flex;align-items:center;gap:16px">
+    <a href="/automations" style="color:var(--orange);text-decoration:none;font-weight:600;font-size:.82rem">Programmations</a>
+    <a href="/skills" style="color:var(--orange);text-decoration:none;font-weight:600;font-size:.82rem">Comp&eacute;tences</a>
     <span class="turn" id="turn-info"></span> <span class="badge" id="status-badge" style="display:none"></span>
     <span class="turn" id="cost-info" style="display:none"></span>
     <a href="/memory" style="color:var(--orange);text-decoration:none;font-weight:600;font-size:.82rem">Gérer la mémoire →</a>
@@ -190,10 +193,17 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
           <option value="admin">Projet automatique + ordinateur entier sur accord</option>
         </select>
       </div>
+      <div>
+        <label for="execution-mode">Exécution du code</label>
+        <select id="execution-mode">
+          <option value="docker" selected>Isolée avec Docker (recommandé)</option>
+          <option value="local">Locale, sans isolation (développement)</option>
+        </select>
+      </div>
     </div>
     <p class="muted">Le serveur calcule toujours le niveau réel. Chaque modification du compte ou de
-      l'ordinateur demande un nouvel accord. Une dépendance reste du code exécuté avec vos droits :
-      elle n'est pas encore isolée dans un conteneur.</p>
+      l'ordinateur demande un nouvel accord. Le mode Docker refuse de démarrer si Docker est absent ;
+      il ne revient jamais silencieusement vers une exécution locale.</p>
 
     <div class="checkbox-row">
       <input type="checkbox" id="web-enabled" checked>
@@ -206,12 +216,12 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
     </div>
     <div id="company-box" style="display:none;margin-top:10px;border-left:3px solid var(--purple);padding-left:12px">
       <label for="target-repo-url">Depot GitHub a auditer (l'app le clone toute seule)</label>
-      <input type="text" id="target-repo-url" placeholder="https://github.com/flotellop-art/Arty">
+      <input type="text" id="target-repo-url" placeholder="https://github.com/organisation/projet">
       <input type="password" id="github-token" placeholder="Token GitHub (uniquement si le depot est prive)"
         style="margin-top:8px" autocomplete="off">
       <p class="muted" style="margin-top:8px">— ou —</p>
       <label for="target-path" style="margin-top:4px">Chemin d'un depot deja clone en local (optionnel)</label>
-      <input type="text" id="target-path" placeholder="C:\\Users\\Tellop\\arty-repo">
+      <input type="text" id="target-path" placeholder="C:\\Users\\vous\\projet">
       <p class="muted">L'entreprise lit le depot en <b>lecture seule</b> et ecrit ses livrables dans un dossier
         <b>delivery/</b> local (elle ne pousse jamais, ne merge pas). Le token sert au clone puis n'est ni
         stocke ni journalise. Limites etendues (jusqu'a 24 agents / 300 tours).</p>
@@ -249,7 +259,6 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
     <div class="controls">
       <button class="btn btn-ghost btn-small" id="btn-pause" onclick="ctrl('pause')">Pause</button>
       <button class="btn btn-ghost btn-small" id="btn-resume" onclick="ctrl('resume')" style="display:none">Reprendre</button>
-      <button class="btn btn-ghost btn-small" id="btn-step" onclick="ctrl('step')">Etape</button>
       <button class="btn btn-primary btn-small" id="btn-restart" onclick="restartTask()" style="display:none">Reprendre la tache</button>
       <button class="btn btn-ghost btn-small" onclick="ctrl('stop')">Arreter</button>
       <button class="btn btn-ghost btn-small" onclick="launchApp()">Lancer l'app</button>
@@ -430,6 +439,7 @@ async function launch() {
     max_agents: parseInt(document.getElementById('max-agents').value) || 4,
     max_cost_usd: parseFloat(document.getElementById('max-cost').value) || 0,
     install_policy: document.getElementById('install-policy').value,
+    execution_mode: document.getElementById('execution-mode').value,
     image: designImageData,
     company_mode: company,
     target_path: company ? (targetPath || null) : null,
@@ -446,8 +456,10 @@ async function launch() {
     var d = await r.json();
     taskId = d.id;
     try { sessionStorage.setItem(activeTaskStorageKey(), String(taskId)); } catch (_) {}
-    await fetch('/api/tasks/' + taskId + '/start', {method: 'POST'});
-    startLive();
+    var started = await fetch('/api/tasks/' + taskId + '/start', {method: 'POST'});
+    var startedBody = await started.json().catch(function(){ return {}; });
+    if (!started.ok) { throw new Error(startedBody.detail || 'Demarrage refuse'); }
+    startLive(startedBody.status || 'queued');
   } catch(e) {
     errEl.style.color = 'var(--red)';
     errEl.textContent = 'Erreur : ' + e.message;
@@ -456,7 +468,7 @@ async function launch() {
 }
 
 // ── Live ──────────────────────────────────────────────────────────────────────
-function startLive() {
+function startLive(initialStatus) {
   document.getElementById('setup').style.display = 'none';
   document.getElementById('live').classList.add('show');
   document.getElementById('feed').innerHTML = '';
@@ -474,7 +486,7 @@ function startLive() {
   activeAgent = null;
   resolvedPermissionIds = {};
   currentFile = null;
-  setStatus('running');
+  setStatus(initialStatus || 'queued');
   connectStream();
   loadPendingPermissions();
   refreshFiles();
@@ -556,6 +568,10 @@ function handleEvent(ev) {
       addTeamCard(ev.name, ev.role, ev.model);
       feedAdd('<div class="msg sys">Nouvel agent : <b>' + esc(ev.name) + '</b> (' + esc(ev.role) + ')</div>');
       break;
+    case 'skill_proposed':
+      feedAdd('<div class="msg sys">Comp&eacute;tence propos&eacute;e : <b>' + esc(ev.name)
+        + '</b>. <a href="/skills">La relire et d&eacute;cider</a>.</div>');
+      break;
     case 'agent_message':
       setActive(ev.agent);
       var cls = ev.kind === 'result' ? 'result' : 'agent';
@@ -609,8 +625,9 @@ function handleEvent(ev) {
     case 'info':
       feedAdd('<div class="msg sys">' + esc(ev.msg) + '</div>');
       break;
+    case 'queued': setStatus('queued'); break;
     case 'paused': setStatus('paused'); break;
-    case 'resumed': setStatus('running'); break;
+    case 'resumed': setStatus(ev.step ? 'running' : 'queued'); break;
     case 'stopped':
       document.getElementById('permission-area').innerHTML = '';
       setStatus('stopped');
@@ -762,7 +779,7 @@ function addTeamCard(name, role, model) {
 
 function setStatus(s) {
   currentTaskStatus = s;
-  var labels = {running:'En cours', paused:'En pause', stopped:'Arrete', done:'Termine', failed:'Echec'};
+  var labels = {queued:'En attente', running:'En cours', paused:'En pause', stopped:'Arrete', done:'Termine', failed:'Echec'};
   var b = document.getElementById('status-badge');
   b.style.display = '';
   b.className = 'badge ' + s;
@@ -776,9 +793,13 @@ function setStatus(s) {
 
 async function ctrl(action) {
   if (!taskId) return;
-  await fetch('/api/tasks/' + taskId + '/' + action, {method: 'POST'});
-  if (action === 'pause') setStatus('paused');
-  if (action === 'resume') setStatus('running');
+  var response = await fetch('/api/tasks/' + taskId + '/' + action, {method: 'POST'});
+  var data = await response.json().catch(function(){ return {}; });
+  if (!response.ok) {
+    feedAdd('<div class="msg err">Action impossible : ' + esc(data.detail || '') + '</div>');
+    return;
+  }
+  setStatus(data.status || (action === 'pause' ? 'paused' : 'queued'));
 }
 
 async function restartTask() {
@@ -806,7 +827,8 @@ async function restartTask() {
   document.getElementById('team-list').innerHTML = '<p class="muted">Reprise...</p>';
   document.getElementById('agent-graph').innerHTML = '';
   teamNames = {}; graphAgents = []; activeAgent = null;
-  setStatus('running');
+  var restartData = await r.json().catch(function(){ return {}; });
+  setStatus(restartData.status || 'queued');
   connectStream();   // re-tail le flux complet (historique + nouveaux messages)
   refreshFiles();
 }
@@ -1023,7 +1045,8 @@ async function newTaskFromMessage() {
   var body = {
     objective: t, chef_model: chefSel ? chefSel.value : 'claude-opus-4-8',
     web_enabled: true, max_iterations: 15, max_agents: 4,
-    install_policy: document.getElementById('install-policy').value
+    install_policy: document.getElementById('install-policy').value,
+    execution_mode: document.getElementById('execution-mode').value
   };
   var d = await (await fetch('/api/tasks', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)

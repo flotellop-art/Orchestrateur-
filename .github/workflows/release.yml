@@ -1,0 +1,123 @@
+name: Publication d'une version
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Installateur Windows publie sur GitHub
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: electron-app/package-lock.json
+
+      - name: Verifier le numero de version
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $desktopVersion = (Get-Content electron-app/package.json -Raw | ConvertFrom-Json).version
+          if ($desktopVersion -ne $version) {
+            throw "electron-app/package.json ($desktopVersion) doit correspondre a VERSION ($version)."
+          }
+          $expected = "v$version"
+          if ($env:GITHUB_REF_NAME -ne $expected) {
+            throw "Le tag $env:GITHUB_REF_NAME doit correspondre a VERSION ($expected)."
+          }
+
+      - name: Installer et tester
+        run: |
+          python -m pip install -r requirements-dev.txt
+          python -m pytest -q
+
+      - name: Construire le serveur autonome
+        shell: pwsh
+        run: ./scripts/build_backend.ps1 -Python python
+
+      - name: Tester le serveur autonome
+        run: python scripts/smoke_backend.py electron-app/backend/orchestrator-backend/orchestrator-backend.exe
+
+      - name: Construire l'installateur et la version portable
+        working-directory: electron-app
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verifier les livrables desktop
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $package = Get-Content electron-app/package.json -Raw | ConvertFrom-Json
+          $expected = @(
+            "electron-app/dist/$($package.build.productName) Setup $version.exe",
+            "electron-app/dist/$($package.build.productName) $version.exe"
+          )
+          foreach ($artifact in $expected) {
+            if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
+              throw "Livrable manquant : $artifact"
+            }
+            if ((Get-Item -LiteralPath $artifact).Length -lt 1MB) {
+              throw "Livrable anormalement petit : $artifact"
+            }
+          }
+          foreach ($resource in @(
+            "electron-app/dist/win-unpacked/resources/backend/orchestrator-backend/orchestrator-backend.exe",
+            "electron-app/dist/win-unpacked/resources/sandbox/Dockerfile",
+            "electron-app/dist/win-unpacked/resources/tools/build_sandbox.ps1",
+            "electron-app/dist/win-unpacked/resources/VERSION",
+            "electron-app/dist/win-unpacked/resources/LICENSE"
+          )) {
+            if (-not (Test-Path -LiteralPath $resource -PathType Leaf)) {
+              throw "Ressource embarquee manquante : $resource"
+            }
+          }
+          $claudeCli = @(Get-ChildItem `
+            "electron-app/dist/win-unpacked/resources/backend/orchestrator-backend" `
+            -Recurse -Filter "claude.exe")
+          if ($claudeCli.Count -ne 1 -or $claudeCli[0].Length -lt 1MB) {
+            throw "Executable Claude SDK absent ou invalide dans le paquet."
+          }
+
+      - name: Calculer les empreintes SHA-256
+        shell: pwsh
+        run: |
+          $executables = @(Get-ChildItem electron-app/dist/*.exe | Sort-Object Name)
+          if ($executables.Count -lt 2) {
+            throw "Installateur NSIS et version portable attendus."
+          }
+          $executables | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii electron-app/dist/SHA256SUMS.txt
+
+      - name: Publier la version GitHub
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(
+            Get-ChildItem electron-app/dist/*.exe | Sort-Object Name | ForEach-Object { $_.FullName }
+          ) + @((Resolve-Path electron-app/dist/SHA256SUMS.txt).Path)
+          $ghArgs = @(
+            "release", "create", $env:GITHUB_REF_NAME
+          ) + $assets + @(
+            "--verify-tag", "--generate-notes", "--title", $env:GITHUB_REF_NAME
+          )
+          if ($env:GITHUB_REF_NAME.Contains("-")) {
+            $ghArgs += @("--prerelease", "--latest=false")
+          }
+          & gh @ghArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "La publication GitHub a echoue."
+          }

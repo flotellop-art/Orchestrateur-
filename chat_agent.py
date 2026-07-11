@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +13,11 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-_env_path = Path(__file__).parent / ".env"
+from app_paths import APP_ROOT, CHAT_WORKSPACE_ROOT, DATA_ROOT, STATIC_ROOT
+
+_env_path = DATA_ROOT / ".env"
+if not _env_path.exists():
+    _env_path = APP_ROOT / ".env"
 load_dotenv(_env_path, override=True)
 log = logging.getLogger(__name__)
 
@@ -26,15 +29,11 @@ def _get_client() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(api_key=key)
 conversations: dict[str, list] = {}
 pending_actions: dict[str, dict] = {}
-STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR = STATIC_ROOT
 
 # Les outils fichier du chat sont confines a ce dossier (anti path-traversal).
-WORKSPACE_DIR = Path(__file__).parent / "chat_workspace"
+WORKSPACE_DIR = CHAT_WORKSPACE_ROOT
 WORKSPACE_DIR.mkdir(exist_ok=True)
-
-# Sandbox d'execution de commandes (liste blanche + pas de shell=True).
-from patches.security.sandbox_commands import safe_run_command_sync, CommandForbiddenError
-
 
 def _safe_chat_path(path: str) -> Path:
     """Resout `path` en l'empechant de sortir de WORKSPACE_DIR (path traversal)."""
@@ -58,11 +57,9 @@ TOOLS = [
     {"name": "search_web", "description": "Recherche sur le web.", "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
     {"name": "read_file", "description": "Lit un fichier local.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     {"name": "write_file", "description": "Ecrit dans un fichier. Action irreversible - necessite confirmation.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "run_command", "description": "Execute une commande systeme (liste blanche). Action irreversible - necessite confirmation.", "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}},
 ]
 
-IRREVERSIBLE_TOOLS = {"send_email", "create_calendar_event", "write_file", "run_command"}
-COMMAND_WHITELIST = ["dir", "ls", "echo", "whoami", "pwd", "python --version", "python -V", "pip list", "git status", "git log --oneline", "git branch", "ipconfig", "hostname"]
+IRREVERSIBLE_TOOLS = {"send_email", "create_calendar_event", "write_file"}
 
 NL = chr(10)
 
@@ -118,17 +115,6 @@ async def execute_tool(tool_name: str, tool_input: dict) -> str:
             return "Acces refuse: " + str(e)
         except Exception as e:
             return "Erreur: " + str(e)
-    elif tool_name == "run_command":
-        cmd = tool_input.get("cmd", "").strip()
-        try:
-            # Sandbox : pas de shell=True, blocage des meta-caracteres et des
-            # commandes hors liste blanche (rm, curl, pip install, python -c, ...).
-            rc, out, err = safe_run_command_sync(cmd, cwd=str(WORKSPACE_DIR), timeout=30)
-            return (out or err or "(vide)").strip()[:2000]
-        except CommandForbiddenError as e:
-            return "Commande refusee: " + str(e)
-        except Exception as e:
-            return "Erreur: " + str(e)
     return "Outil inconnu: " + tool_name
 
 
@@ -139,14 +125,12 @@ def describe_action(tool_name: str, tool_input: dict) -> str:
         return "Creer: **" + tool_input.get("title", "") + "** le " + tool_input.get("date", "")
     elif tool_name == "write_file":
         return "Ecrire dans: **" + tool_input.get("path", "") + "** (" + str(len(tool_input.get("content", ""))) + " chars)"
-    elif tool_name == "run_command":
-        return "Executer: " + tool_input.get("cmd", "")
     return "Action: " + tool_name
 
 
 SYSTEM_PROMPT = (
     "Tu es un assistant IA personnel auto-heberge qui tourne sur le PC Windows de l utilisateur." + NL
-    + "Tu peux effectuer de vraies actions: emails, calendrier, recherche web, fichiers locaux, commandes." + NL + NL
+    + "Tu peux proposer des actions sur les emails, le calendrier, la recherche web et les fichiers du dossier de chat." + NL + NL
     + "Regles:" + NL
     + "- Tu reponds TOUJOURS en francais." + NL
     + "- Sois concis et efficace." + NL

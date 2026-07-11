@@ -24,20 +24,24 @@ const path = require('path');
 // Configuration de securite
 // ---------------------------------------------------------------------------
 
-const PORT = 8000; // port de l'orchestrateur (main.js utilise 8000)
-const BASE_URL = `http://127.0.0.1:${PORT}`;
+let LOCAL_ORIGIN = null;
+
+function configureLocalOrigin(baseUrl) {
+  const parsed = new URL(baseUrl);
+  const port = Number(parsed.port);
+  if (parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1' ||
+      !Number.isInteger(port) || port < 1024 || port > 65535 ||
+      parsed.pathname !== '/') {
+    throw new Error('Invalid local Orchestrator origin');
+  }
+  LOCAL_ORIGIN = parsed.origin;
+}
 
 /**
  * Origines autorisees pour le chargement de contenu.
  * UNIQUEMENT localhost — aucune URL externe ne doit etre chargee
  * dans la fenetre principale.
  */
-const ALLOWED_ORIGINS = [
-  `http://localhost:${PORT}`,
-  `http://127.0.0.1:${PORT}`,
-  `http://localhost:8000`,
-  `http://127.0.0.1:8000`,
-];
 
 /**
  * Domaines autorises pour shell.openExternal (liens ouverts dans le navigateur
@@ -65,19 +69,19 @@ const ALLOWED_EXTERNAL_HOSTS = [
  * - base-uri 'self' : empeche l'injection de base tag
  * - frame-ancestors 'none' : empeche l'embedding dans des iframes
  */
-const CSP_POLICY = [
+function getCspPolicy() { return [
   "default-src 'self'",
   // 'unsafe-inline' requis : control.html / workspace.html / index.html embarquent
   // leur JS en <script> inline. (Phase 2 : extraire le JS puis durcir a 'self'.)
   "script-src 'self' 'unsafe-inline'",
   "style-src 'self' 'unsafe-inline'",
-  `connect-src 'self' http://127.0.0.1:${PORT} http://localhost:${PORT} http://127.0.0.1:8000 http://localhost:8000`,
+  `connect-src 'self' ${LOCAL_ORIGIN || ''}`,
   "img-src 'self' data:",
   "object-src 'none'",
   "base-uri 'self'",
   "frame-ancestors 'none'",
   "form-action 'self'",
-].join('; ');
+].join('; '); }
 
 // ---------------------------------------------------------------------------
 // webPreferences securisees (remplacement du bloc createWin)
@@ -132,17 +136,8 @@ function getSecureWebPreferences() {
 function isAllowedUrl(url) {
   try {
     const parsed = new URL(url);
-    // Autoriser les URLs data: pour le splash screen
-    if (parsed.protocol === 'data:') return true;
-    // Autoriser les fichiers locaux (preload, etc.)
-    if (parsed.protocol === 'file:') return true;
-    // Verifier l'origine
-    const origin = `${parsed.protocol}//${parsed.hostname}:${parsed.port || (parsed.protocol === 'https:' ? 443 : 80)}`;
-    // Verifier contre la liste des origines autorisees
-    for (const allowed of ALLOWED_ORIGINS) {
-      if (url.startsWith(allowed)) return true;
-    }
-    return false;
+    return Boolean(LOCAL_ORIGIN) && parsed.protocol === 'http:' &&
+      parsed.origin === LOCAL_ORIGIN;
   } catch (e) {
     return false;
   }
@@ -156,8 +151,9 @@ function isAllowedUrl(url) {
 function isAllowedExternalUrl(url) {
   try {
     const parsed = new URL(url);
-    // Seuls https:// sont autorises pour les liens externes
-    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    const local = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+    if (local) return parsed.protocol === 'http:';
+    if (parsed.protocol !== 'https:') return false;
     return ALLOWED_EXTERNAL_HOSTS.some(host =>
       parsed.hostname === host || parsed.hostname.endsWith('.' + host)
     );
@@ -187,7 +183,11 @@ function setupSecureSession() {
     // Appliquer CSP uniquement sur les pages HTML (pas les assets)
     const contentType = (responseHeaders['content-type'] || responseHeaders['Content-Type'] || []).join('');
     if (contentType.includes('text/html') || !contentType) {
-      responseHeaders['Content-Security-Policy'] = [CSP_POLICY];
+      const existingCsp = responseHeaders['content-security-policy'] ||
+        responseHeaders['Content-Security-Policy'];
+      if (!existingCsp || existingCsp.length === 0) {
+        responseHeaders['Content-Security-Policy'] = [getCspPolicy()];
+      }
       responseHeaders['X-Content-Type-Options'] = ['nosniff'];
       responseHeaders['X-Frame-Options'] = ['DENY'];
       responseHeaders['X-XSS-Protection'] = ['1; mode=block'];
@@ -251,7 +251,7 @@ function attachSecurityHooks(browserWindow) {
   // 4. Bloquer les permissions non necessaires (camera, micro, notifications, etc.)
   browserWindow.webContents.session.setPermissionRequestHandler(
     (webContents, permission, callback) => {
-      const allowedPermissions = ['clipboard-read', 'clipboard-sanitized-write'];
+      const allowedPermissions = ['clipboard-sanitized-write'];
       if (allowedPermissions.includes(permission)) {
         callback(true);
       } else {
@@ -290,14 +290,14 @@ function safeOpenExternal(url) {
 // ---------------------------------------------------------------------------
 
 module.exports = {
+  configureLocalOrigin,
   getSecureWebPreferences,
   setupSecureSession,
   attachSecurityHooks,
   safeOpenExternal,
   isAllowedUrl,
   isAllowedExternalUrl,
-  CSP_POLICY,
-  ALLOWED_ORIGINS,
+  getCspPolicy,
 };
 
 // ---------------------------------------------------------------------------

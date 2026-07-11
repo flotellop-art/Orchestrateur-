@@ -1,11 +1,12 @@
 @echo off
 setlocal EnableExtensions
-title Cloudflare Tunnel - agent.tryarty.com
+title Tunnel Cloudflare - Orchestrateur
 echo ============================================
-echo   Cloudflare Tunnel pour Claude Agents
+echo   Tunnel Cloudflare pour Orchestrateur
 echo   Expose: http://localhost:8000
 echo ============================================
 echo.
+set "TUNNEL_NAME=%~1"
 
 REM Refuser toute exposition distante sans cle API.
 if not exist "%~dp0.env" (
@@ -42,16 +43,20 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-REM Verifier si un tunnel nomme est configure (agent.tryarty.com)
+REM Utiliser le tunnel du fichier de configuration, ou le nom passe en argument.
 if exist "%USERPROFILE%\.cloudflared\config.yml" (
-    echo [INFO] Configuration trouvee - Lancement du tunnel permanent ^(agent.tryarty.com^)
+    echo [INFO] Configuration Cloudflare trouvee - lancement du tunnel permanent.
     echo.
-    cloudflared tunnel run agent-tryarty
+    if defined TUNNEL_NAME (
+        cloudflared tunnel run "%TUNNEL_NAME%"
+    ) else (
+        cloudflared tunnel run
+    )
 ) else (
     echo [INFO] Pas de tunnel permanent configure.
     echo [INFO] Lancement d'un tunnel temporaire ^(trycloudflare.com^)...
     echo.
-    echo Pour configurer un tunnel permanent sur agent.tryarty.com,
+    echo Pour configurer un tunnel permanent avec votre propre domaine,
     echo suivez les instructions dans TUNNEL_SETUP.md
     echo.
     cloudflared tunnel --url http://localhost:8000 --no-autoupdate
