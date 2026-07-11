@@ -248,13 +248,13 @@ charset-normalizer==3.4.9 \
     --hash=sha256:fa36ec09ef71d158186bc79e359ff5fdd6e7996fe8ab638f00d6b93139ba4fcf \
     --hash=sha256:fe2c7201c642b7c308f1675355ad7ff7b66acfe3541625efe5a3ad38f29d6115
     # via requests
-claude-agent-sdk==0.2.115 \
-    --hash=sha256:230017fbba74fb3aa1a1d86b2986277c7fe26dd2e33eea865c90553d93f4e26d \
-    --hash=sha256:23fc46eadafbf9315c63a6959a7677c4e2325339e09f6caf820e81ef905b51da \
-    --hash=sha256:8ca9eea21ed6b1b7d6b35c5bac368210214b36028c68046231ca4ea545854e80 \
-    --hash=sha256:946f8b3240e9c0e79a7f87bab14eb079d283ab564a0503923aa81648351b8c6f \
-    --hash=sha256:9bff5ef9932747ce41982a7c955fb144220ada80e6931bd5f5ee5da74f454990 \
-    --hash=sha256:c662fe2f618aa19e9ea1c161b490b2f67ec0c8e15a75d96b5b14cbb8a7301e86
+claude-agent-sdk==0.2.116 \
+    --hash=sha256:37d6c9d98960c7ea41d1a7fd3331ad0b1bef68e559ed9cc5ccf9d00ae68adfcd \
+    --hash=sha256:93c1f60ed1e4d73dc13f2c714bbe1be43798d9bb4067a6d563358c397b300801 \
+    --hash=sha256:9ea5ababb44afdcc7e33b857ca3ad5008f906c30052aa2d957dacfa7f70ead9f \
+    --hash=sha256:d5e420912378cf66a90cf898bdd4567cc8f994308bd8011d7bd71968066f3894 \
+    --hash=sha256:e130166e5b1054b4e3741d957fd6759546fa657fa765385955a9ef12fdc545f9 \
+    --hash=sha256:fb8dbc73f52d103e08b30fe865199ea1d89e7b2197652a19a97a15b040cf685b
     # via -r requirements_orchestrator.txt
 click==8.4.2 \
     --hash=sha256:9a6cea6e60b17ebe0a44c5cc636d94f09bd66142c1cd7d8b4cd731c4917a15f6 \
