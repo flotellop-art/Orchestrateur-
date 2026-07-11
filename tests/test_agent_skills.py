@@ -144,6 +144,19 @@ class AgentSkillsTests(unittest.IsolatedAsyncioTestCase):
             "Documentation normale.\u202eTexte inversé dangereux.",
             "Documentation normale. <script>alert(1)</script>",
             "Documentation normale. [ouvrir](javascript:alert(1))",
+            "Documentation normale. [ouvrir][x]\n\n[x]: javascript:alert(1)",
+            "Documentation normale. [ouvrir][x]\n\n[x]: <javascript:alert(1)>",
+            "Documentation normale. [ouvrir][x]\n\n[x]:\n  javascript:alert(1)",
+            r"Documentation normale. [ouvrir](javascript\:alert(1))",
+            "Documentation normale. [ouvrir][x]\n\n[x]: javascript\\:alert(1)",
+            "Documentation normale. [ouvrir][x]\n\n> [x]: javascript:alert(1)",
+            "Documentation normale. [ouvrir][x]\n\n- [x]: javascript:alert(1)",
+            "Documentation normale. [ouvrir][x]\n\n"
+            + "> " * 9
+            + "[x]: javascript:alert(1)",
+            "Documentation normale.\n\n10. element\n\n"
+            "    [x]: javascript:alert(1)\n"
+            "    [ouvrir][x]",
             "x" * 32_769,
         )
         for instructions in bad_instructions:
@@ -156,6 +169,50 @@ class AgentSkillsTests(unittest.IsolatedAsyncioTestCase):
             await self.propose(summary="ligne une\nligne deux")
         with self.assertRaises(SkillValidationError):
             await self.propose(summary="x" * 501)
+
+    async def test_safe_markdown_angles_and_plain_comparisons_are_allowed(self):
+        instructions = (
+            "Consulter <https://example.com/guide?q=review> puis remplacer "
+            "<project_name>. Verifier que a < b avant de continuer. "
+            "Le libelle Rock &amp; Roll reste documentaire."
+        )
+        skill = await self.propose(instructions=instructions)
+        self.assertEqual(skill.instructions, instructions)
+
+    async def test_real_html_remains_rejected(self):
+        dangerous = (
+            "Consigne <img src=x onerror=alert(1)>",
+            "Consigne <svg><script>alert(1)</script></svg>",
+            "Consigne <script\nsrc=https://evil.example/x.js></script>",
+            "Consigne <a href=https://example.com>ouvrir</a>",
+            "Consigne <!-- commentaire HTML -->",
+            "Consigne <plaintext>texte restant",
+            "Consigne <marquee>texte restant",
+            "Consigne <xmp>texte restant",
+            "Consigne <custom-widget>texte restant",
+            "Consigne dangereuse\n<script\nalert(1)",
+            "Consigne dangereuse\n<img src=x onerror=alert(1)",
+            "Consigne dangereuse\n<!-- commentaire non termine",
+            "Consigne &lt;plaintext&gt;texte restant",
+            "Consigne [ouvrir](javascript&colon;alert(1))",
+            "Consigne [ouvrir](java&#x73;cript:alert(1))",
+            "Consigne [ouvrir](javascript&amp;colon;alert(1))",
+            "Consigne [ouvrir][x]\n\n[x]: javascript&colon;alert(1)",
+            "Consigne [ouvrir][x]\n\n[x]: <java&#x73;cript:alert(1)>",
+        )
+        for instructions in dangerous:
+            with self.subTest(instructions=instructions), self.assertRaises(
+                SkillValidationError
+            ):
+                await self.propose(instructions=instructions)
+
+    async def test_safe_markdown_reference_link_is_allowed(self):
+        instructions = (
+            "Consulter la [documentation][guide] avant de continuer.\n\n"
+            "[guide]: https://example.com/guide"
+        )
+        skill = await self.propose(instructions=instructions)
+        self.assertEqual(skill.instructions, instructions)
 
     async def test_proposal_is_idempotent_including_after_a_decision(self):
         first = await self.propose()

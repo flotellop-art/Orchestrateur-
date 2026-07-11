@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Espace de travail multi-agents</title>
+<script src="/static/session-auth.js"></script>
 <link rel="manifest" href="/static/manifest.webmanifest">
 <meta name="theme-color" content="#1a1a2e">
 <link rel="icon" href="/static/icon-app.svg" type="image/svg+xml">
@@ -308,10 +309,10 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 
 <script src="/static/secure-sse.js"></script>
 <script>
-// Si une cle API est definie (page /control -> Reglages, stockee dans localStorage),
+// Si une cle API est definie (page /control -> Reglages, gardee pour cet onglet),
 // on l'attache automatiquement a toutes les requetes. Transparent si aucune cle.
 (function () {
-  function key() { try { return localStorage.getItem('ORCH_API_KEY') || ''; } catch (e) { return ''; } }
+  function key() { try { return sessionStorage.getItem('ORCH_API_KEY') || ''; } catch (e) { return ''; } }
   var _fetch = window.fetch.bind(window);
   window.fetch = function (input, init) {
     var k = key();
@@ -845,9 +846,15 @@ async function refreshFiles() {
 function renderFiles(files) {
   var el = document.getElementById('file-list');
   if (!files || !files.length) { el.innerHTML = '<p class="muted">Aucun fichier pour l\'instant.</p>'; return; }
-  el.innerHTML = files.map(function(f) {
-    return '<div class="file-item" onclick="viewFile(\'' + esc(f).replace(/'/g, "\\'") + '\')">' + esc(f) + '</div>';
-  }).join('');
+  el.textContent = '';
+  files.forEach(function(f) {
+    var path = String(f);
+    var item = document.createElement('div');
+    item.className = 'file-item';
+    item.textContent = path;
+    item.addEventListener('click', function() { viewFile(path); });
+    el.appendChild(item);
+  });
 }
 
 async function viewFile(path) {

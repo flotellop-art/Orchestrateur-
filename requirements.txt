@@ -1,2 +1,1 @@
-claude-agent-sdk
-python-dotenv
+-r requirements_orchestrator.txt

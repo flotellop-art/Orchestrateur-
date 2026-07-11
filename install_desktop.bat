@@ -40,7 +40,7 @@ echo [OK] Python detecte.
 echo.
 echo [INSTALL] Installation des dependances Python...
 cd /d "%~dp0"
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements-lock.txt
 if %ERRORLEVEL% NEQ 0 (
     echo [ERREUR] Installation Python impossible.
     pause

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="referrer" content="no-referrer">
   <title>Compétences réutilisables — Orchestrator</title>
+  <script src="/static/session-auth.js"></script>
   <style>
     :root {
       color-scheme: light;
@@ -245,7 +246,10 @@
 
     <p class="human-note">
       Les boutons de décision utilisent une session de revue courte et à usage
-      unique. Cette capacité n'est pas exposée aux outils des agents.
+      unique. Pour prendre une décision, configurez une API_SECRET_KEY forte
+      sur le serveur, puis saisissez-la dans Réglages sur la page Contrôle. La
+      clé reste uniquement dans cet onglet et disparaît à sa fermeture. Cette
+      capacité n'est pas exposée aux outils des agents.
     </p>
   </main>
 
@@ -283,7 +287,7 @@
 
     function apiKey() {
       try {
-        return localStorage.getItem('ORCH_API_KEY') || '';
+        return sessionStorage.getItem('ORCH_API_KEY') || '';
       } catch (_error) {
         return '';
       }

@@ -12,7 +12,7 @@ import re
 import sys
 import traceback
 import uuid
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -48,7 +48,76 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-running_servers = {}   # app_id -> asyncio.Process
+running_servers = {}   # app_id -> SandboxHandle
+_app_lifecycle_locks: dict[int, asyncio.Lock] = {}
+_runtime_shutdown_operation: asyncio.Task | None = None
+
+
+def _app_lifecycle_lock(app_id: int) -> asyncio.Lock:
+    return _app_lifecycle_locks.setdefault(app_id, asyncio.Lock())
+
+
+async def _cleanup_running_server(app_id: int):
+    """Nettoie le conteneur d'une application sans oublier un échec.
+
+    Le handle permet d'arrêter uniquement cette application. Après un
+    redémarrage, l'absence de handle déclenche le balayage par labels afin de
+    récupérer un éventuel conteneur orphelin.
+    """
+    runtime = team.get_sandbox_runtime()
+    handle = running_servers.get(app_id)
+    if handle is None:
+        cleanup = await runtime.stop("app-" + str(app_id), strict=False)
+    else:
+        cleanup = await runtime.stop_handle(handle, strict=False)
+    if cleanup.failed:
+        runtime.block_execution(
+            "Le nettoyage Docker de l'application est incomplet."
+        )
+        return cleanup
+    if handle is None or running_servers.get(app_id) is handle:
+        running_servers.pop(app_id, None)
+    return cleanup
+
+
+async def _cleanup_cancelled_app_start(
+    app_id: int,
+    *,
+    error_message: str = "Démarrage annulé avant la fin de la vérification.",
+) -> None:
+    """Nettoie un aperçu dont le démarrage n'a pas été publié avec succès."""
+    runtime = team.get_sandbox_runtime()
+    status = "stopped"
+    error = error_message
+    try:
+        cleanup = await _cleanup_running_server(app_id)
+        if cleanup.failed:
+            status = "failed"
+            error = "Démarrage annulé ; le nettoyage Docker reste incomplet."
+    except Exception as exc:
+        status = "failed"
+        runtime.block_execution(
+            "Le nettoyage d'un aperçu annulé n'a pas pu être vérifié."
+        )
+        error = "Démarrage annulé ; nettoyage non vérifiable : " + str(exc)[:300]
+        log.error("Nettoyage de l'aperçu annulé %s impossible : %s", app_id, exc)
+    try:
+        await db_update(app_id, status=status, error=error)
+    except Exception as exc:
+        log.error("État de l'aperçu annulé %s non enregistré : %s", app_id, exc)
+
+
+async def _registered_server_is_live(app_id: int, port: int) -> bool:
+    """Vérifie le conteneur suivi puis l'URL avant tout faux succès."""
+
+    handle = running_servers.get(app_id)
+    if handle is None:
+        return False
+    runtime = team.get_sandbox_runtime()
+    inspect_handle = getattr(runtime, "is_handle_running", None)
+    if inspect_handle is not None and not await inspect_handle(handle):
+        return False
+    return await wait_for_server(port, timeout=2)
 
 
 # ── Base de donnees ────────────────────────────────────────────────────────────
@@ -333,12 +402,24 @@ async def creation_pipeline(app_id, description, folder, port):
     # Etape 3 : Ecriture des fichiers
     yield evt("step", "Sauvegarde des fichiers...")
     target = Path(folder)
-    target.mkdir(parents=True, exist_ok=True)
     files_written = []
-    for f in app_data["files"]:
-        fp = target / f["filename"]
-        fp.write_text(f["content"], encoding="utf-8")
-        files_written.append(f["filename"])
+    write_error = None
+    # Une suppression peut arriver pendant la generation distante. La
+    # verification de l'etat et les ecritures partagent donc le meme verrou
+    # que start/stop/delete, sans conserver ce verrou pendant un ``yield`` SSE.
+    async with _app_lifecycle_lock(app_id):
+        current = await db_get(app_id)
+        if not current or current.get("status") != "creating":
+            write_error = "La creation a ete arretee avant la sauvegarde."
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+            for f in app_data["files"]:
+                fp = target / f["filename"]
+                fp.write_text(f["content"], encoding="utf-8")
+                files_written.append(f["filename"])
+    if write_error:
+        yield evt("error", write_error)
+        return
     yield evt("files", "Fichiers : " + ", ".join(files_written), files=files_written)
 
     # Etape 4 : dependance fixe, installee avec l'orchestrateur lui-meme.
@@ -359,37 +440,68 @@ async def creation_pipeline(app_id, description, folder, port):
         await db_update(app_id, status="stopped", error=message)
         yield evt("error", message)
         return
-    try:
-        handle = await team.get_sandbox_runtime().launch(
-            "app-" + str(app_id),
-            target,
-            ("python", "app.py"),
-            env={"PORT": str(port), "PYTHONUNBUFFERED": "1"},
-            network_enabled=True,
-            published_ports={port: port},
-            lifetime_seconds=3600,
-        )
-        running_servers[app_id] = handle
-    except Exception as e:
-        await db_update(app_id, status="failed", error=str(e))
-        yield evt("error", "Impossible de demarrer : " + str(e))
-        return
-
-    # Etape 6 : Attente que le serveur reponde
+    # Etape 6 : le lancement, l'enregistrement du handle, la sonde et l'état
+    # final forment une seule section critique face à start/stop.
     yield evt("step", "Verification que tout fonctionne...")
-    ok = await wait_for_server(port, timeout=25)
+    launch_error = None
+    name = app_data.get("name", "app-" + str(app_id))
+    async with _app_lifecycle_lock(app_id):
+        current = await db_get(app_id)
+        if current and current.get("status") == "running" and app_id in running_servers:
+            if await _registered_server_is_live(app_id, port):
+                name = current.get("name") or name
+            else:
+                cleanup = await _cleanup_running_server(app_id)
+                launch_error = "L'ancien aperçu n'est plus actif. Relancez-le."
+                if cleanup.failed:
+                    launch_error += " Son conteneur n'a pas pu être nettoyé."
+                await db_update(
+                    app_id,
+                    status="failed" if cleanup.failed else "stopped",
+                    error=launch_error,
+                )
+        elif not current or current.get("status") != "creating":
+            launch_error = "La creation a ete arretee avant le lancement."
+        else:
+            try:
+                handle = await team.get_sandbox_runtime().launch(
+                    "app-" + str(app_id),
+                    target,
+                    ("python", "app.py"),
+                    env={"PORT": str(port), "PYTHONUNBUFFERED": "1"},
+                    network_enabled=True,
+                    published_ports={port: port},
+                    lifetime_seconds=3600,
+                )
+                running_servers[app_id] = handle
+            except Exception as exc:
+                launch_error = "Impossible de demarrer : " + str(exc)
+                await db_update(app_id, status="failed", error=str(exc))
+            else:
+                try:
+                    ok = await wait_for_server(port, timeout=25)
+                    if not ok:
+                        cleanup = await _cleanup_running_server(app_id)
+                        launch_error = "Le serveur isole n'a pas repondu dans les delais."
+                        if cleanup.failed:
+                            launch_error += " Son conteneur n'a pas pu etre nettoye."
+                        await db_update(app_id, status="failed", error=launch_error)
+                    else:
+                        await db_update(app_id, status="running", name=name)
+                except BaseException:
+                    await asyncio.shield(_cleanup_cancelled_app_start(
+                        app_id,
+                        error_message=(
+                            "Démarrage interrompu avant la publication de son état."
+                        ),
+                    ))
+                    raise
 
-    if not ok:
-        await team.get_sandbox_runtime().stop("app-" + str(app_id), strict=False)
-        running_servers.pop(app_id, None)
-        err_msg = "Le serveur isole n'a pas repondu dans les delais."
-        await db_update(app_id, status="failed", error=err_msg)
-        yield evt("error", "L'application n'a pas demarree. " + err_msg[:150])
+    if launch_error:
+        yield evt("error", launch_error[:500])
         return
 
     # Succes
-    name = app_data.get("name", "app-" + str(app_id))
-    await db_update(app_id, status="running", name=name)
     url = "http://localhost:{}".format(port)
     yield evt("done", "Votre application est prete !", url=url, port=port, name=name)
 
@@ -408,12 +520,16 @@ async def lifespan(app):
         yield
     finally:
         for app_id in list(running_servers):
-            with suppress(Exception):
-                await team.get_sandbox_runtime().stop(
-                    "app-" + str(app_id), strict=False
-                )
-        running_servers.clear()
-        await team.stop_runtime_services()
+            try:
+                cleanup = await _cleanup_running_server(app_id)
+                if cleanup.failed:
+                    log.error("Conteneur d'application non nettoye : %s", app_id)
+            except Exception as exc:
+                log.error("Nettoyage de l'application %s impossible : %s", app_id, exc)
+        try:
+            await team.stop_runtime_services()
+        except team.SandboxError as exc:
+            log.error("Arret final incomplet : %s", exc)
         log.info("App Creator arrete.")
 
 app = FastAPI(title="Orchestrateur", lifespan=lifespan)
@@ -457,6 +573,27 @@ async def health_check(request: Request):
     }
 
 
+async def _prepare_runtime_shutdown_once():
+    failed_cleanup = []
+    for app_id in list(running_servers):
+        try:
+            cleanup = await _cleanup_running_server(app_id)
+            if cleanup.failed:
+                failed_cleanup.append(app_id)
+        except Exception:
+            failed_cleanup.append(app_id)
+    if failed_cleanup:
+        raise HTTPException(
+            503,
+            "Arret refuse : des conteneurs d'application restent actifs.",
+        )
+    try:
+        await team.stop_runtime_services()
+    except team.SandboxError as exc:
+        raise HTTPException(503, str(exc)[:500]) from None
+    return {"status": "ready"}
+
+
 @app.post("/api/runtime/prepare-shutdown")
 async def prepare_runtime_shutdown(request: Request):
     """Libere baux et conteneurs avant l'arret force du processus Windows."""
@@ -464,12 +601,26 @@ async def prepare_runtime_shutdown(request: Request):
     supplied = request.headers.get("X-Orchestrator-Instance", "")
     if not expected or not supplied or not hmac.compare_digest(expected, supplied):
         raise HTTPException(404, "Endpoint indisponible")
-    for app_id in list(running_servers):
-        with suppress(Exception):
-            await team.get_sandbox_runtime().stop("app-" + str(app_id), strict=False)
-    running_servers.clear()
-    await team.stop_runtime_services()
-    return {"status": "ready"}
+    # Bloquer synchroniquement les nouveaux lancements avant le premier await.
+    # Les nettoyages restent autorises sur un runtime bloque.
+    team.get_sandbox_runtime().block_execution(
+        "La fermeture de l'Orchestrateur est en cours."
+    )
+
+    global _runtime_shutdown_operation
+    operation = _runtime_shutdown_operation
+    loop = asyncio.get_running_loop()
+    retry = operation is None or operation.get_loop() is not loop
+    if operation is not None and operation.get_loop() is loop and operation.done():
+        retry = operation.cancelled() or operation.exception() is not None
+    if retry:
+        operation = asyncio.create_task(
+            _prepare_runtime_shutdown_once(), name="runtime-prepare-shutdown"
+        )
+        _runtime_shutdown_operation = operation
+    # Une deconnexion Electron ne doit pas annuler le nettoyage partage. Un
+    # nouvel essai retrouve la meme operation tant qu'elle est en cours.
+    return await asyncio.shield(operation)
 
 
 @app.get("/api/version")
@@ -515,11 +666,34 @@ async def create_app(request: Request):
 
 @app.post("/api/apps/{app_id}/start")
 async def start_app(app_id: int):
+    async with _app_lifecycle_lock(app_id):
+        return await _start_app_locked(app_id)
+
+
+async def _start_app_locked(app_id: int):
     a = await db_get(app_id)
     if not a:
         raise HTTPException(404, "Application introuvable")
     if a["status"] == "running" and app_id in running_servers:
-        return {"status": "already_running", "url": "http://localhost:{}".format(a["port"])}
+        try:
+            live = await _registered_server_is_live(app_id, int(a["port"]))
+        except team.SandboxError as exc:
+            team.get_sandbox_runtime().block_execution(
+                "La vivacité du conteneur de l'application n'a pas pu être vérifiée."
+            )
+            raise HTTPException(503, str(exc)[:500]) from None
+        if live:
+            return {"status": "already_running", "url": "http://localhost:{}".format(a["port"])}
+        cleanup = await _cleanup_running_server(app_id)
+        if cleanup.failed:
+            raise HTTPException(
+                500, "L'ancien conteneur inactif n'a pas pu être nettoyé."
+            )
+        await db_update(
+            app_id,
+            status="stopped",
+            error="L'ancien aperçu ne répondait plus et a été nettoyé.",
+        )
     if not (Path(a["folder"]) / "app.py").exists():
         raise HTTPException(400, "Fichiers introuvables")
     if not team.sandbox_app_network_allowed():
@@ -542,46 +716,59 @@ async def start_app(app_id: int):
     except Exception as exc:
         raise HTTPException(409, "Lancement isole refuse : " + str(exc)[:500])
     running_servers[app_id] = handle
-    ok = await wait_for_server(a["port"], timeout=20)
+    try:
+        ok = await wait_for_server(a["port"], timeout=20)
+        if ok:
+            await db_update(app_id, status="running")
+        else:
+            runtime = team.get_sandbox_runtime()
+            cleanup = await _cleanup_running_server(app_id)
+            await db_update(app_id, status="failed")
+            if cleanup.failed:
+                runtime.block_execution(
+                    "Le conteneur de l'application n'a pas pu etre nettoye."
+                )
+                raise HTTPException(500, "Le conteneur de l'application a resiste au nettoyage.")
+    except BaseException:
+        await asyncio.shield(_cleanup_cancelled_app_start(
+            app_id,
+            error_message="Démarrage interrompu avant la publication de son état.",
+        ))
+        raise
     if ok:
-        await db_update(app_id, status="running")
         return {"status": "running", "url": "http://localhost:{}".format(a["port"])}
-    else:
-        runtime = team.get_sandbox_runtime()
-        cleanup = await runtime.stop("app-" + str(app_id), strict=False)
-        running_servers.pop(app_id, None)
-        await db_update(app_id, status="failed")
-        if cleanup.failed:
-            runtime.block_execution(
-                "Le conteneur de l'application n'a pas pu etre nettoye."
-            )
-            raise HTTPException(500, "Le conteneur de l'application a resiste au nettoyage.")
-        return {"status": "failed"}
+    return {"status": "failed"}
 
 @app.post("/api/apps/{app_id}/stop")
 async def stop_app(app_id: int):
+    async with _app_lifecycle_lock(app_id):
+        return await _stop_app_locked(app_id)
+
+
+async def _stop_app_locked(app_id: int):
     app_record = await db_get(app_id)
     if not app_record:
         raise HTTPException(404, "Application introuvable")
-    running_servers.pop(app_id, None)
-    if app_record.get("status") != "running":
-        await db_update(app_id, status="stopped")
-        return {"status": "stopped"}
     runtime = team.get_sandbox_runtime()
     try:
-        cleanup = await runtime.stop("app-" + str(app_id), strict=False)
+        cleanup = await _cleanup_running_server(app_id)
     except team.SandboxError as exc:
         runtime.block_execution("Le nettoyage Docker de l'application est incomplet.")
         raise HTTPException(503, str(exc)[:500]) from None
-    await db_update(app_id, status="stopped")
     if cleanup.failed:
         runtime.block_execution("Le nettoyage Docker de l'application est incomplet.")
         raise HTTPException(500, "Le conteneur de l'application a resiste au nettoyage.")
+    await db_update(app_id, status="stopped")
     return {"status": "stopped"}
 
 @app.delete("/api/apps/{app_id}")
 async def delete_app(app_id: int):
-    await stop_app(app_id)
+    async with _app_lifecycle_lock(app_id):
+        return await _delete_app_locked(app_id)
+
+
+async def _delete_app_locked(app_id: int):
+    await _stop_app_locked(app_id)
     a = await db_get(app_id)
     if a:
         folder = Path(a["folder"]).resolve(strict=False)

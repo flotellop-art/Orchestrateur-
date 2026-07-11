@@ -191,7 +191,11 @@ function setupSecureSession() {
       responseHeaders['X-Content-Type-Options'] = ['nosniff'];
       responseHeaders['X-Frame-Options'] = ['DENY'];
       responseHeaders['X-XSS-Protection'] = ['1; mode=block'];
-      responseHeaders['Referrer-Policy'] = ['strict-origin-when-cross-origin'];
+      const existingReferrerPolicy = responseHeaders['referrer-policy'] ||
+        responseHeaders['Referrer-Policy'];
+      if (!existingReferrerPolicy || existingReferrerPolicy.length === 0) {
+        responseHeaders['Referrer-Policy'] = ['no-referrer'];
+      }
     }
 
     callback({ responseHeaders });

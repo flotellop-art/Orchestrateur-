@@ -72,7 +72,9 @@ proposition avec `replace_existing=True`. L'ancienne version devient alors
 - Les noms, identités et tags suivent un format ASCII borné, sans chemin.
 - Les tailles sont bornées en caractères et en octets UTF-8.
 - Les caractères de contrôle, le HTML brut et les liens actifs tels que
-  `javascript:` ou `data:` sont refusés.
+  `javascript:` ou `data:` sont refusés, y compris lorsqu'ils sont masqués par
+  des entités HTML. Les autoliens HTTP(S) et les placeholders documentaires
+  comme `<project_name>` restent autorisés.
 - Les propositions en attente ou refusées n'entrent jamais dans la recherche.
 - L'export choisit lui-même le nom `SKILL.md`, reste sous la racine fournie,
   refuse les liens symboliques concernés et remplace le fichier atomiquement.
@@ -85,6 +87,21 @@ pas une preuve cryptographique. L'orchestrateur doit donc ne jamais exposer
 appelables par un agent. Ces appels doivent provenir d'une route authentifiée et
 d'un clic humain. De même, le champ `agent` doit être rempli par le contexte de
 la tâche, jamais recopié depuis une sortie libre du modèle.
+
+## Autorisation de la revue humaine
+
+Les routes `POST /api/skills/review-session` et
+`POST /api/skills/<id>/decision` refusent toute décision si le serveur ne
+possède pas une `API_SECRET_KEY` forte. La clé doit aussi être envoyée dans
+`X-API-Key` ou sous la forme `Authorization: Bearer ...`. Cette règle vaut
+également pour un appel direct depuis `127.0.0.1` : les en-têtes indiquant une
+page de même origine ne constituent pas, seuls, une preuve humaine.
+
+Dans l'interface, la clé est saisie dans **Contrôle > Réglages**. Elle est
+conservée dans la session de l'onglet, jamais dans le stockage persistant du
+navigateur, et disparaît à la fermeture de cet onglet. La page `/skills`
+ajoute ensuite une session de revue courte et à usage unique avant chaque
+décision.
 
 ## Utilisation dans Orchestrateur
 

@@ -1,10 +1,12 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from automations import (
+    MAX_AUTOMATION_PAYLOAD_BYTES,
     AutomationConflict,
     AutomationState,
     AutomationStore,
@@ -185,6 +187,150 @@ class AutomationStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(sum(len(items) for items in results), 1)
         self.assertEqual(len(await self.queue.list()), 1)
+
+    async def test_create_validates_the_final_queue_envelope_size(self):
+        # Le JSON utilisateur seul tient encore dans 64 Kio, mais les champs
+        # automation_id/scheduled_for le feraient depasser dans la file.
+        payload = {"text": "x" * (MAX_AUTOMATION_PAYLOAD_BYTES - 20)}
+        with self.assertRaises(AutomationValidationError):
+            await self.create(
+                payload=payload,
+                idempotency_key="automation:almost-too-large",
+            )
+
+    async def test_invalid_row_is_quarantined_without_blocking_later_due_jobs(self):
+        valid = await self.create(idempotency_key="automation:valid-after-bad")
+        async with self.store._db() as db:
+            await db.execute(
+                """
+                INSERT INTO automations (
+                    id,idempotency_key,name,schedule_json,job_kind,payload_json,
+                    state,next_run_at,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,'enabled',?,?,?)
+                """,
+                (
+                    "bad-automation",
+                    "automation:bad-row",
+                    "invalide",
+                    json.dumps(
+                        Schedule.interval(60, anchor=T0).to_payload(),
+                        separators=(",", ":"),
+                    ),
+                    "run_task",
+                    json.dumps(
+                        {"text": "x" * (MAX_AUTOMATION_PAYLOAD_BYTES - 20)},
+                        separators=(",", ":"),
+                    ),
+                    datetime_to_text(T0),
+                    datetime_to_text(T0 - timedelta(seconds=1)),
+                    datetime_to_text(T0),
+                ),
+            )
+            await db.commit()
+
+        jobs = await self.store.dispatch_due(
+            self.queue, now=T0 + timedelta(minutes=1), limit=10
+        )
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].payload["automation_id"], valid.id)
+        async with self.store._db() as db:
+            async with db.execute(
+                "SELECT state FROM automations WHERE id='bad-automation'"
+            ) as cursor:
+                bad = await cursor.fetchone()
+        self.assertEqual(bad["state"], AutomationState.CANCELLED.value)
+
+    async def test_legacy_null_id_is_quarantined_by_storage_rowid(self):
+        async with self.store._db() as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO automations (
+                    id,idempotency_key,name,schedule_json,job_kind,payload_json,
+                    state,next_run_at,created_at,updated_at
+                ) VALUES (NULL,?,?,?,?,?,'enabled',?,?,?)
+                """,
+                (
+                    "automation:null-id",
+                    "ancienne ligne",
+                    json.dumps(
+                        Schedule.interval(60, anchor=T0).to_payload(),
+                        separators=(",", ":"),
+                    ),
+                    "run_task",
+                    json.dumps({"task_id": 1}, separators=(",", ":")),
+                    datetime_to_text(T0),
+                    datetime_to_text(T0 - timedelta(seconds=1)),
+                    datetime_to_text(T0),
+                ),
+            )
+            row_id = cursor.lastrowid
+            await db.commit()
+
+        self.assertEqual(
+            await self.store.dispatch_due(self.queue, now=T0, limit=10), []
+        )
+        async with self.store._db() as db:
+            async with db.execute(
+                "SELECT state FROM automations WHERE rowid=?", (row_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+        self.assertEqual(row["state"], AutomationState.CANCELLED.value)
+
+    async def test_corrupt_unrelated_payload_does_not_block_task_cancellation(self):
+        target = await self.create(
+            payload={"task_id": 7},
+            idempotency_key="automation:target-task",
+        )
+        unrelated = await self.create(
+            payload={"task_id": 8},
+            idempotency_key="automation:other-task",
+        )
+        generic = await self.create(
+            payload=["valid", "generic", "payload"],
+            idempotency_key="automation:generic-payload",
+        )
+        async with self.store._db() as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO automations (
+                    id,idempotency_key,name,schedule_json,job_kind,payload_json,
+                    state,next_run_at,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,'enabled',?,?,?)
+                """,
+                (
+                    "corrupt-payload",
+                    "automation:corrupt-payload",
+                    "ancienne ligne corrompue",
+                    json.dumps(Schedule.interval(60, anchor=T0).to_payload()),
+                    "run_task",
+                    "{not-json",
+                    datetime_to_text(T0),
+                    datetime_to_text(T0),
+                    datetime_to_text(T0),
+                ),
+            )
+            corrupt_rowid = cursor.lastrowid
+            await db.commit()
+
+        self.assertEqual(await self.store.cancel_for_task(7, now=T0), 1)
+        self.assertEqual(
+            (await self.store.get(target.id)).state,
+            AutomationState.CANCELLED,
+        )
+        self.assertEqual(
+            (await self.store.get(unrelated.id)).state,
+            AutomationState.ENABLED,
+        )
+        self.assertEqual(
+            (await self.store.get(generic.id)).state,
+            AutomationState.ENABLED,
+        )
+        async with self.store._db() as db:
+            async with db.execute(
+                "SELECT state FROM automations WHERE rowid=?", (corrupt_rowid,)
+            ) as cursor:
+                corrupt = await cursor.fetchone()
+        self.assertEqual(corrupt["state"], AutomationState.CANCELLED.value)
 
 
 if __name__ == "__main__":

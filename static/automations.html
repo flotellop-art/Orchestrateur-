@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Travaux programmés · Orchestrateur</title>
+  <script src="/static/session-auth.js"></script>
   <style>
     :root {
       --bg: #f6f7fa; --card: #fff; --ink: #1a1a2e; --muted: #667085;
@@ -163,7 +164,7 @@
     };
 
     function apiKey() {
-      try { return localStorage.getItem('ORCH_API_KEY') || ''; } catch (_) { return ''; }
+      try { return sessionStorage.getItem('ORCH_API_KEY') || ''; } catch (_) { return ''; }
     }
 
     async function apiFetch(url, options) {

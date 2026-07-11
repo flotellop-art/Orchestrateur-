@@ -23,7 +23,7 @@ else
   VENV_PY=.venv/bin/python
 fi
 
-"$VENV_PY" -m pip install -r requirements-dev.txt
+"$VENV_PY" -m pip install --require-hashes -r requirements-lock.txt
 (cd electron-app && npm ci)
 
 if [ ! -f .env ]; then

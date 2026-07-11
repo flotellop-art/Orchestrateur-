@@ -19,21 +19,22 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python: ["3.12"]
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: |
-            requirements_orchestrator.txt
-            requirements-dev.txt
-      - uses: actions/setup-node@v6
+            requirements-lock.txt
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "24"
           cache: npm
           cache-dependency-path: electron-app/package-lock.json
       - name: Installer les dependances Python
-        run: python -m pip install -r requirements-dev.txt
+        run: python -m pip install --require-hashes -r requirements-lock.txt
       - name: Lancer les tests
         run: python -m pytest -q
       - name: Verifier la syntaxe Python
@@ -41,24 +42,78 @@ jobs:
       - name: Verifier JavaScript et le paquet desktop
         run: |
           node --check static/secure-sse.js
+          node --check static/session-auth.js
+          node --check static/chat-stream-utils.js
           node --check electron-app/main.js
           node --check electron-app/preload.js
           node --check electron-app/electron_hardening.js
           node -e "JSON.parse(require('fs').readFileSync('electron-app/package.json','utf8'))"
+          node tests/test_secure_sse.js
 
   backend-windows:
     name: Executable autonome Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: electron-app/package-lock.json
       - name: Installer les dependances de build
-        run: python -m pip install -r requirements-dev.txt
+        run: python -m pip install --require-hashes -r requirements-lock.txt
       - name: Construire le serveur autonome
         shell: pwsh
         run: ./scripts/build_backend.ps1 -Python python
       - name: Tester le serveur empaquete
         run: python scripts/smoke_backend.py electron-app/backend/orchestrator-backend/orchestrator-backend.exe
+      - name: Installer les dependances desktop
+        working-directory: electron-app
+        run: npm ci
+      - name: Construire l'installateur et la version portable
+        working-directory: electron-app
+        run: npm run build
+      - name: Verifier les livrables desktop
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $package = Get-Content electron-app/package.json -Raw | ConvertFrom-Json
+          $expected = @(
+            "electron-app/dist/$($package.build.productName) Setup $version.exe",
+            "electron-app/dist/$($package.build.productName) $version.exe"
+          )
+          foreach ($artifact in $expected) {
+            if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
+              throw "Livrable manquant : $artifact"
+            }
+            if ((Get-Item -LiteralPath $artifact).Length -lt 1MB) {
+              throw "Livrable anormalement petit : $artifact"
+            }
+          }
+          foreach ($resource in @(
+            "electron-app/dist/win-unpacked/resources/backend/orchestrator-backend/orchestrator-backend.exe",
+            "electron-app/dist/win-unpacked/resources/backend/orchestrator-backend/_internal/static/secure-sse.js",
+            "electron-app/dist/win-unpacked/resources/backend/orchestrator-backend/_internal/static/session-auth.js",
+            "electron-app/dist/win-unpacked/resources/backend/orchestrator-backend/_internal/static/chat-stream-utils.js",
+            "electron-app/dist/win-unpacked/resources/sandbox/Dockerfile",
+            "electron-app/dist/win-unpacked/resources/tools/build_sandbox.ps1",
+            "electron-app/dist/win-unpacked/resources/VERSION",
+            "electron-app/dist/win-unpacked/resources/LICENSE"
+          )) {
+            if (-not (Test-Path -LiteralPath $resource -PathType Leaf)) {
+              throw "Ressource embarquee manquante : $resource"
+            }
+          }
+          $claudeCli = @(Get-ChildItem `
+            "electron-app/dist/win-unpacked/resources/backend/orchestrator-backend" `
+            -Recurse -Filter "claude.exe")
+          if ($claudeCli.Count -ne 1 -or $claudeCli[0].Length -lt 1MB) {
+            throw "Executable Claude SDK absent ou invalide dans le paquet."
+          }

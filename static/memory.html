@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Memoire — Notes utilisateur</title>
+<script src="/static/session-auth.js"></script>
 <style>
   :root {
     --bg: #f8f9fa; --white: #fff; --dark: #1a1a2e; --orange: #e8825a;
@@ -107,7 +108,7 @@ function toast(msg, err) {
   t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), 2400);
 }
-function key() { try { return localStorage.getItem('ORCH_API_KEY')||''; } catch(e) { return ''; } }
+function key() { try { return sessionStorage.getItem('ORCH_API_KEY')||''; } catch(e) { return ''; } }
 async function api(path, opts) {
   opts = opts || {};
   const k = key();

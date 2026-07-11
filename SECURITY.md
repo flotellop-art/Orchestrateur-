@@ -63,6 +63,21 @@ mode `local`, le code possède les droits du compte qui lance Orchestrateur. Le
 détail du fonctionnement et de ces limites se trouve dans
 [`docs/INSTALL_PERMISSIONS.md`](docs/INSTALL_PERMISSIONS.md).
 
+## Clé dans l'interface
+
+La clé saisie dans **Contrôle > Réglages** reste uniquement dans la session de
+l'onglet. Elle n'est pas écrite dans le stockage persistant du navigateur et
+disparaît quand l'onglet est fermé. Au chargement de l'interface, une éventuelle
+clé laissée dans le stockage persistant par une ancienne version est supprimée
+sans être recopiée. Les pages `/chat`, `/memory`, `/skills` et
+`/automations` sont des coquilles publiques sans donnée sensible ; leurs
+routes `/api/...` restent protégées.
+
+L'activation ou le refus d'une compétence exige toujours une
+`API_SECRET_KEY` forte configurée sur le serveur, même depuis la machine
+locale. La session de revue à usage unique complète cette clé mais ne la
+remplace pas.
+
 ## Critères de contrôle
 
 - une requête distante sans clé reçoit un refus ;

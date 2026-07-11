@@ -41,6 +41,10 @@ class IdempotencyConflict(QueueError):
     """Une cle idempotente existe deja pour un autre travail."""
 
 
+class TaskReservationConflict(QueueError):
+    """La tache a change d'etat avant la reservation de son travail."""
+
+
 class LeaseLost(QueueError):
     """Le worker ne possede plus le bail associe au travail."""
 
@@ -226,6 +230,14 @@ class DurableQueue:
                 "CREATE INDEX IF NOT EXISTS idx_durable_jobs_lease "
                 "ON durable_jobs(state, lease_until)"
             )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_durable_jobs_created_at "
+                "ON durable_jobs(created_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_durable_jobs_terminal_retention "
+                "ON durable_jobs(state, finished_at)"
+            )
             await db.commit()
 
     async def enqueue(
@@ -316,6 +328,213 @@ class DurableQueue:
                 row = await cursor.fetchone()
         return _row_to_job(row) if row else None
 
+    async def reserve_task_run(
+        self,
+        *,
+        task_id: int,
+        payload: Any,
+        allowed_task_states: set[str] | frozenset[str],
+        now: datetime | None = None,
+    ) -> Job:
+        """Cree un lancement et reserve sa tache dans une seule transaction.
+
+        ``durable_jobs`` et ``tasks`` partagent le meme fichier SQLite dans
+        l'Orchestrateur. Cette operation evite donc qu'un worker voie le job
+        avant que ``queue_job_id``, ``run_number`` et ``status`` soient poses.
+        Le travail deja actif reste idempotent ; une ancienne occurrence
+        terminale orpheline fait avancer le numero au lieu d'etre rejouee.
+        """
+        if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 1:
+            raise ValidationError("task_id doit etre un entier positif.")
+        if (
+            not isinstance(allowed_task_states, (set, frozenset))
+            or not allowed_task_states
+            or any(not isinstance(state, str) or not state for state in allowed_task_states)
+        ):
+            raise ValidationError("allowed_task_states est invalide.")
+        kind = "run_task"
+        payload_json = _json_text(payload, limit=MAX_PAYLOAD_BYTES, label="payload")
+        current = normalize_utc(now or utc_now(), "now")
+        current_text = datetime_to_text(current)
+        active_states = {
+            JobState.QUEUED.value,
+            JobState.RUNNING.value,
+            JobState.PAUSED.value,
+        }
+
+        async with self._db() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                async with db.execute(
+                    "SELECT status,queue_job_id,COALESCE(run_number,0) AS run_number, "
+                    "source_job_id "
+                    "FROM tasks WHERE id=?",
+                    (task_id,),
+                ) as cursor:
+                    task = await cursor.fetchone()
+                if task is None:
+                    raise TaskReservationConflict("Tache introuvable.")
+
+                previous_status = str(task["status"])
+                previous_job_id = task["queue_job_id"]
+                if previous_job_id:
+                    async with db.execute(
+                        "SELECT * FROM durable_jobs WHERE id=?", (previous_job_id,)
+                    ) as cursor:
+                        previous_job = await cursor.fetchone()
+                    if (
+                        previous_job is not None
+                        and previous_job["state"] in active_states
+                    ):
+                        if previous_status not in {"queued", "running", "paused"}:
+                            raise TaskReservationConflict(
+                                "Le lancement precedent termine encore son traitement."
+                            )
+                        try:
+                            previous_payload = json.loads(previous_job["payload_json"])
+                        except (TypeError, json.JSONDecodeError) as exc:
+                            raise TaskReservationConflict(
+                                "Le lancement actif contient un payload invalide."
+                            ) from exc
+                        source_owned = task["source_job_id"] == previous_job_id
+                        direct_owned = (
+                            isinstance(previous_payload, dict)
+                            and isinstance(previous_payload.get("task_id"), int)
+                            and not isinstance(previous_payload.get("task_id"), bool)
+                            and previous_payload.get("task_id") == task_id
+                            and previous_job["payload_json"] == payload_json
+                            and previous_job["idempotency_key"]
+                            == f"task:{task_id}:run:{int(task['run_number'] or 0)}"
+                        )
+                        scheduled_owned = (
+                            source_owned
+                            and isinstance(previous_payload, dict)
+                            and bool(previous_payload.get("automation_id"))
+                            and isinstance(previous_payload.get("payload"), dict)
+                            and isinstance(
+                                previous_payload["payload"].get("task_id"), int
+                            )
+                            and not isinstance(
+                                previous_payload["payload"].get("task_id"), bool
+                            )
+                        )
+                        if previous_job["kind"] != kind or not (
+                            direct_owned or scheduled_owned
+                        ):
+                            raise TaskReservationConflict(
+                                "Le lancement actif n'appartient pas a cette tache."
+                            )
+                        await db.commit()
+                        return _row_to_job(previous_job)
+
+                if previous_status not in allowed_task_states:
+                    raise TaskReservationConflict(
+                        "La tache a change d'etat avant son lancement."
+                    )
+
+                previous_run_number = int(task["run_number"] or 0)
+                run_number = previous_run_number + 1
+                job_row = None
+                # Les trous ne se produisent qu'apres une ancienne ecriture
+                # partielle. La borne protege une base volontairement corrompue.
+                for _ in range(1000):
+                    idempotency_key = f"task:{task_id}:run:{run_number}"
+                    async with db.execute(
+                        "SELECT * FROM durable_jobs WHERE idempotency_key=?",
+                        (idempotency_key,),
+                    ) as cursor:
+                        existing = await cursor.fetchone()
+                    if existing is not None:
+                        if existing["state"] in active_states:
+                            if (
+                                existing["kind"] != kind
+                                or existing["payload_json"] != payload_json
+                                or existing["priority"] != 0
+                                or existing["max_attempts"] != 3
+                                or existing["base_backoff_seconds"] != 5.0
+                            ):
+                                raise IdempotencyConflict(
+                                    "Cette occurrence active contient un autre lancement."
+                                )
+                            job_row = existing
+                            break
+                        run_number += 1
+                        continue
+
+                    job_id = uuid.uuid4().hex
+                    try:
+                        await db.execute(
+                            """
+                            INSERT INTO durable_jobs (
+                                id, idempotency_key, kind, payload_json, state,
+                                priority, attempts, max_attempts,
+                                base_backoff_seconds, available_at, created_at,
+                                updated_at
+                            ) VALUES (?, ?, ?, ?, 'queued', 0, 0, 3, 5, ?, ?, ?)
+                            """,
+                            (
+                                job_id,
+                                idempotency_key,
+                                kind,
+                                payload_json,
+                                current_text,
+                                current_text,
+                                current_text,
+                            ),
+                        )
+                    except sqlite3.IntegrityError:
+                        async with db.execute(
+                            "SELECT * FROM durable_jobs WHERE idempotency_key=?",
+                            (idempotency_key,),
+                        ) as cursor:
+                            existing = await cursor.fetchone()
+                        if existing is None:
+                            raise
+                        if (
+                            existing["kind"] != kind
+                            or existing["payload_json"] != payload_json
+                        ):
+                            raise IdempotencyConflict(
+                                "Cette cle idempotente designe un autre travail."
+                            ) from None
+                        job_row = existing
+                    else:
+                        async with db.execute(
+                            "SELECT * FROM durable_jobs WHERE id=?", (job_id,)
+                        ) as cursor:
+                            job_row = await cursor.fetchone()
+                    break
+                if job_row is None:
+                    raise TaskReservationConflict(
+                        "Impossible de reserver un numero de lancement."
+                    )
+
+                cursor = await db.execute(
+                    """
+                    UPDATE tasks
+                    SET status='queued', queue_job_id=?, run_number=?
+                    WHERE id=? AND status=? AND COALESCE(run_number,0)=?
+                        AND queue_job_id IS ?
+                    """,
+                    (
+                        job_row["id"],
+                        run_number,
+                        task_id,
+                        previous_status,
+                        previous_run_number,
+                        previous_job_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise TaskReservationConflict(
+                        "La tache a change d'etat avant sa reservation."
+                    )
+                await db.commit()
+                return _row_to_job(job_row)
+            except BaseException:
+                await db.rollback()
+                raise
+
     async def list(self, *, state: JobState | str | None = None, limit: int = 100) -> list[Job]:
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
             raise ValidationError("limit doit etre compris entre 1 et 1000.")
@@ -336,6 +555,43 @@ class DurableQueue:
                 rows = await cursor.fetchall()
         return [_row_to_job(row) for row in rows]
 
+    async def purge_terminal(
+        self,
+        *,
+        older_than: datetime,
+        limit: int = 1000,
+    ) -> int:
+        """Supprime un lot de travaux termines apres leur duree de retention.
+
+        La date de fin, et non la date de creation, porte la retention : un
+        travail ancien qui vient seulement de finir garde donc son resultat.
+        Les travaux en attente, actifs ou en pause ne sont jamais concernes.
+        Le lot borne evite de monopoliser SQLite lors d'un gros nettoyage.
+        """
+        cutoff = datetime_to_text(normalize_utc(older_than, "older_than"))
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 10_000:
+            raise ValidationError("limit doit etre compris entre 1 et 10000.")
+        async with self._db() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                """
+                SELECT id FROM durable_jobs
+                WHERE state IN ('succeeded','failed','cancelled')
+                    AND finished_at IS NOT NULL AND finished_at<=?
+                ORDER BY finished_at ASC, created_at ASC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            if rows:
+                await db.executemany(
+                    "DELETE FROM durable_jobs WHERE id=?",
+                    [(row["id"],) for row in rows],
+                )
+            await db.commit()
+        return len(rows)
+
     async def cancel_scheduled_for_task(
         self, task_id: int, *, now: datetime | None = None
     ) -> int:
@@ -344,6 +600,7 @@ class DurableQueue:
             raise ValidationError("task_id doit etre un entier positif.")
         current_text = datetime_to_text(normalize_utc(now or utc_now(), "now"))
         matched: list[str] = []
+        quarantined: list[str] = []
         async with self._db() as db:
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -354,18 +611,73 @@ class DurableQueue:
             for row in rows:
                 try:
                     payload = json.loads(row["payload_json"])
-                except (TypeError, json.JSONDecodeError) as exc:
-                    await db.rollback()
-                    raise QueueError("Un travail contient un payload invalide.") from exc
+                except (TypeError, json.JSONDecodeError):
+                    # Un ancien travail corrompu ne doit pas empecher la
+                    # suppression d'une tache sans rapport. Il est inexecutable
+                    # de toute facon : on le met en quarantaine atomiquement.
+                    quarantined.append(row["id"])
+                    continue
+                if not isinstance(payload, dict):
+                    quarantined.append(row["id"])
+                    continue
                 nested = payload.get("payload") if isinstance(payload, dict) else None
+                if payload.get("automation_id") and not isinstance(nested, dict):
+                    quarantined.append(row["id"])
+                    continue
                 if (
-                    isinstance(payload, dict)
-                    and payload.get("automation_id")
+                    payload.get("automation_id")
                     and isinstance(nested, dict)
+                    and isinstance(nested.get("task_id"), int)
+                    and not isinstance(nested.get("task_id"), bool)
                     and nested.get("task_id") == task_id
                 ):
                     matched.append(row["id"])
-            for job_id in matched:
+            for job_id in (*matched, *quarantined):
+                await db.execute(
+                    """
+                    UPDATE durable_jobs
+                    SET state='cancelled', lease_owner=NULL, lease_token=NULL,
+                        lease_until=NULL, updated_at=?, finished_at=?
+                    WHERE id=? AND state IN ('queued','running','paused')
+                    """,
+                    (current_text, current_text, job_id),
+                )
+            await db.commit()
+        return len(matched)
+
+    async def cancel_notifications_for_task(
+        self, task_id: int, *, now: datetime | None = None
+    ) -> int:
+        """Annule les notifications non terminales liees a une tache."""
+        if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 1:
+            raise ValidationError("task_id doit etre un entier positif.")
+        current_text = datetime_to_text(normalize_utc(now or utc_now(), "now"))
+        matched: list[str] = []
+        quarantined: list[str] = []
+        async with self._db() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT id,payload_json FROM durable_jobs "
+                "WHERE kind='notify' AND state IN ('queued','running','paused')"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    quarantined.append(row["id"])
+                    continue
+                if not isinstance(payload, dict):
+                    quarantined.append(row["id"])
+                    continue
+                payload_task_id = payload.get("task_id")
+                if (
+                    isinstance(payload_task_id, int)
+                    and not isinstance(payload_task_id, bool)
+                    and payload_task_id == task_id
+                ):
+                    matched.append(row["id"])
+            for job_id in (*matched, *quarantined):
                 await db.execute(
                     """
                     UPDATE durable_jobs
@@ -748,7 +1060,9 @@ __all__ = [
     "JobLease",
     "JobState",
     "LeaseLost",
+    "MAX_PAYLOAD_BYTES",
     "QueueError",
+    "TaskReservationConflict",
     "ValidationError",
     "datetime_from_text",
     "datetime_to_text",

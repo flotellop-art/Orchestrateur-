@@ -6,10 +6,10 @@ elle lance le serveur autonome placé dans `resources/backend/`.
 
 ## Développement Windows
 
-Prérequis : Python 3.12, Node.js 24 et les dépendances du dépôt.
+Prérequis : Python 3.12 et Node.js 24. Depuis la racine du dépôt :
 
 ```powershell
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements-lock.txt
 cd electron-app
 npm ci
 npm start

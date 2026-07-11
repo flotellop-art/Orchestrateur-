@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -28,8 +29,15 @@ INSTRUCTIONS = """Lire tous les fichiers concernés avant de conclure.
 """
 
 
+TEST_API_SECRET = "test-review-secret-that-is-long-enough"
+
+
 class SkillsAPITests(unittest.TestCase):
     def setUp(self):
+        self.secret_patch = patch.dict(
+            os.environ, {"API_SECRET_KEY": TEST_API_SECRET}, clear=False
+        )
+        self.secret_patch.start()
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.db_path = self.root / "skills-api.db"
@@ -62,6 +70,7 @@ class SkillsAPITests(unittest.TestCase):
             "Sec-Fetch-Site": "same-origin",
             "X-Orchestrator-Human-UI": "skills-page",
             "User-Agent": "orchestrator-human-browser",
+            "X-API-Key": TEST_API_SECRET,
         }
 
     def tearDown(self):
@@ -70,6 +79,7 @@ class SkillsAPITests(unittest.TestCase):
             skills_api._review_sessions.clear()
         self.export_patch.stop()
         self.db_patch.stop()
+        self.secret_patch.stop()
         self.temp.cleanup()
 
     def propose(self, **changes):
@@ -189,10 +199,47 @@ class SkillsAPITests(unittest.TestCase):
         )
         for headers in bad_headers:
             with self.subTest(headers=headers):
+                headers = {**headers, "X-API-Key": TEST_API_SECRET}
                 response = self.client.post(
                     "/api/skills/review-session", headers=headers
                 )
                 self.assertEqual(response.status_code, 403)
+
+    def test_forged_loopback_review_requires_the_configured_secret(self):
+        forged = {
+            "Origin": "http://testserver",
+            "Sec-Fetch-Site": "same-origin",
+            "X-Orchestrator-Human-UI": "skills-page",
+            "User-Agent": "forged-local-client",
+        }
+        missing = self.client.post("/api/skills/review-session", headers=forged)
+        self.assertEqual(missing.status_code, 401)
+        wrong = self.client.post(
+            "/api/skills/review-session",
+            headers={**forged, "X-API-Key": "wrong-secret"},
+        )
+        self.assertEqual(wrong.status_code, 403)
+        with patch.dict(os.environ, {"API_SECRET_KEY": ""}, clear=False):
+            unconfigured = self.client.post(
+                "/api/skills/review-session",
+                headers={**forged, "X-API-Key": TEST_API_SECRET},
+            )
+        self.assertEqual(unconfigured.status_code, 503)
+
+    def test_decision_rechecks_the_server_secret_before_consuming_session(self):
+        skill = self.propose()
+        token = self.review_token()
+        without_key = dict(self.browser_headers)
+        without_key.pop("X-API-Key")
+        refused = self.decide(
+            skill.id,
+            {"decision": "approve"},
+            token=token,
+            headers=without_key,
+        )
+        self.assertEqual(refused.status_code, 401)
+        approved = self.decide(skill.id, {"decision": "approve"}, token=token)
+        self.assertEqual(approved.status_code, 200, approved.text)
 
     def test_review_session_is_bound_to_browser_and_used_once(self):
         first = self.propose(name="First Review")

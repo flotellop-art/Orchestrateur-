@@ -25,6 +25,11 @@ l'acces HTTP et de la fenetre Electron, nettoyage des conteneurs survivants et
 documentation de construction. Les executables de cette beta restent non
 signes.
 
+La revue de securite a egalement renforce l'approbation humaine des
+competences, les courses pause/reprise/arret, les notifications durables, la
+fermeture du runtime Docker, les en-tetes des pages web et le verrouillage par
+empreinte des dependances de construction.
+
 ## 0.1.0 - prototype initial
 
 - creation d'applications Flask ;

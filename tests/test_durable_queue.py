@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -183,6 +184,66 @@ class DurableQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.queue.get(first.id)).state, JobState.CANCELLED)
         self.assertEqual((await self.queue.get(second.id)).state, JobState.QUEUED)
 
+    async def test_corrupt_scheduled_payload_is_quarantined_without_blocking_delete(self):
+        target = await self.enqueue(
+            key="scheduled:target",
+            payload={
+                "automation_id": "a" * 32,
+                "scheduled_for": "2026-07-11T08:00:00Z",
+                "payload": {"task_id": 7},
+            },
+        )
+        corrupt = await self.enqueue(
+            key="scheduled:corrupt",
+            payload={
+                "automation_id": "b" * 32,
+                "scheduled_for": "2026-07-11T08:00:00Z",
+                "payload": {"task_id": 8},
+            },
+        )
+        db = sqlite3.connect(self.queue.db_path)
+        try:
+            db.execute(
+                "UPDATE durable_jobs SET payload_json='{broken' WHERE id=?",
+                (corrupt.id,),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        self.assertEqual(
+            await self.queue.cancel_scheduled_for_task(7, now=T0), 1
+        )
+        self.assertEqual((await self.queue.get(target.id)).state, JobState.CANCELLED)
+        db = sqlite3.connect(self.queue.db_path)
+        try:
+            corrupt_state = db.execute(
+                "SELECT state FROM durable_jobs WHERE id=?", (corrupt.id,)
+            ).fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(corrupt_state, JobState.CANCELLED.value)
+
+    async def test_notification_cancellation_matches_strict_integer_task_id(self):
+        exact = await self.queue.enqueue(
+            kind="notify",
+            payload={"task_id": 1, "channel": "alerts", "text": "exact"},
+            idempotency_key="notify:exact",
+            now=T0,
+        )
+        boolean = await self.queue.enqueue(
+            kind="notify",
+            payload={"task_id": True, "channel": "alerts", "text": "bool"},
+            idempotency_key="notify:boolean",
+            now=T0,
+        )
+
+        self.assertEqual(
+            await self.queue.cancel_notifications_for_task(1, now=T0), 1
+        )
+        self.assertEqual((await self.queue.get(exact.id)).state, JobState.CANCELLED)
+        self.assertEqual((await self.queue.get(boolean.id)).state, JobState.QUEUED)
+
     async def test_worker_cannot_finish_after_lease_deadline(self):
         await self.enqueue()
         lease = await self.queue.claim(
@@ -206,6 +267,39 @@ class DurableQueueTests(unittest.IsolatedAsyncioTestCase):
                 error_code="https://secret.example/token/value",
                 now=T0,
             )
+
+    async def test_purge_removes_only_terminal_jobs_past_retention(self):
+        old_done = await self.enqueue(key="old:done")
+        old_lease = await self.queue.claim(worker_id="worker:old-done", now=T0)
+        await self.queue.complete(old_lease, now=T0 + timedelta(seconds=30))
+
+        old_waiting = await self.enqueue(key="old:waiting")
+        recent_done = await self.enqueue(
+            key="recent:done", now=T0 + timedelta(days=40), priority=10
+        )
+        recent_lease = await self.queue.claim(
+            worker_id="worker:recent", now=T0 + timedelta(days=40)
+        )
+        await self.queue.complete(
+            recent_lease, now=T0 + timedelta(days=40, seconds=30)
+        )
+
+        removed = await self.queue.purge_terminal(
+            older_than=T0 + timedelta(days=30)
+        )
+        self.assertEqual(removed, 1)
+        self.assertIsNone(await self.queue.get(old_done.id))
+        self.assertEqual((await self.queue.get(old_waiting.id)).state, JobState.QUEUED)
+        self.assertEqual((await self.queue.get(recent_done.id)).state, JobState.SUCCEEDED)
+
+        db = sqlite3.connect(self.queue.db_path)
+        try:
+            indexes = {
+                row[1]: row for row in db.execute("PRAGMA index_list(durable_jobs)")
+            }
+        finally:
+            db.close()
+        self.assertIn("idx_durable_jobs_created_at", indexes)
 
 
 if __name__ == "__main__":

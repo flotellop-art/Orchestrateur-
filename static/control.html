@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Orchestrator · Centre de contrôle</title>
+<script src="/static/session-auth.js"></script>
+<script src="/static/chat-stream-utils.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
@@ -298,7 +300,7 @@ main{grid-area:main;overflow-y:auto;padding:var(--sp-6);position:relative}
         <label for="settings-apikey" style="display:block;margin-bottom:6px;color:var(--c-text)">Clé API <span style="color:var(--c-text-faint);font-weight:normal">(envoyée en header X-API-Key)</span></label>
         <div style="display:flex;gap:6px">
           <input class="input" type="password" id="settings-apikey" placeholder="Saisir la clé API…" style="flex:1" autocomplete="off">
-          <button class="btn btn-sm btn-primary" id="settings-apikey-save">Enregistrer</button>
+          <button class="btn btn-sm btn-primary" id="settings-apikey-save">Utiliser dans cet onglet</button>
         </div>
         <div id="settings-apikey-status" style="margin-top:6px;font-size:var(--fs-xs);color:var(--c-text-faint)"></div>
       </div>
@@ -332,7 +334,7 @@ main{grid-area:main;overflow-y:auto;padding:var(--sp-6);position:relative}
 // CONFIG (B-INC-01) — auth header centralisée + base URL
 // ============================================================
 const CONFIG = {
-  apiKey: (function(){ try { return localStorage.getItem('ORCH_API_KEY') || ''; } catch(e){ return ''; } })(),
+  apiKey: (function(){ try { return sessionStorage.getItem('ORCH_API_KEY') || ''; } catch(e){ return ''; } })(),
   baseUrl: ''
 };
 
@@ -766,24 +768,27 @@ async function sendChat(){
           if(!m) continue;
           const raw = m[1];
           if(raw==='[DONE]') continue;
-          try{
-            const j = JSON.parse(raw);
-            if(j.type==='tool_executing'){
-              asstEl.innerHTML = '<em>Outil en cours : '+escapeHtml(j.tool_name||'')+'</em>';
-              continue;
-            }
-            if(j.type==='tool_result'){
-              chatAppend('assistant', 'Résultat '+String(j.tool_name||'outil')+' : '+String(j.result||''));
-              continue;
-            }
-            if(j.type==='confirmation_needed'){
-              asstEl.innerHTML = renderMarkdown((acc?acc+'\n\n':'')+'Une autorisation est nécessaire : '+String(j.description||j.tool_name||'action')+'. Ouvrez la page Chat pour accepter ou refuser.');
-              continue;
-            }
-            if(j.type==='error') throw new Error(j.message||'Erreur du chat');
-            const delta = (j.type==='text_delta' ? j.text : '') || j.delta || j.content || (j.choices && j.choices[0] && (j.choices[0].delta?j.choices[0].delta.content:j.choices[0].text)) || '';
-            if(delta){ acc += delta; asstEl.innerHTML = renderMarkdown(acc); $('#chat-stream').scrollTop = $('#chat-stream').scrollHeight; }
-          }catch(_){ acc += raw; asstEl.innerHTML = renderMarkdown(acc); }
+          const parsed = OrchestratorChatStream.parsePayload(raw);
+          if(!parsed.parsed){
+            acc += parsed.raw;
+            asstEl.innerHTML = renderMarkdown(acc);
+            continue;
+          }
+          const j = parsed.event;
+          if(j.type==='tool_executing'){
+            asstEl.innerHTML = '<em>Outil en cours : '+escapeHtml(j.tool_name||'')+'</em>';
+            continue;
+          }
+          if(j.type==='tool_result'){
+            chatAppend('assistant', 'Résultat '+String(j.tool_name||'outil')+' : '+String(j.result||''));
+            continue;
+          }
+          if(j.type==='confirmation_needed'){
+            asstEl.innerHTML = renderMarkdown((acc?acc+'\n\n':'')+'Une autorisation est nécessaire : '+String(j.description||j.tool_name||'action')+'. Ouvrez la page Chat pour accepter ou refuser.');
+            continue;
+          }
+          const delta = (j.type==='text_delta' ? j.text : '') || j.delta || j.content || (j.choices && j.choices[0] && (j.choices[0].delta?j.choices[0].delta.content:j.choices[0].text)) || '';
+          if(delta){ acc += delta; asstEl.innerHTML = renderMarkdown(acc); $('#chat-stream').scrollTop = $('#chat-stream').scrollHeight; }
         }
       }
     } else {
@@ -932,20 +937,20 @@ window.addEventListener('DOMContentLoaded', ()=>{
   $('#theme-toggle').addEventListener('click', toggleTheme);
   const stBtn = $('#settings-theme-toggle'); if(stBtn) stBtn.addEventListener('click', toggleTheme);
 
-  // API key persistante
+  // Cle API limitee a la session de cet onglet
   const keyInput = $('#settings-apikey');
   const keyStatus = $('#settings-apikey-status');
   if(keyInput){
     keyInput.value = CONFIG.apiKey || '';
-    if(keyStatus) keyStatus.textContent = CONFIG.apiKey ? 'Clé enregistrée (longueur : '+CONFIG.apiKey.length+').' : 'Aucune clé enregistrée — les requêtes seront refusées (401).';
+    if(keyStatus) keyStatus.textContent = CONFIG.apiKey ? 'Clé disponible pour cet onglet (longueur : '+CONFIG.apiKey.length+').' : 'Aucune clé dans cet onglet — les requêtes seront refusées (401).';
   }
   const keyBtn = $('#settings-apikey-save');
   if(keyBtn) keyBtn.addEventListener('click', ()=>{
     const v = (keyInput.value||'').trim();
-    try{ localStorage.setItem('ORCH_API_KEY', v); }catch(e){}
+    try{ sessionStorage.setItem('ORCH_API_KEY', v); }catch(e){}
     CONFIG.apiKey = v;
-    if(keyStatus) keyStatus.textContent = v ? 'Clé enregistrée (longueur : '+v.length+'). Reconnexion SSE…' : 'Clé effacée.';
-    toast('Clé API enregistrée','','success');
+    if(keyStatus) keyStatus.textContent = v ? 'Clé disponible pour cet onglet (longueur : '+v.length+'). Reconnexion SSE…' : 'Clé effacée.';
+    toast('Clé API chargée pour cet onglet','','success');
     // Re-tente une connexion SSE et recharge la vue courante
     connectSSE();
     navigate();

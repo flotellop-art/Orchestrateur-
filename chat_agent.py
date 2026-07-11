@@ -304,7 +304,22 @@ router = APIRouter()
 
 @router.get("/chat")
 async def chat_page():
-    return FileResponse(STATIC_DIR / "chat.html")
+    return FileResponse(
+        STATIC_DIR / "chat.html",
+        media_type="text/html",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": (
+                "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
+                "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+                "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+                "form-action 'self'"
+            ),
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+        },
+    )
 
 
 @router.post("/api/chat")

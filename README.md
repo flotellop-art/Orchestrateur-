@@ -73,7 +73,7 @@ Docker Engine.
 git clone https://github.com/flotellop-art/Orchestrateur-.git
 cd Orchestrateur-
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements-dev.txt
+.venv\Scripts\python -m pip install --require-hashes -r requirements-lock.txt
 .\scripts\build_sandbox.ps1
 .venv\Scripts\python orchestrator.py
 ```
@@ -107,7 +107,7 @@ Variables importantes :
 | `ANTHROPIC_API_KEY` | modèles Claude |
 | `OPENAI_API_KEY` | modèles OpenAI et recherche mémoire facultative |
 | `GEMINI_API_KEY` | modèles Gemini |
-| `API_SECRET_KEY` | accès distant, 24 caractères minimum |
+| `API_SECRET_KEY` | accès distant et décisions sur les compétences, 24 caractères minimum |
 | `ORCHESTRATOR_ALLOWED_HOSTS` | domaines distants explicitement admis |
 | `ORCHESTRATOR_TARGET_ROOTS` | dossiers locaux lisibles en mode audit |
 | `ORCHESTRATOR_DEFAULT_EXECUTION` | `docker` recommandé ou `local` non isolé |
@@ -129,7 +129,7 @@ L'installateur embarque le serveur Python construit avec PyInstaller. La
 personne qui installe Orchestrateur n'a donc pas besoin d'installer Python.
 
 ```powershell
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements-lock.txt
 cd electron-app
 npm ci
 cd ..
@@ -158,6 +158,7 @@ Voir [le guide de construction](docs/PACKAGING.md).
 
 ```powershell
 .venv\Scripts\python -m pytest -q
+node tests/test_secure_sse.js
 ```
 
 GitHub vérifie la suite sur Windows et Linux et construit aussi le serveur

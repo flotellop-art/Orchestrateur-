@@ -17,7 +17,7 @@ if (-not $Python) {
 
 & $Python -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) {
-    throw "PyInstaller manque. Installez requirements-dev.txt avant le build."
+    throw "PyInstaller manque. Installez requirements-lock.txt avec --require-hashes avant le build."
 }
 
 if (Test-Path -LiteralPath $Backend) {

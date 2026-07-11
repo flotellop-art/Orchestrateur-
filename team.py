@@ -24,6 +24,7 @@ import signal
 import socket
 import sys
 import uuid
+import weakref
 import zipfile
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -40,7 +41,13 @@ from pydantic import BaseModel
 from app_paths import APP_ROOT, DATA_ROOT, DB_PATH, PROJECTS_ROOT, STATIC_ROOT
 import agent_skills
 from automations import AutomationStore
-from durable_queue import DurableQueue, JobLease, JobState, LeaseLost
+from durable_queue import (
+    DurableQueue,
+    JobLease,
+    JobState,
+    LeaseLost,
+    TaskReservationConflict,
+)
 import managed_agents  # pont vers les Agents geres Anthropic (delegation depuis le chef)
 from messaging import (
     MAX_MESSAGE_CHARACTERS,
@@ -66,6 +73,7 @@ from sandbox_runtime import (
     DockerSandboxRuntime,
     SandboxConfig,
     SandboxError,
+    SandboxStopError,
     SandboxUnavailableError,
 )
 
@@ -138,8 +146,18 @@ _client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 # task_id -> {"task": asyncio.Task, "pause": asyncio.Event, "step": bool, "inbox": list}
 running_tasks: dict[int, dict] = {}
+# Verrou court couvrant les changements de cycle de vie d'une tache. La table
+# faible evite de conserver un verrou pour chaque ancienne tache jusqu'a la fin
+# du processus, tout en donnant le meme objet a tous les appels concurrents.
+_task_lifecycle_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+_preview_shutdown_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
 # task_id -> {"proc": Process, "url": str|None, "output": list}
 launched_apps: dict[int, dict] = {}
+_launched_app_locks: dict[int, asyncio.Lock] = {}
 # request_id -> Future resolue par l'endpoint de decision.
 install_waiters: dict[str, asyncio.Future] = {}
 install_waiter_tasks: dict[str, int] = {}
@@ -155,7 +173,40 @@ messaging_gateway: Optional[MessagingGateway] = None
 sandbox_runtime: Optional[DockerSandboxRuntime] = None
 _runtime_background_tasks: list[asyncio.Task] = []
 _runtime_shutdown: Optional[asyncio.Event] = None
+_runtime_service_error: Optional[str] = None
 _QUEUE_LEASE_SECONDS = 90.0
+_DURABLE_JOB_RETENTION = timedelta(days=30)
+_PREVIEW_STOP_TIMEOUT_SECONDS = 3.0
+
+
+class CompletionNotificationError(RuntimeError):
+    """La tache est terminee, mais sa notification doit etre reessayee."""
+
+
+class PreviewStopError(SandboxError):
+    """Un apercu local n'a pas confirme sa terminaison."""
+
+
+def _task_lifecycle_lock(task_id: int) -> asyncio.Lock:
+    lock = _task_lifecycle_locks.get(task_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _task_lifecycle_locks[task_id] = lock
+    return lock
+
+
+def _preview_shutdown_lock() -> asyncio.Lock:
+    loop_key = id(asyncio.get_running_loop())
+    lock = _preview_shutdown_locks.get(loop_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _preview_shutdown_locks[loop_key] = lock
+    return lock
+
+
+def _require_runtime_services() -> None:
+    if _runtime_service_error:
+        raise HTTPException(503, _runtime_service_error)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -343,6 +394,31 @@ async def init_team_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_source_job "
             "ON tasks(source_job_id) WHERE source_job_id IS NOT NULL"
         )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS completion_notification_outbox (
+                run_job_id  TEXT PRIMARY KEY,
+                task_id     INTEGER NOT NULL,
+                iteration   INTEGER NOT NULL,
+                channel     TEXT NOT NULL,
+                text        TEXT NOT NULL,
+                ready       INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+        """)
+        # Les lignes creees avant l'introduction des intentions preliminaires
+        # contenaient deja un texte final : elles sont donc immediatement pretes.
+        try:
+            await db.execute(
+                "ALTER TABLE completion_notification_outbox "
+                "ADD COLUMN ready INTEGER NOT NULL DEFAULT 1"
+            )
+        except Exception:
+            pass
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_completion_outbox_created "
+            "ON completion_notification_outbox(created_at)"
+        )
         try:
             await db.execute("ALTER TABLE install_requests ADD COLUMN source TEXT")
         except Exception:
@@ -454,6 +530,9 @@ async def db_delete_task(task_id):
         await db.execute("DELETE FROM prompts WHERE task_id=?", (task_id,))
         await db.execute("DELETE FROM builds WHERE task_id=?", (task_id,))
         await db.execute("DELETE FROM install_requests WHERE task_id=?", (task_id,))
+        await db.execute(
+            "DELETE FROM completion_notification_outbox WHERE task_id=?", (task_id,)
+        )
         await db.commit()
 
 
@@ -473,6 +552,80 @@ async def db_transition_task_status(
         return cursor.rowcount == 1
 
 
+async def db_claim_task_for_job(task_id: int, job_id: str) -> bool:
+    """Reserve atomiquement une tache encore demarrable pour ce travail.
+
+    Le controle de l'etat et le passage a ``running`` partagent une seule
+    instruction SQL. Une pause ou un arret gagne donc la course au lieu d'etre
+    ecrase par un snapshot lu avant la verification de Docker.
+    """
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cursor = await db.execute(
+            "UPDATE tasks SET status='running', queue_job_id=? "
+            "WHERE id=? AND ("
+            "(status IN ('idle','queued') AND (queue_job_id IS NULL OR queue_job_id=?)) "
+            "OR (status='running' AND queue_job_id=?))",
+            (job_id, task_id, job_id, job_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def db_detach_task_job(task_id: int, job_id: str) -> bool:
+    """Retire uniquement une reference de job devenue incoherente."""
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cursor = await db.execute(
+            "UPDATE tasks SET queue_job_id=NULL "
+            "WHERE id=? AND queue_job_id=? "
+            "AND status IN ('queued','running','paused')",
+            (task_id, job_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def db_transition_task_status_for_job(
+    task_id: int,
+    job_id: str,
+    new_status: str,
+    allowed_current: set[str] | frozenset[str],
+) -> bool:
+    """Transitionne uniquement si ce travail possede encore la tache."""
+    if not allowed_current or any(not isinstance(item, str) for item in allowed_current):
+        raise ValueError("Etats sources invalides.")
+    placeholders = ",".join("?" for _ in allowed_current)
+    values = [new_status, task_id, job_id, *sorted(allowed_current)]
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cursor = await db.execute(
+            f"UPDATE tasks SET status=? WHERE id=? AND queue_job_id=? "
+            f"AND status IN ({placeholders})",
+            values,
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def db_transition_task_status_for_source_job(
+    task_id: int,
+    source_job_id: str,
+    new_status: str,
+    allowed_current: set[str] | frozenset[str],
+) -> bool:
+    """Transition equivalente pour une execution creee par automatisation."""
+    if not allowed_current or any(not isinstance(item, str) for item in allowed_current):
+        raise ValueError("Etats sources invalides.")
+    placeholders = ",".join("?" for _ in allowed_current)
+    values = [new_status, task_id, source_job_id, *sorted(allowed_current)]
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cursor = await db.execute(
+            f"UPDATE tasks SET status=? WHERE id=? AND source_job_id=? "
+            f"AND status IN ({placeholders})",
+            values,
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
 # -- File durable, reprise et planifications ---------------------------------
 async def _configured_channels() -> tuple[str, ...]:
     if messaging_gateway is None:
@@ -486,6 +639,7 @@ async def enqueue_task_run(
     resume: bool,
     notification_channel: Optional[str] = None,
     source: str = "user",
+    expected_statuses: set[str] | frozenset[str] | None = None,
 ):
     """Enregistre un lancement avant de l'executer.
 
@@ -494,41 +648,23 @@ async def enqueue_task_run(
     """
     if task_queue is None:
         raise RuntimeError("La file durable n'est pas initialisee.")
-    task = await db_get_task(task_id)
-    if not task:
-        raise ValueError("Tache introuvable.")
-    existing_id = task.get("queue_job_id")
-    if existing_id:
-        existing = await task_queue.get(existing_id)
-        if existing and existing.state in {
-            JobState.QUEUED, JobState.RUNNING, JobState.PAUSED
-        }:
-            return existing
-
     if notification_channel:
         channels = await _configured_channels()
         if notification_channel not in channels:
             raise ValueError("Canal de notification non configure.")
-    run_number = int(task.get("run_number") or 0) + 1
-    job = await task_queue.enqueue(
-        kind="run_task",
+    allowed = expected_statuses or {"idle", "queued"}
+    job = await task_queue.reserve_task_run(
+        task_id=task_id,
         payload={
             "task_id": task_id,
             "resume": bool(resume),
             "notification_channel": notification_channel,
             "source": source,
         },
-        idempotency_key=f"task:{task_id}:run:{run_number}",
-        max_attempts=3,
-        base_backoff_seconds=5,
+        allowed_task_states=allowed,
     )
-    await db_update_task(
-        task_id,
-        queue_job_id=job.id,
-        run_number=run_number,
-        status="queued",
-    )
-    await emit(task_id, int(task.get("iteration") or 0), "systeme", "queued", {
+    task = await db_get_task(task_id)
+    await emit(task_id, int((task or {}).get("iteration") or 0), "systeme", "queued", {
         "job_id": job.id,
         "source": source,
     })
@@ -562,11 +698,271 @@ async def enqueue_notification(
     return job.id
 
 
+async def _ensure_completion_notification_intent(
+    *,
+    run_job_id: str,
+    task_id: int,
+    channel: str,
+) -> None:
+    """Persiste l'intention avant que l'agent puisse terminer sa tache."""
+    if not isinstance(run_job_id, str) or not run_job_id:
+        raise ValueError("run_job_id invalide.")
+    if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 1:
+        raise ValueError("task_id invalide.")
+    MessageRequest(channel=channel, text="Notification de fin en attente.")
+    current_text = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO completion_notification_outbox (
+                run_job_id,task_id,iteration,channel,text,ready,created_at,updated_at
+            ) VALUES (?,?,0,?,'',0,?,?)
+            """,
+            (run_job_id, task_id, channel, current_text, current_text),
+        )
+        async with db.execute(
+            "SELECT task_id,channel FROM completion_notification_outbox "
+            "WHERE run_job_id=?",
+            (run_job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None or (row["task_id"], row["channel"]) != (task_id, channel):
+            await db.rollback()
+            raise RuntimeError("Conflit dans l'intention de notification.")
+        await db.commit()
+
+
+async def _discard_pending_completion_intents(task_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cursor = await db.execute(
+            "DELETE FROM completion_notification_outbox "
+            "WHERE task_id=? AND ready=0",
+            (task_id,),
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def _stage_completion_notification(
+    *,
+    run_job_id: str,
+    task_id: int,
+    iteration: int,
+    channel: str,
+    text: str,
+) -> None:
+    """Persiste l'intention avant de terminer le travail d'agent."""
+    if not isinstance(run_job_id, str) or not run_job_id:
+        raise ValueError("run_job_id invalide.")
+    clean_text = (text or "").strip()
+    if not clean_text or len(clean_text) > MAX_MESSAGE_CHARACTERS:
+        raise ValueError("Texte de notification invalide.")
+    MessageRequest(channel=channel, text=clean_text)
+    current_text = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT * FROM completion_notification_outbox WHERE run_job_id=?",
+            (run_job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        normalized_iteration = max(0, int(iteration))
+        if row is None:
+            await db.execute(
+                """
+                INSERT INTO completion_notification_outbox (
+                    run_job_id,task_id,iteration,channel,text,ready,created_at,updated_at
+                ) VALUES (?,?,?,?,?,1,?,?)
+                """,
+                (
+                    run_job_id,
+                    task_id,
+                    normalized_iteration,
+                    channel,
+                    clean_text,
+                    current_text,
+                    current_text,
+                ),
+            )
+        elif (row["task_id"], row["channel"]) != (task_id, channel):
+            await db.rollback()
+            raise RuntimeError("Conflit dans l'outbox de notification.")
+        elif bool(row["ready"]):
+            if (row["iteration"], row["text"]) != (
+                normalized_iteration,
+                clean_text,
+            ):
+                await db.rollback()
+                raise RuntimeError("Conflit dans l'outbox de notification.")
+        else:
+            await db.execute(
+                "UPDATE completion_notification_outbox "
+                "SET iteration=?, text=?, ready=1, updated_at=? "
+                "WHERE run_job_id=? AND ready=0",
+                (normalized_iteration, clean_text, current_text, run_job_id),
+            )
+        await db.commit()
+
+
+async def _try_dispatch_completion_notification(run_job_id: str) -> str | None:
+    """Transforme une intention en job notify, sans perdre l'intention."""
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM completion_notification_outbox "
+            "WHERE run_job_id=? AND ready=1",
+            (run_job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+    if row is None:
+        return None
+    task_id = int(row["task_id"])
+    async with _task_lifecycle_lock(task_id):
+        async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM completion_notification_outbox "
+                "WHERE run_job_id=? AND ready=1",
+                (run_job_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+        if await db_get_task(task_id) is None:
+            async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+                await db.execute(
+                    "DELETE FROM completion_notification_outbox WHERE run_job_id=?",
+                    (run_job_id,),
+                )
+                await db.commit()
+            return None
+        try:
+            notification_job_id = await enqueue_notification(
+                task_id=task_id,
+                iteration=int(row["iteration"]),
+                agent="systeme",
+                channel=row["channel"],
+                text=row["text"],
+            )
+        except Exception as exc:
+            log.warning(
+                "Notification de fin en attente pour le travail %s (%s).",
+                run_job_id,
+                type(exc).__name__,
+            )
+            return None
+        async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+            await db.execute(
+                "DELETE FROM completion_notification_outbox WHERE run_job_id=?",
+                (run_job_id,),
+            )
+            await db.commit()
+        return notification_job_id
+
+
+async def _recover_completion_notification_intents(*, limit: int = 100) -> int:
+    """Finalise les intentions dont la tache a termine avant un crash."""
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT o.run_job_id,o.task_id,o.channel,j.state AS job_state "
+            "FROM completion_notification_outbox AS o "
+            "LEFT JOIN durable_jobs AS j ON j.id=o.run_job_id "
+            "WHERE o.ready=0 ORDER BY o.created_at ASC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    recovered = 0
+    for row in rows:
+        task_id = int(row["task_id"])
+        async with _task_lifecycle_lock(task_id):
+            task = await db_get_task(task_id)
+            if task is None:
+                async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+                    await db.execute(
+                        "DELETE FROM completion_notification_outbox "
+                        "WHERE run_job_id=? AND ready=0",
+                        (row["run_job_id"],),
+                    )
+                    await db.commit()
+                continue
+            status = task.get("status")
+            if status == "stopped":
+                await _discard_pending_completion_intents(task_id)
+                continue
+            if status not in {"done", "failed"}:
+                continue
+            # ``_run_task`` peut poser ``failed`` avant que le worker durable
+            # ne le remette en file. Ne notifier qu'apres la fin definitive du
+            # job (ou apres sa purge de retention) evite un faux echec pendant
+            # une reprise encore possible.
+            if row["job_state"] not in {
+                None,
+                JobState.SUCCEEDED.value,
+                JobState.FAILED.value,
+            }:
+                continue
+            text = await _task_completion_text(task_id, status)
+            await _stage_completion_notification(
+                run_job_id=row["run_job_id"],
+                task_id=task_id,
+                iteration=int(task.get("iteration") or 0),
+                channel=row["channel"],
+                text=text,
+            )
+            recovered += 1
+    return recovered
+
+
+async def _flush_completion_notification_outbox(*, limit: int = 100) -> int:
+    """Retente les notifications dont le job n'a pas encore pu etre cree."""
+    await _recover_completion_notification_intents(limit=limit)
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        async with db.execute(
+            "SELECT run_job_id FROM completion_notification_outbox "
+            "WHERE ready=1 ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    dispatched = 0
+    for row in rows:
+        if await _try_dispatch_completion_notification(row[0]):
+            dispatched += 1
+    return dispatched
+
+
 def _job_payload(job) -> dict:
     payload = job.payload if isinstance(job.payload, dict) else {}
     # Une occurrence planifiee enveloppe le payload de l'automatisation.
     nested = payload.get("payload")
     return nested if isinstance(nested, dict) else payload
+
+
+def _active_job_owns_task(task: dict, job) -> bool:
+    if job.kind != "run_task":
+        return False
+    if task.get("source_job_id") == job.id:
+        nested = job.payload.get("payload") if isinstance(job.payload, dict) else None
+        return (
+            isinstance(job.payload, dict)
+            and bool(job.payload.get("automation_id"))
+            and isinstance(nested, dict)
+            and isinstance(nested.get("task_id"), int)
+            and not isinstance(nested.get("task_id"), bool)
+        )
+    payload = _job_payload(job)
+    run_number = int(task.get("run_number") or 0)
+    payload_task_id = payload.get("task_id")
+    return (
+        task.get("queue_job_id") == job.id
+        and isinstance(payload_task_id, int)
+        and not isinstance(payload_task_id, bool)
+        and payload_task_id == task.get("id")
+        and job.idempotency_key == f"task:{task['id']}:run:{run_number}"
+    )
 
 
 async def _complete_automation_execution_clone(
@@ -734,38 +1130,84 @@ async def _execute_run_job(job) -> dict:
         task_id, created = await _automation_execution_task(job, template_id)
     else:
         task_id, created = template_id, False
-    task = await db_get_task(task_id)
-    if not task:
-        return {"status": "missing", "task_id": task_id}
-    if task_id in running_tasks:
-        await running_tasks[task_id]["task"]
-        finished = await db_get_task(task_id)
+    channel = payload.get("notification_channel")
+    async with _task_lifecycle_lock(task_id):
+        task = await db_get_task(task_id)
+        if not task:
+            return {"status": "missing", "task_id": task_id}
+        if (
+            not _active_job_owns_task(task, job)
+            or task.get("status")
+            not in {"idle", "queued", "running", "done", "failed"}
+        ):
+            return {"status": task.get("status"), "task_id": task_id}
+        if channel:
+            # Cette ligne existe avant la premiere action de l'agent. Meme si le
+            # dernier bail meurt juste apres le passage a ``done``, le
+            # planificateur pourra reconstruire le texte depuis la tache.
+            await _ensure_completion_notification_intent(
+                run_job_id=job.id,
+                task_id=task_id,
+                channel=channel,
+            )
+    existing_runner = (running_tasks.get(task_id) or {}).get("task")
+    if existing_runner is not None:
+        await existing_runner
     else:
         if task.get("execution_mode") == "docker":
             await get_sandbox_runtime().ensure_available()
 
-        await db_update_task(task_id, queue_job_id=job.id, status="queued")
         resume = (not created) and (
-            bool(payload.get("resume")) or task.get("status") not in {"idle", "queued"}
+            bool(payload.get("resume"))
+            or int(task.get("iteration") or 0) > 0
+            or float(task.get("total_cost_usd") or 0) > 0
         )
-        runner = _spawn_loop(task_id, resume=resume)
-        await runner
-        finished = await db_get_task(task_id)
-    status = finished.get("status") if finished else "missing"
+        runner = None
+        async with _task_lifecycle_lock(task_id):
+            claimable = await db_get_task(task_id)
+            if (
+                claimable
+                and _active_job_owns_task(claimable, job)
+                and claimable.get("status") in {"idle", "queued", "running"}
+            ):
+                # Le verrou couvre le commit du CAS et l'enregistrement du
+                # runner. Stop voit donc soit aucune reservation, soit un ctrl
+                # complet qu'il peut annuler.
+                claimed = await db_claim_task_for_job(task_id, job.id)
+                if claimed:
+                    runner = _spawn_loop(task_id, resume=resume)
+        if runner is not None:
+            await runner
 
-    channel = payload.get("notification_channel")
-    if channel and status in {"done", "failed"}:
-        await enqueue_notification(
-            task_id=task_id,
-            iteration=int((finished or {}).get("iteration") or 0),
-            agent="systeme",
-            channel=channel,
-            text=await _task_completion_text(task_id, status),
-        )
+    notification_job_id = None
+    notification_ready = False
+    async with _task_lifecycle_lock(task_id):
+        finished = await db_get_task(task_id)
+        status = finished.get("status") if finished else "missing"
+        if channel and status in {"done", "failed"}:
+            completion_text = await _task_completion_text(task_id, status)
+            try:
+                await _stage_completion_notification(
+                    run_job_id=job.id,
+                    task_id=task_id,
+                    iteration=int((finished or {}).get("iteration") or 0),
+                    channel=channel,
+                    text=completion_text,
+                )
+            except Exception as exc:
+                # Si meme l'intention ne peut pas etre finalisee, le lancement
+                # est retente. L'intention preliminaire reste recuperable.
+                raise CompletionNotificationError(
+                    f"Notification de fin non persistee pour la tache {task_id}."
+                ) from exc
+            notification_ready = True
+    if notification_ready:
+        notification_job_id = await _try_dispatch_completion_notification(job.id)
     return {
         "status": status,
         "task_id": task_id,
         "template_task_id": template_id if scheduled else None,
+        "notification_job_id": notification_job_id,
     }
 
 
@@ -776,10 +1218,16 @@ async def _execute_queue_job(job):
         if messaging_gateway is None:
             raise RuntimeError("messaging_unavailable")
         payload = job.payload if isinstance(job.payload, dict) else {}
-        receipt = await messaging_gateway.send(MessageRequest(
-            channel=payload.get("channel", ""), text=payload.get("text", "")
-        ))
-        return {"channel": receipt.channel, "status": receipt.status_code}
+        task_id = payload.get("task_id")
+        if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 1:
+            raise ValueError("Notification sans identifiant de tache valide.")
+        async with _task_lifecycle_lock(task_id):
+            if await db_get_task(task_id) is None:
+                return {"channel": payload.get("channel", ""), "status": "deleted"}
+            receipt = await messaging_gateway.send(MessageRequest(
+                channel=payload.get("channel", ""), text=payload.get("text", "")
+            ))
+            return {"channel": receipt.channel, "status": receipt.status_code}
     raise ValueError("Type de travail inconnu.")
 
 
@@ -848,6 +1296,9 @@ async def _queue_worker(worker_number: int) -> None:
             try:
                 updated = await task_queue.fail(lease, error_code="worker_error")
                 if lease.job.kind == "run_task":
+                    notification_retry = isinstance(
+                        exc, CompletionNotificationError
+                    )
                     payload = _job_payload(lease.job)
                     if isinstance(payload.get("task_id"), int):
                         failed_task_id = payload["task_id"]
@@ -865,28 +1316,78 @@ async def _queue_worker(worker_number: int) -> None:
                                     execution = await cursor.fetchone()
                             if execution:
                                 failed_task_id = int(execution["id"])
-                        next_status = (
-                            "queued" if updated.state is JobState.QUEUED else "failed"
-                        )
-                        await db_update_task(failed_task_id, status=next_status)
-                        if updated.state is JobState.FAILED:
-                            await emit(
-                                failed_task_id, 0, "systeme", "error",
-                                {"msg": "La tache a echoue apres plusieurs tentatives."},
-                            )
-                            channel = payload.get("notification_channel")
-                            if channel and execution:
-                                with suppress(Exception):
-                                    await enqueue_notification(
-                                        task_id=failed_task_id,
-                                        iteration=int(execution["iteration"] or 0),
-                                        agent="systeme",
-                                        channel=channel,
-                                        text=(
-                                            "Orchestrator : la tache planifiee "
-                                            f"#{failed_task_id} a echoue apres plusieurs tentatives."
-                                        ),
+                        # Une occurrence planifiee dont la copie a deja ete
+                        # supprimee ne doit jamais retomber sur la tache modele.
+                        if not (
+                            isinstance(lease.job.payload, dict)
+                            and lease.job.payload.get("automation_id")
+                            and execution is None
+                        ):
+                            dispatch_notification = False
+                            async with _task_lifecycle_lock(failed_task_id):
+                                current_task = await db_get_task(failed_task_id)
+                                if current_task and _active_job_owns_task(
+                                    current_task, lease.job
+                                ):
+                                    next_status = (
+                                        "queued"
+                                        if updated.state is JobState.QUEUED
+                                        else "failed"
                                     )
+                                    transitioned = False
+                                    if not notification_retry:
+                                        if execution:
+                                            transitioned = await db_transition_task_status_for_source_job(
+                                                failed_task_id,
+                                                lease.job.id,
+                                                next_status,
+                                                {"idle", "running", "queued", "failed"},
+                                            )
+                                        else:
+                                            transitioned = await db_transition_task_status_for_job(
+                                                failed_task_id,
+                                                lease.job.id,
+                                                next_status,
+                                                {"running", "queued", "failed"},
+                                            )
+                                    if updated.state is JobState.FAILED:
+                                        if (
+                                            notification_retry
+                                            and current_task.get("status")
+                                            in {"done", "failed"}
+                                        ):
+                                            await emit(
+                                                failed_task_id, 0, "systeme", "error",
+                                                {"msg": "La notification de fin n'a pas pu etre enfilee."},
+                                            )
+                                        elif transitioned:
+                                            await emit(
+                                                failed_task_id, 0, "systeme", "error",
+                                                {"msg": "La tache a echoue apres plusieurs tentatives."},
+                                            )
+                                            channel = payload.get("notification_channel")
+                                            if channel:
+                                                failed_task = await db_get_task(
+                                                    failed_task_id
+                                                )
+                                                text = await _task_completion_text(
+                                                    failed_task_id, "failed"
+                                                )
+                                                await _stage_completion_notification(
+                                                    run_job_id=lease.job.id,
+                                                    task_id=failed_task_id,
+                                                    iteration=int(
+                                                        (failed_task or {}).get("iteration")
+                                                        or 0
+                                                    ),
+                                                    channel=channel,
+                                                    text=text,
+                                                )
+                                                dispatch_notification = True
+                            if dispatch_notification:
+                                await _try_dispatch_completion_notification(
+                                    lease.job.id
+                                )
             except LeaseLost:
                 pass
             except Exception as queue_exc:
@@ -903,8 +1404,18 @@ async def _scheduler_loop() -> None:
     while not _runtime_shutdown.is_set():
         try:
             await automation_store.dispatch_due(task_queue, limit=100)
+            await task_queue.purge_terminal(
+                older_than=datetime.now(timezone.utc) - _DURABLE_JOB_RETENTION,
+                limit=1000,
+            )
         except Exception as exc:
             log.warning("Planificateur indisponible (%s).", type(exc).__name__)
+        try:
+            await _flush_completion_notification_outbox(limit=100)
+        except Exception as exc:
+            log.warning(
+                "Outbox de notifications indisponible (%s).", type(exc).__name__
+            )
         try:
             await asyncio.wait_for(_runtime_shutdown.wait(), timeout=5)
         except asyncio.TimeoutError:
@@ -915,16 +1426,27 @@ async def _reconcile_durable_tasks() -> None:
     if task_queue is None:
         return
     for task in await db_list_tasks():
-        if task.get("status") not in {"queued", "paused"}:
+        if task.get("status") not in {"queued", "paused", "running"}:
             continue
         job = await task_queue.get(task.get("queue_job_id")) if task.get("queue_job_id") else None
         if job and job.state in {JobState.QUEUED, JobState.RUNNING, JobState.PAUSED}:
-            if task.get("status") == "paused" and job.state is not JobState.PAUSED:
-                await task_queue.pause(job.id)
-            elif task.get("status") != "paused" and job.state is JobState.PAUSED:
-                await task_queue.resume(job.id)
-            continue
-        job = await enqueue_task_run(task["id"], resume=True, source="restart")
+            if _active_job_owns_task(task, job):
+                if task.get("status") == "paused" and job.state is not JobState.PAUSED:
+                    await task_queue.pause(job.id)
+                elif task.get("status") != "paused" and job.state is JobState.PAUSED:
+                    await task_queue.resume(job.id)
+                continue
+            # Ne jamais annuler ici un job qui peut appartenir a une autre
+            # tache. Seule la reference incoherente est detachee par CAS.
+            if not await db_detach_task_job(task["id"], job.id):
+                continue
+            task["queue_job_id"] = None
+        job = await enqueue_task_run(
+            task["id"],
+            resume=True,
+            source="restart",
+            expected_statuses={str(task.get("status"))},
+        )
         if task.get("status") == "paused":
             await task_queue.pause(job.id)
             await db_update_task(task["id"], status="paused")
@@ -932,7 +1454,7 @@ async def _reconcile_durable_tasks() -> None:
 
 async def start_runtime_services() -> None:
     global task_queue, automation_store, messaging_gateway
-    global _runtime_shutdown, _runtime_background_tasks
+    global _runtime_shutdown, _runtime_background_tasks, _runtime_service_error
     task_queue = DurableQueue(DB_PATH)
     automation_store = AutomationStore(DB_PATH)
     await task_queue.init()
@@ -984,10 +1506,51 @@ async def start_runtime_services() -> None:
     _runtime_background_tasks.append(
         asyncio.create_task(_scheduler_loop(), name="automation-scheduler")
     )
+    _runtime_service_error = None
+
+
+async def _restore_runtime_services_after_refused_shutdown() -> None:
+    global _runtime_shutdown, _runtime_service_error
+    _runtime_shutdown = None
+    try:
+        await start_runtime_services()
+    except Exception as restart_exc:
+        _runtime_service_error = (
+            "Les services d'execution n'ont pas pu redemarrer apres un "
+            "arret refuse. Redemarrez l'Orchestrateur."
+        )
+        try:
+            import automation_api
+            automation_api.disable(_runtime_service_error)
+        except (ImportError, AttributeError):
+            pass
+        log.error(
+            "Redemarrage des services apres echec de nettoyage impossible (%s).",
+            type(restart_exc).__name__,
+        )
+    else:
+        _runtime_service_error = None
 
 
 async def stop_runtime_services() -> None:
-    global _runtime_background_tasks, _runtime_shutdown
+    global _runtime_background_tasks, _runtime_shutdown, _runtime_service_error
+    _runtime_service_error = (
+        "Les services d'execution sont en cours d'arret. Reessayez apres le redemarrage."
+    )
+    try:
+        import automation_api
+        automation_api.disable(_runtime_service_error)
+    except (ImportError, AttributeError):
+        pass
+    runtime = sandbox_runtime
+    if runtime is not None:
+        # Fermer la frontiere avant le premier ``await``. Ainsi, aucun appel
+        # HTTP concurrent ne peut franchir _require_execution_allowed entre le
+        # dernier balayage global et la fin effective du processus.
+        runtime.block_execution(
+            "L'Orchestrateur termine son arret ; les nouveaux lancements Docker "
+            "sont temporairement refuses."
+        )
     if _runtime_shutdown is not None:
         _runtime_shutdown.set()
     for background in _runtime_background_tasks:
@@ -996,7 +1559,20 @@ async def stop_runtime_services() -> None:
         await asyncio.gather(*_runtime_background_tasks, return_exceptions=True)
     _runtime_background_tasks = []
     # Les baux restent en base et expireront ; les taches ne sont pas perdues.
-    runtime = sandbox_runtime
+    preview_failures: list[tuple[int, Exception]] = []
+    async with _preview_shutdown_lock():
+        for task_id in list(launched_apps):
+            try:
+                await _stop_launched(task_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                preview_failures.append((task_id, exc))
+                log.error(
+                    "Arret de l'apercu %s non confirme (%s).",
+                    task_id,
+                    type(exc).__name__,
+                )
     if runtime is not None:
         cleanup = await runtime.stop_all_managed(strict=False)
         if cleanup.failed:
@@ -1006,6 +1582,21 @@ async def stop_runtime_services() -> None:
                 "Le nettoyage Docker est incomplet ; aucune nouvelle execution "
                 "Docker n'est autorisee avant un redemarrage propre."
             )
+            # L'arrêt n'est pas confirmé : conserver les handles pour une
+            # nouvelle tentative et remettre les workers en service afin qu'un
+            # refus de fermeture ne laisse pas l'application à moitié arrêtée.
+            await _restore_runtime_services_after_refused_shutdown()
+            raise SandboxStopError(cleanup)
+    if preview_failures:
+        if runtime is not None:
+            runtime.block_execution(
+                "Un apercu local ou Docker reste actif ; l'arret est refuse."
+            )
+        await _restore_runtime_services_after_refused_shutdown()
+        ids = ", ".join(str(task_id) for task_id, _ in preview_failures)
+        raise PreviewStopError(
+            "Arret refuse : apercu non termine pour la tache " + ids + "."
+        )
     launched_apps.clear()
     _runtime_shutdown = None
 
@@ -3566,11 +4157,19 @@ def _spawn_loop(task_id, resume=False):
 
 @router.post("/api/tasks/{task_id}/start")
 async def start_task(task_id: int):
+    async with _task_lifecycle_lock(task_id):
+        _require_runtime_services()
+        return await _start_task_locked(task_id)
+
+
+async def _start_task_locked(task_id: int):
     t = await db_get_task(task_id)
     if not t:
         raise HTTPException(404, "Tache introuvable")
     if task_id in running_tasks:
         return {"status": "already_running"}
+    if t.get("status") not in {"idle", "queued"}:
+        raise HTTPException(409, "Cette tache doit etre reprise, pas redemarree.")
     if task_queue is None:
         raise HTTPException(503, "La file durable n'est pas encore prete.")
     if t.get("execution_mode") == "docker":
@@ -3578,7 +4177,14 @@ async def start_task(task_id: int):
             await get_sandbox_runtime().ensure_available()
         except SandboxUnavailableError as exc:
             raise HTTPException(409, str(exc))
-    job = await enqueue_task_run(task_id, resume=False)
+    try:
+        job = await enqueue_task_run(
+            task_id,
+            resume=False,
+            expected_statuses={str(t.get("status"))},
+        )
+    except TaskReservationConflict as exc:
+        raise HTTPException(409, str(exc)) from None
     return {"status": "queued", "job_id": job.id}
 
 
@@ -3588,6 +4194,12 @@ class RestartBody(BaseModel):
 
 @router.post("/api/tasks/{task_id}/restart")
 async def restart_task(task_id: int, body: Optional[RestartBody] = None):
+    async with _task_lifecycle_lock(task_id):
+        _require_runtime_services()
+        return await _restart_task_locked(task_id, body)
+
+
+async def _restart_task_locked(task_id: int, body: Optional[RestartBody] = None):
     """Reprend une tache terminee/arretee/echouee la ou elle s'etait arretee (contexte reconstruit)."""
     t = await db_get_task(task_id)
     if not t:
@@ -3605,12 +4217,25 @@ async def restart_task(task_id: int, body: Optional[RestartBody] = None):
             await get_sandbox_runtime().ensure_available()
         except SandboxUnavailableError as exc:
             raise HTTPException(409, str(exc))
-    job = await enqueue_task_run(task_id, resume=True)
+    try:
+        job = await enqueue_task_run(
+            task_id,
+            resume=True,
+            source="restart",
+            expected_statuses={str(t.get("status"))},
+        )
+    except TaskReservationConflict as exc:
+        raise HTTPException(409, str(exc)) from None
     return {"status": "queued", "resumed": True, "job_id": job.id}
 
 
 @router.post("/api/tasks/{task_id}/pause")
 async def pause_task(task_id: int):
+    async with _task_lifecycle_lock(task_id):
+        return await _pause_task_locked(task_id)
+
+
+async def _pause_task_locked(task_id: int):
     task = await db_get_task(task_id)
     if not task:
         raise HTTPException(404, "Tache introuvable")
@@ -3622,14 +4247,30 @@ async def pause_task(task_id: int):
     worker_task = ctrl.get("task") if ctrl else None
     if ctrl:
         async with ctrl["permission_lock"]:
+            transitioned = await db_transition_task_status(
+                task_id, "paused", {"running", "queued"}
+            )
+            if not transitioned:
+                raise HTTPException(409, "La tache vient deja de se terminer.")
             ctrl["pause"].clear()
-            await db_update_task(task_id, status="paused")
     else:
-        await db_update_task(task_id, status="paused")
+        transitioned = await db_transition_task_status(
+            task_id, "paused", {"running", "queued"}
+        )
+        if not transitioned:
+            raise HTTPException(409, "La tache vient deja de se terminer.")
     if task_queue is not None and task.get("queue_job_id"):
         paused = await task_queue.pause(task["queue_job_id"])
-        if paused is None or paused.state is not JobState.PAUSED:
-            await db_update_task(task_id, status=task.get("status"))
+        # Si le travail durable s'est termine exactement pendant la pause, on
+        # conserve l'etat frais ``paused``. Reprendre creera une nouvelle
+        # occurrence au lieu de restaurer l'ancien snapshot (souvent running)
+        # par-dessus un etat terminal plus recent.
+        if paused is not None and paused.state not in {
+            JobState.PAUSED,
+            JobState.SUCCEEDED,
+            JobState.FAILED,
+            JobState.CANCELLED,
+        }:
             raise HTTPException(409, "Ce lancement ne peut plus etre mis en pause.")
     if worker_task and not worker_task.done():
         worker_task.cancel()
@@ -3641,28 +4282,67 @@ async def pause_task(task_id: int):
 
 @router.post("/api/tasks/{task_id}/resume")
 async def resume_task(task_id: int):
+    async with _task_lifecycle_lock(task_id):
+        _require_runtime_services()
+        return await _resume_task_locked(task_id)
+
+
+async def _resume_task_locked(task_id: int):
     task = await db_get_task(task_id)
     if not task:
         raise HTTPException(404, "Tache introuvable")
     if task.get("status") != "paused":
         raise HTTPException(409, "Seule une tache en pause peut etre reprise.")
     ctrl = running_tasks.get(task_id)
-    if ctrl:
+    if ctrl and (task_queue is None or not task.get("queue_job_id")):
         async with ctrl["permission_lock"]:
+            if not await db_transition_task_status(task_id, "running", {"paused"}):
+                raise HTTPException(409, "La tache a change d'etat.")
             ctrl["pause"].set()
-        if task_queue is None or not task.get("queue_job_id"):
-            await db_update_task(task_id, status="running")
             await emit(task_id, 0, "systeme", "resumed", {})
             return {"status": "running"}
     if task_queue is not None and task.get("queue_job_id"):
-        resumed = await task_queue.resume(task["queue_job_id"])
-        if resumed is None or resumed.state is not JobState.QUEUED:
-            raise HTTPException(409, "Le lancement durable est introuvable.")
-        await db_update_task(task_id, status="queued")
+        current_job = await task_queue.get(task["queue_job_id"])
+        if current_job is not None and current_job.state is JobState.PAUSED:
+            # La tache est le verrou logique. Un second appel perd ici et ne
+            # touche jamais au travail que le premier est en train de reprendre.
+            if not await db_transition_task_status(task_id, "queued", {"paused"}):
+                raise HTTPException(409, "La tache a change d'etat.")
+            try:
+                resumed = await task_queue.resume(current_job.id)
+            except BaseException:
+                await db_transition_task_status(task_id, "paused", {"queued"})
+                raise
+            if resumed is None or resumed.state is not JobState.QUEUED:
+                await db_transition_task_status(task_id, "paused", {"queued"})
+                raise HTTPException(409, "Le lancement durable est introuvable.")
+            if ctrl:
+                async with ctrl["permission_lock"]:
+                    ctrl["pause"].set()
+            job_id = resumed.id
+        elif current_job is None or current_job.state in {
+            JobState.SUCCEEDED,
+            JobState.FAILED,
+            JobState.CANCELLED,
+        }:
+            # La pause a pu gagner la course avec la toute fin du worker. Le
+            # contexte persiste en DB ; une nouvelle occurrence le reprend.
+            try:
+                resumed = await enqueue_task_run(
+                    task_id,
+                    resume=True,
+                    source="resume",
+                    expected_statuses={"paused"},
+                )
+            except TaskReservationConflict as exc:
+                raise HTTPException(409, str(exc)) from None
+            job_id = resumed.id
+        else:
+            raise HTTPException(409, "Le lancement durable ne peut pas etre repris.")
     else:
         raise HTTPException(409, "Cette tache n'a pas de lancement a reprendre.")
     await emit(task_id, 0, "systeme", "resumed", {})
-    return {"status": "queued"}
+    return {"status": "queued", "job_id": job_id}
 
 
 @router.post("/api/tasks/{task_id}/step")
@@ -3680,28 +4360,8 @@ async def step_task(task_id: int):
     )
 
 
-@router.post("/api/tasks/{task_id}/stop")
-async def stop_task(task_id: int):
-    task = await db_get_task(task_id)
-    if not task:
-        raise HTTPException(404, "Tache introuvable")
-    ctrl = running_tasks.get(task_id)
-    worker_task = ctrl.get("task") if ctrl else None
-    if ctrl:
-        async with ctrl["permission_lock"]:
-            await db_update_task(task_id, status="stopped")
-            ctrl["pause"].set()  # debloque la boucle pour qu'elle constate l'arret
-            await _terminate_install_process(ctrl.get("install_proc"))
-            await _cancel_install_waiters_locked(task_id, "task_stopped")
-    else:
-        await db_update_task(task_id, status="stopped")
-        await _cancel_install_waiters(task_id)
-    if task_queue is not None and task.get("queue_job_id"):
-        await task_queue.cancel(task["queue_job_id"])
-    if worker_task and not worker_task.done():
-        worker_task.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await worker_task
+async def _cleanup_task_runtime(task_id: int, task: dict) -> None:
+    """Nettoie les ressources sans modifier le resultat persiste de la tache."""
     await _stop_launched(task_id)
     if task.get("execution_mode") == "docker":
         runtime = get_sandbox_runtime()
@@ -3722,6 +4382,48 @@ async def stop_task(task_id: int):
                 500, "La tache est arretee, mais son conteneur n'a pas pu etre nettoye."
             )
     await _stop_mcp(task_id)
+
+
+@router.post("/api/tasks/{task_id}/stop")
+async def stop_task(task_id: int):
+    async with _task_lifecycle_lock(task_id):
+        return await _stop_task_locked(task_id)
+
+
+async def _stop_task_locked(task_id: int):
+    task = await db_get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Tache introuvable")
+    ctrl = running_tasks.get(task_id)
+    worker_task = ctrl.get("task") if ctrl else None
+    if ctrl:
+        async with ctrl["permission_lock"]:
+            transitioned = await db_transition_task_status(
+                task_id, "stopped", {"idle", "running", "queued", "paused"}
+            )
+            current = await db_get_task(task_id)
+            if not transitioned and (current or {}).get("status") != "stopped":
+                raise HTTPException(409, "La tache vient deja de se terminer.")
+            ctrl["pause"].set()  # debloque la boucle pour qu'elle constate l'arret
+            await _terminate_install_process(ctrl.get("install_proc"))
+            await _cancel_install_waiters_locked(task_id, "task_stopped")
+    else:
+        transitioned = await db_transition_task_status(
+            task_id, "stopped", {"idle", "running", "queued", "paused"}
+        )
+        current = await db_get_task(task_id)
+        if not transitioned and (current or {}).get("status") != "stopped":
+            raise HTTPException(409, "La tache vient deja de se terminer.")
+        await _cancel_install_waiters(task_id)
+    task = await db_get_task(task_id) or task
+    if task_queue is not None and task.get("queue_job_id"):
+        await task_queue.cancel(task["queue_job_id"])
+    await _discard_pending_completion_intents(task_id)
+    if worker_task and not worker_task.done():
+        worker_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await worker_task
+    await _cleanup_task_runtime(task_id, task)
     await emit(task_id, 0, "systeme", "stopped", {})
     return {"status": "stopped"}
 
@@ -3824,17 +4526,64 @@ async def task_message(task_id: int, body: TaskMessage):
 WEB_ENTRYPOINTS = ["app.py", "main.py", "server.py", "run.py"]
 
 
+def _launched_app_lock(task_id: int) -> asyncio.Lock:
+    return _launched_app_locks.setdefault(task_id, asyncio.Lock())
+
+
 async def _stop_launched(task_id):
-    info = launched_apps.pop(task_id, None)
+    async with _launched_app_lock(task_id):
+        await _stop_launched_unlocked(task_id)
+
+
+async def _stop_launched_unlocked(task_id):
+    info = launched_apps.get(task_id)
     if info and info.get("sandbox"):
-        with suppress(Exception):
-            await get_sandbox_runtime().stop(task_id, strict=False)
+        runtime = get_sandbox_runtime()
+        try:
+            await runtime.stop_handle(info["sandbox"], strict=True)
+        except SandboxStopError:
+            # Le runtime conserve le suivi et bloque déjà les nouvelles
+            # exécutions. Ne pas oublier le handle tant que Docker n'a pas
+            # confirmé sa suppression.
+            raise
+        if launched_apps.get(task_id) is info:
+            launched_apps.pop(task_id, None)
         return
     if info and info.get("proc") and info["proc"].returncode is None:
+        proc = info["proc"]
         try:
-            info["proc"].terminate()
-        except Exception:
+            proc.terminate()
+        except ProcessLookupError:
             pass
+        except Exception as exc:
+            raise PreviewStopError(
+                "Impossible de demander l'arret de l'apercu local."
+            ) from exc
+        try:
+            await asyncio.wait_for(
+                proc.wait(), timeout=_PREVIEW_STOP_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                raise PreviewStopError(
+                    "Impossible de forcer l'arret de l'apercu local."
+                ) from exc
+            try:
+                await asyncio.wait_for(
+                    proc.wait(), timeout=_PREVIEW_STOP_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError as exc:
+                raise PreviewStopError(
+                    "L'apercu local ne confirme pas son arret."
+                ) from exc
+        if proc.returncode is None:
+            raise PreviewStopError("L'apercu local reste actif apres son arret.")
+    if launched_apps.get(task_id) is info:
+        launched_apps.pop(task_id, None)
 
 
 async def _drain_proc(task_id, proc):
@@ -3853,7 +4602,7 @@ async def _drain_proc(task_id, proc):
 
 
 async def _launch_python_app(task_id, base, name):
-    await _stop_launched(task_id)
+    await _stop_launched_unlocked(task_id)
     task = await db_get_task(task_id)
     if task and task.get("execution_mode") == "docker":
         if not sandbox_app_network_allowed():
@@ -3939,6 +4688,14 @@ async def _launch_python_app(task_id, base, name):
 
 @router.post("/api/tasks/{task_id}/launch")
 async def launch_app(task_id: int):
+    async with _preview_shutdown_lock():
+        async with _task_lifecycle_lock(task_id):
+            _require_runtime_services()
+            async with _launched_app_lock(task_id):
+                return await _launch_app_locked(task_id)
+
+
+async def _launch_app_locked(task_id: int):
     t = await db_get_task(task_id)
     if not t:
         raise HTTPException(404, "Tache introuvable")
@@ -3955,8 +4712,9 @@ async def launch_app(task_id: int):
 
 @router.post("/api/tasks/{task_id}/launch/stop")
 async def launch_stop(task_id: int):
-    await _stop_launched(task_id)
-    return {"stopped": True}
+    async with _task_lifecycle_lock(task_id):
+        await _stop_launched(task_id)
+        return {"stopped": True}
 
 
 @router.get("/api/tasks/{task_id}/app/{path:path}")
@@ -4273,11 +5031,31 @@ async def get_task(task_id: int):
 
 @router.delete("/api/tasks/{task_id}")
 async def delete_task(task_id: int):
+    async with _task_lifecycle_lock(task_id):
+        return await _delete_task_locked(task_id)
+
+
+async def _delete_task_locked(task_id: int):
     if automation_store is not None:
         await automation_store.cancel_for_task(task_id)
     if task_queue is not None:
         await task_queue.cancel_scheduled_for_task(task_id)
-    await stop_task(task_id)
+        await task_queue.cancel_notifications_for_task(task_id)
+    before_delete = await db_get_task(task_id)
+    if not before_delete:
+        raise HTTPException(404, "Tache introuvable")
+    if task_queue is not None and before_delete.get("queue_job_id"):
+        await task_queue.cancel(before_delete["queue_job_id"])
+    if before_delete.get("status") in {"done", "failed"}:
+        # Supprimer une tache terminee reste permis, sans reecrire son resultat
+        # en ``stopped`` pendant la fenetre de nettoyage.
+        finishing = (running_tasks.get(task_id) or {}).get("task")
+        if finishing and not finishing.done():
+            with suppress(asyncio.CancelledError, Exception):
+                await finishing
+        await _cleanup_task_runtime(task_id, before_delete)
+    else:
+        await _stop_task_locked(task_id)
     t = await db_get_task(task_id)
     if t:
         folder = Path(t["folder"]).resolve(strict=False)
@@ -4296,6 +5074,10 @@ async def delete_task(task_id: int):
         if not await asyncio.to_thread(_rmtree_force, auxiliary):
             raise HTTPException(500, "Des fichiers annexes n'ont pas pu etre supprimes.")
     await db_delete_task(task_id)
+    if task_queue is not None:
+        # Second balayage sous le verrou lifecycle : couvre un enfilage qui
+        # aurait commence juste avant l'annulation du runner.
+        await task_queue.cancel_notifications_for_task(task_id)
     return {"deleted": True}
 
 

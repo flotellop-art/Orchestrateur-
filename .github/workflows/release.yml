@@ -12,12 +12,15 @@ jobs:
     name: Installateur Windows publie sur GitHub
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
           cache: pip
-      - uses: actions/setup-node@v6
+          cache-dependency-path: requirements-lock.txt
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "24"
           cache: npm
@@ -38,8 +41,15 @@ jobs:
 
       - name: Installer et tester
         run: |
-          python -m pip install -r requirements-dev.txt
+          python -m pip install --require-hashes -r requirements-lock.txt
           python -m pytest -q
+          node --check static/secure-sse.js
+          node --check static/session-auth.js
+          node --check static/chat-stream-utils.js
+          node --check electron-app/main.js
+          node --check electron-app/preload.js
+          node --check electron-app/electron_hardening.js
+          node tests/test_secure_sse.js
 
       - name: Construire le serveur autonome
         shell: pwsh
@@ -73,6 +83,9 @@ jobs:
           }
           foreach ($resource in @(
             "electron-app/dist/win-unpacked/resources/backend/orchestrator-backend/orchestrator-backend.exe",
+            "electron-app/dist/win-unpacked/resources/backend/orchestrator-backend/_internal/static/secure-sse.js",
+            "electron-app/dist/win-unpacked/resources/backend/orchestrator-backend/_internal/static/session-auth.js",
+            "electron-app/dist/win-unpacked/resources/backend/orchestrator-backend/_internal/static/chat-stream-utils.js",
             "electron-app/dist/win-unpacked/resources/sandbox/Dockerfile",
             "electron-app/dist/win-unpacked/resources/tools/build_sandbox.ps1",
             "electron-app/dist/win-unpacked/resources/VERSION",

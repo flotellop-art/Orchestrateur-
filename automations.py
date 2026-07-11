@@ -22,7 +22,9 @@ import aiosqlite
 
 from durable_queue import (
     DurableQueue,
+    IdempotencyConflict as QueueIdempotencyConflict,
     Job,
+    MAX_PAYLOAD_BYTES as MAX_QUEUE_PAYLOAD_BYTES,
     ValidationError as QueueValidationError,
     datetime_from_text,
     datetime_to_text,
@@ -67,7 +69,12 @@ def _identifier(value: object, label: str) -> str:
     return value
 
 
-def _json_text(value: Any, label: str) -> str:
+def _json_text(
+    value: Any,
+    label: str,
+    *,
+    limit: int = MAX_AUTOMATION_PAYLOAD_BYTES,
+) -> str:
     try:
         encoded = json.dumps(
             value,
@@ -78,9 +85,32 @@ def _json_text(value: Any, label: str) -> str:
         )
     except (TypeError, ValueError) as exc:
         raise AutomationValidationError(f"{label} doit etre du JSON valide.") from exc
-    if len(encoded.encode("utf-8")) > MAX_AUTOMATION_PAYLOAD_BYTES:
+    if len(encoded.encode("utf-8")) > limit:
         raise AutomationValidationError(f"{label} est trop volumineux.")
     return encoded
+
+
+def _occurrence_payload(
+    automation_id: str, occurrence_text: str, payload: Any
+) -> dict[str, Any]:
+    return {
+        "automation_id": automation_id,
+        "scheduled_for": occurrence_text,
+        "payload": payload,
+    }
+
+
+def _validate_occurrence_payload(
+    automation_id: str, occurrence_text: str, payload: Any
+) -> None:
+    # La file borne le JSON apres ajout de cette enveloppe. Valider seulement
+    # le payload utilisateur laisserait passer une valeur qui echoue ensuite
+    # a chaque tour du planificateur.
+    _json_text(
+        _occurrence_payload(automation_id, occurrence_text, payload),
+        "payload final de l'automatisation",
+        limit=MAX_QUEUE_PAYLOAD_BYTES,
+    )
 
 
 def _utc(value: datetime, label: str) -> datetime:
@@ -291,12 +321,20 @@ class Automation:
 
 
 def _row_to_automation(row: aiosqlite.Row) -> Automation:
+    automation_id = _identifier(row["id"], "automation.id")
+    idempotency_key = _identifier(
+        row["idempotency_key"], "automation.idempotency_key"
+    )
+    job_kind = _identifier(row["job_kind"], "automation.job_kind")
+    name = row["name"]
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 120:
+        raise AutomationValidationError("automation.name est invalide.")
     return Automation(
-        id=row["id"],
-        idempotency_key=row["idempotency_key"],
-        name=row["name"],
+        id=automation_id,
+        idempotency_key=idempotency_key,
+        name=name.strip(),
         schedule=Schedule.from_payload(json.loads(row["schedule_json"])),
-        job_kind=row["job_kind"],
+        job_kind=job_kind,
         payload=json.loads(row["payload_json"]),
         state=AutomationState(row["state"]),
         next_run_at=datetime_from_text(row["next_run_at"]),  # type: ignore[arg-type]
@@ -363,11 +401,14 @@ class AutomationStore:
         job_kind = _identifier(job_kind, "job_kind")
         idempotency_key = _identifier(idempotency_key, "idempotency_key")
         schedule_json = _json_text(schedule.to_payload(), "schedule")
-        payload_json = _json_text(payload, "payload")
         current = _utc(now or utc_now(), "now")
         next_run = schedule.next_after(current)
         current_text = datetime_to_text(current)
         automation_id = uuid.uuid4().hex
+        payload_json = _json_text(payload, "payload")
+        _validate_occurrence_payload(
+            automation_id, datetime_to_text(next_run), payload
+        )
         async with self._db() as db:
             try:
                 await db.execute("BEGIN IMMEDIATE")
@@ -442,28 +483,45 @@ class AutomationStore:
         if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 1:
             raise AutomationValidationError("task_id doit etre un entier positif.")
         current_text = datetime_to_text(_utc(now or utc_now(), "now"))
-        matched: list[str] = []
+        matched: list[int] = []
         async with self._db() as db:
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
-                "SELECT id,payload_json FROM automations WHERE state!='cancelled'"
+                "SELECT rowid AS _storage_rowid,payload_json FROM automations "
+                "WHERE state!='cancelled'"
             ) as cursor:
                 rows = await cursor.fetchall()
             for row in rows:
                 try:
                     payload = json.loads(row["payload_json"])
-                except (TypeError, json.JSONDecodeError) as exc:
-                    await db.rollback()
-                    raise AutomationError(
-                        "Une planification contient un payload invalide."
-                    ) from exc
-                if isinstance(payload, dict) and payload.get("task_id") == task_id:
-                    matched.append(row["id"])
-            for automation_id in matched:
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    # Une ancienne ligne corrompue ne doit pas empêcher la
+                    # suppression d'une tâche sans rapport. La mettre en
+                    # quarantaine dans la même transaction évite aussi de
+                    # reproduire l'échec au prochain appel.
+                    await db.execute(
+                        "UPDATE automations SET state='cancelled', updated_at=? "
+                        "WHERE rowid=? AND state!='cancelled'",
+                        (current_text, int(row["_storage_rowid"])),
+                    )
+                    continue
+                if not isinstance(payload, dict):
+                    # AutomationStore reste générique : un payload JSON
+                    # scalaire ou tableau peut être valide pour un autre type
+                    # de travail et n'est simplement pas lié à une tâche.
+                    continue
+                payload_task_id = payload.get("task_id")
+                if (
+                    isinstance(payload_task_id, int)
+                    and not isinstance(payload_task_id, bool)
+                    and payload_task_id == task_id
+                ):
+                    matched.append(int(row["_storage_rowid"]))
+            for row_id in matched:
                 await db.execute(
                     "UPDATE automations SET state='cancelled', updated_at=? "
-                    "WHERE id=? AND state!='cancelled'",
-                    (current_text, automation_id),
+                    "WHERE rowid=? AND state!='cancelled'",
+                    (current_text, row_id),
                 )
             await db.commit()
         return len(matched)
@@ -537,6 +595,19 @@ class AutomationStore:
             await db.commit()
         return _row_to_automation(updated)
 
+    async def _quarantine_invalid(
+        self, row_id: int, *, now_text: str
+    ) -> None:
+        """Ecarte une ligne invalide afin que les suivantes restent executables."""
+        async with self._db() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                "UPDATE automations SET state='cancelled', updated_at=? "
+                "WHERE rowid=? AND state='enabled'",
+                (now_text, row_id),
+            )
+            await db.commit()
+
     async def dispatch_due(
         self,
         queue: DurableQueue,
@@ -562,7 +633,7 @@ class AutomationStore:
             async with self._db() as db:
                 async with db.execute(
                     """
-                    SELECT * FROM automations
+                    SELECT rowid AS _storage_rowid, * FROM automations
                     WHERE state='enabled' AND next_run_at<=?
                     ORDER BY next_run_at ASC, created_at ASC
                     LIMIT 1
@@ -573,22 +644,45 @@ class AutomationStore:
             if row is None:
                 break
 
-            automation = _row_to_automation(row)
+            try:
+                automation = _row_to_automation(row)
+            except (
+                AutomationValidationError,
+                QueueValidationError,
+                TypeError,
+                ValueError,
+                KeyError,
+            ):
+                await self._quarantine_invalid(
+                    int(row["_storage_rowid"]), now_text=current_text
+                )
+                continue
             occurrence = automation.next_run_at
             occurrence_text = datetime_to_text(occurrence)
             occurrence_key = f"automation:{automation.id}:{occurrence_text}"
-            job_payload = {
-                "automation_id": automation.id,
-                "scheduled_for": occurrence_text,
-                "payload": automation.payload,
-            }
-            job = await queue.enqueue(
-                kind=automation.job_kind,
-                payload=job_payload,
-                idempotency_key=occurrence_key,
-                available_at=occurrence,
-                now=current,
+            job_payload = _occurrence_payload(
+                automation.id, occurrence_text, automation.payload
             )
+            try:
+                _validate_occurrence_payload(
+                    automation.id, occurrence_text, automation.payload
+                )
+                job = await queue.enqueue(
+                    kind=automation.job_kind,
+                    payload=job_payload,
+                    idempotency_key=occurrence_key,
+                    available_at=occurrence,
+                    now=current,
+                )
+            except (
+                AutomationValidationError,
+                QueueValidationError,
+                QueueIdempotencyConflict,
+            ):
+                await self._quarantine_invalid(
+                    int(row["_storage_rowid"]), now_text=current_text
+                )
+                continue
             # Une remise en route apres une longue absence declenche au plus
             # une execution de rattrapage par planification. Les occurrences
             # intermediaires sont regroupees pour eviter une tempete de couts.
@@ -624,6 +718,7 @@ __all__ = [
     "AutomationState",
     "AutomationStore",
     "AutomationValidationError",
+    "MAX_AUTOMATION_PAYLOAD_BYTES",
     "Schedule",
     "ScheduleKind",
 ]

@@ -20,7 +20,7 @@ Docker n'est pas embarquée dans l'installateur.
 - Windows 10 ou 11 ;
 - Python 3.12 ;
 - Node.js 24 et npm ;
-- les dépendances verrouillées de `requirements-dev.txt` ;
+- les dépendances et empreintes verrouillées de `requirements-lock.txt` ;
 - Docker uniquement si vous voulez aussi construire ou essayer le bac à sable.
 
 ## Construction locale
@@ -28,11 +28,20 @@ Docker n'est pas embarquée dans l'installateur.
 Depuis la racine du dépôt :
 
 ```powershell
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements-lock.txt
 cd electron-app
 npm ci
 cd ..
 .\build_desktop.bat
+```
+
+`requirements_orchestrator.txt` et `requirements-dev.txt` restent les fichiers
+source lisibles. Après une modification volontaire, le verrou universel se
+régénère avec :
+
+```powershell
+uv pip compile requirements-dev.txt --universal --generate-hashes `
+  --python-version 3.12 --output-file requirements-lock.txt
 ```
 
 Le script construit d'abord `orchestrator-backend.exe`, puis demande à

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from sandbox_runtime import (
     SandboxConfig,
     SandboxExecutionError,
     SandboxStopError,
+    SandboxStoppedError,
     SandboxUnavailableError,
     SandboxValidationError,
 )
@@ -30,14 +32,34 @@ class FakeDockerRunner:
         self.os_type = "linux"
         self.version = "26.1.4"
         self.containers = set()
+        self.container_names = {}
         self.command_exit_code = 0
         self.command_output = "commande ok"
+        self.command_started = True
+        self.command_state_error = ""
         self.timeout_on_attach = False
         self.launch_running = True
         self.stop_fails = False
         self.remove_fails = False
+        self.pause_stop = False
+        self.stop_started = asyncio.Event()
+        self.release_stop = asyncio.Event()
+        self.pause_create = False
+        self.create_returncode = 0
+        self.create_stdout = self.CONTAINER_ID + "\n"
+        self.create_started = asyncio.Event()
+        self.release_create = asyncio.Event()
+        self.pause_remove = False
+        self.remove_started = asyncio.Event()
+        self.release_remove = asyncio.Event()
         self.extra_ps_ids = set()
+        self.ps_fails = False
+        self.pause_ps = False
+        self.ps_started = asyncio.Event()
+        self.release_ps = asyncio.Event()
+        self.remove_missing_fails = False
         self.last_create = None
+        self.unsafe_policy = False
 
     async def run(self, argv, *, timeout=None):
         argv = tuple(argv)
@@ -59,10 +81,21 @@ class FakeDockerRunner:
         if args[:1] == ("create",):
             self.last_create = args
             self.containers.add(self.CONTAINER_ID)
-            return CliResult(0, self.CONTAINER_ID + "\n", "")
+            name = args[args.index("--name") + 1]
+            self.container_names[name] = self.CONTAINER_ID
+            if self.pause_create:
+                self.create_started.set()
+                await self.release_create.wait()
+            return CliResult(
+                self.create_returncode,
+                self.create_stdout,
+                "create refused" if self.create_returncode else "",
+            )
         if args[:2] == ("start", "--attach"):
             if self.timeout_on_attach:
                 raise CliTimeoutError("sortie avant délai", "")
+            if not self.command_started:
+                return CliResult(0, "", "")
             return CliResult(self.command_exit_code, self.command_output, "")
         if args[:1] == ("start",):
             return CliResult(0, args[-1] + "\n", "")
@@ -70,28 +103,82 @@ class FakeDockerRunner:
             format_value = args[args.index("--format") + 1]
             if format_value == "{{json .}}":
                 return CliResult(0, json.dumps(self._policy_payload()), "")
-            if "ExitCode}}" in format_value and "Running" not in format_value:
-                return CliResult(0, str(self.command_exit_code) + "\n", "")
+            if format_value == "{{json .State}}":
+                state = {
+                    "Status": "exited" if self.command_started else "created",
+                    "Running": False,
+                    "ExitCode": self.command_exit_code,
+                    "Error": self.command_state_error,
+                    "StartedAt": (
+                        "2026-07-11T10:00:00.000000000Z"
+                        if self.command_started
+                        else "0001-01-01T00:00:00Z"
+                    ),
+                    "FinishedAt": (
+                        "2026-07-11T10:00:01.000000000Z"
+                        if self.command_started
+                        else "0001-01-01T00:00:00Z"
+                    ),
+                }
+                return CliResult(0, json.dumps(state), "")
             state = "true|0|" if self.launch_running else "false|1|process exited"
             return CliResult(0, state + "\n", "")
         if args[:1] == ("logs",):
             return CliResult(0, "erreur de démarrage", "")
         if args[:1] == ("ps",):
+            if self.ps_fails:
+                return CliResult(1, "", "daemon unavailable")
             ids = sorted(self.containers | self.extra_ps_ids)
+            filters = [
+                args[index + 1]
+                for index, value in enumerate(args[:-1])
+                if value == "--filter"
+            ]
+            for value in filters:
+                if value.startswith("id="):
+                    expected = value.removeprefix("id=")
+                    ids = [item for item in ids if item.startswith(expected)]
+                elif value.startswith("name="):
+                    pattern = value.removeprefix("name=")
+                    matching = {
+                        container_id
+                        for name, container_id in self.container_names.items()
+                        if re.search(pattern, "/" + name)
+                    }
+                    ids = [item for item in ids if item in matching]
+            if self.pause_ps:
+                self.ps_started.set()
+                await self.release_ps.wait()
             return CliResult(0, "\n".join(ids) + ("\n" if ids else ""), "")
         if args[:1] == ("stop",):
+            if self.pause_stop:
+                self.stop_started.set()
+                await self.release_stop.wait()
             if self.stop_fails:
                 return CliResult(1, "", "stop impossible")
             return CliResult(0, args[-1] + "\n", "")
         if args[:1] == ("kill",):
             return CliResult(0, args[-1] + "\n", "")
         if args[:1] == ("rm",):
+            if self.pause_remove:
+                self.remove_started.set()
+                await self.release_remove.wait()
             if self.remove_fails:
                 return CliResult(1, "", "suppression impossible")
             identifier = args[-1]
-            self.containers.discard(identifier)
-            self.extra_ps_ids.discard(identifier)
-            return CliResult(0, identifier + "\n", "")
+            container_id = self.container_names.get(identifier, identifier)
+            exists = (
+                container_id in self.containers
+                or container_id in self.extra_ps_ids
+            )
+            if self.remove_missing_fails and not exists:
+                return CliResult(1, "", "No such container")
+            self.containers.discard(container_id)
+            self.extra_ps_ids.discard(container_id)
+            for name, known_id in list(self.container_names.items()):
+                if known_id == container_id:
+                    self.container_names.pop(name, None)
+            return CliResult(0, container_id + "\n", "")
         raise AssertionError(f"Appel Docker inattendu : {argv!r}")
 
     def docker_calls(self, operation):
@@ -128,7 +215,7 @@ class FakeDockerRunner:
         entrypoint = create[entrypoint_index + 1]
         command = list(create[entrypoint_index + 3 :])
         memory = bytes_value(value("--memory"))
-        return {
+        payload = {
             "Config": {
                 "User": value("--user"),
                 "Labels": labels,
@@ -176,6 +263,9 @@ class FakeDockerRunner:
                 "PortBindings": ports,
             },
         }
+        if self.unsafe_policy:
+            payload["HostConfig"]["Privileged"] = True
+        return payload
 
 
 class DockerSandboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -240,6 +330,43 @@ class DockerSandboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(FakeDockerRunner.CONTAINER_ID, self.runner.containers)
         self.assertTrue(self.runner.docker_calls("rm"))
 
+    async def test_run_command_refuses_false_success_when_container_never_started(self):
+        self.runner.command_started = False
+        runtime = self.runtime()
+
+        with self.assertRaisesRegex(SandboxExecutionError, "pas démarré"):
+            await runtime.run_command(
+                "false-start", self.workspace, ("python", "script.py")
+            )
+
+        self.assertNotIn(FakeDockerRunner.CONTAINER_ID, self.runner.containers)
+        self.assertTrue(self.runner.docker_calls("rm"))
+
+    async def test_run_command_preserves_real_program_nonzero_exit(self):
+        self.runner.command_exit_code = 7
+        self.runner.command_output = "échec du programme"
+        runtime = self.runtime()
+
+        result = await runtime.run_command(
+            "program-error", self.workspace, ("python", "script.py")
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.exit_code, 7)
+        self.assertEqual(result.output, "échec du programme")
+
+    async def test_policy_inspect_independently_rejects_privileged_container(self):
+        self.runner.unsafe_policy = True
+        runtime = self.runtime()
+
+        with self.assertRaisesRegex(SandboxExecutionError, "protections demandées"):
+            await runtime.run_command(
+                "unsafe-policy", self.workspace, ("python", "script.py")
+            )
+
+        self.assertNotIn(FakeDockerRunner.CONTAINER_ID, self.runner.containers)
+        self.assertTrue(self.runner.docker_calls("rm"))
+
     async def test_run_tests_uses_structured_default_command(self):
         runtime = self.runtime()
         result = await runtime.run_tests(7, self.workspace)
@@ -281,6 +408,186 @@ class DockerSandboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await runtime.stop(3)
         self.assertFalse(raised.exception.result.ok)
         self.assertIn("suppression impossible", str(raised.exception))
+        self.assertIn(FakeDockerRunner.CONTAINER_ID, runtime._containers["3"])
+        self.assertIsNotNone(runtime.blocked_reason)
+
+    async def test_concurrent_stop_calls_share_one_reliable_result(self):
+        runtime = self.runtime()
+        self.runner.extra_ps_ids.add(FakeDockerRunner.CONTAINER_ID)
+        self.runner.pause_stop = True
+
+        first = asyncio.create_task(runtime.stop("same-task"))
+        await asyncio.wait_for(self.runner.stop_started.wait(), timeout=1)
+        second = asyncio.create_task(runtime.stop("same-task"))
+        await asyncio.sleep(0)
+        self.runner.release_stop.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertEqual(first_result, second_result)
+        self.assertTrue(first_result.ok)
+        self.assertEqual(
+            len(self.runner.docker_calls("stop")),
+            1,
+            "les deux appels doivent partager la même opération Docker",
+        )
+
+    async def test_concurrent_stop_handle_calls_share_one_container_operation(self):
+        runtime = self.runtime(max_launch_seconds=30)
+        handle = await runtime.launch(
+            "same-handle",
+            self.workspace,
+            ("python", "app.py"),
+            lifetime_seconds=20,
+        )
+        self.runner.pause_stop = True
+
+        first = asyncio.create_task(runtime.stop_handle(handle))
+        await asyncio.wait_for(self.runner.stop_started.wait(), timeout=1)
+        second = asyncio.create_task(runtime.stop_handle(handle))
+        await asyncio.sleep(0)
+        self.runner.release_stop.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertEqual(first_result, second_result)
+        self.assertTrue(first_result.ok)
+        self.assertEqual(len(self.runner.docker_calls("stop")), 1)
+        self.assertEqual(len(self.runner.docker_calls("rm")), 1)
+        self.assertIsNone(runtime.blocked_reason)
+
+    async def test_stop_handle_only_removes_its_launched_container(self):
+        runtime = self.runtime(max_launch_seconds=30)
+        handle = await runtime.launch(
+            "two-apps", self.workspace, ("python", "app.py"), lifetime_seconds=20
+        )
+        sibling = "b" * 64
+        self.runner.extra_ps_ids.add(sibling)
+        runtime._containers["two-apps"].add(sibling)
+
+        result = await runtime.stop_handle(handle)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.stopped, (handle.container_id,))
+        self.assertIn(sibling, self.runner.extra_ps_ids)
+        self.assertIn(sibling, runtime._containers["two-apps"])
+        await runtime.stop("two-apps")
+
+    async def test_normal_cleanup_and_stop_share_one_container_operation(self):
+        runtime = self.runtime()
+        container_id = FakeDockerRunner.CONTAINER_ID
+        runtime._containers["cleanup-race"] = {container_id}
+        runtime._container_names[container_id] = "tracked"
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def controlled_cleanup(identifier):
+            nonlocal calls
+            self.assertEqual(identifier, container_id)
+            calls += 1
+            started.set()
+            await release.wait()
+            await runtime._unregister(identifier)
+            return None
+
+        with patch.object(
+            runtime, "_perform_stop_and_remove", side_effect=controlled_cleanup
+        ):
+            normal = asyncio.create_task(
+                runtime._cleanup_container(container_id, stop_first=False)
+            )
+            await started.wait()
+            concurrent_stop = asyncio.create_task(
+                runtime._stop_and_remove(container_id)
+            )
+            await asyncio.sleep(0)
+            release.set()
+            self.assertEqual(await normal, None)
+            self.assertEqual(await concurrent_stop, None)
+
+        self.assertEqual(calls, 1)
+        self.assertIsNone(runtime.blocked_reason)
+
+    async def test_cancelled_docker_create_cleans_container_by_known_name(self):
+        runtime = self.runtime()
+        self.runner.pause_create = True
+
+        command = asyncio.create_task(
+            runtime.run_command(
+                "cancel-create", self.workspace, ("python", "script.py")
+            )
+        )
+        await asyncio.wait_for(self.runner.create_started.wait(), timeout=1)
+        command.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await command
+
+        self.assertFalse(self.runner.containers)
+        self.assertNotIn("cancel-create", runtime._creating)
+        self.assertEqual(len(self.runner.docker_calls("rm")), 1)
+        self.assertIsNone(runtime.blocked_reason)
+
+    async def test_cancellation_during_invalid_id_cleanup_waits_for_absence(self):
+        runtime = self.runtime()
+        self.runner.create_stdout = "not-a-container-id\n"
+        self.runner.pause_remove = True
+
+        command = asyncio.create_task(
+            runtime.run_command(
+                "invalid-id-cancel", self.workspace, ("python", "script.py")
+            )
+        )
+        await asyncio.wait_for(self.runner.remove_started.wait(), timeout=1)
+        command.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(command.done())
+        self.runner.release_remove.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await command
+
+        self.assertFalse(self.runner.containers)
+        self.assertNotIn("invalid-id-cancel", runtime._creating)
+        self.assertIsNone(runtime.blocked_reason)
+
+    async def test_refused_create_also_cleans_the_uncertain_container(self):
+        runtime = self.runtime()
+        self.runner.create_returncode = 1
+        self.runner.create_stdout = ""
+
+        with self.assertRaisesRegex(SandboxExecutionError, "refusé la création"):
+            await runtime.run_command(
+                "refused-create", self.workspace, ("python", "script.py")
+            )
+
+        self.assertFalse(self.runner.containers)
+        self.assertNotIn("refused-create", runtime._creating)
+
+    async def test_missing_container_is_success_only_after_fresh_confirmation(self):
+        runtime = self.runtime()
+        container_id = FakeDockerRunner.CONTAINER_ID
+        runtime._containers["already-gone"] = {container_id}
+        runtime._container_names[container_id] = "already-gone"
+        self.runner.remove_missing_fails = True
+
+        error = await runtime._stop_and_remove(container_id)
+
+        self.assertIsNone(error)
+        self.assertNotIn("already-gone", runtime._containers)
+        self.assertIsNone(runtime.blocked_reason)
+        self.assertTrue(self.runner.docker_calls("ps"))
+
+    async def test_missing_container_without_confirmation_stays_failed_closed(self):
+        runtime = self.runtime()
+        container_id = FakeDockerRunner.CONTAINER_ID
+        runtime._containers["unverified-gone"] = {container_id}
+        runtime._container_names[container_id] = "unverified-gone"
+        self.runner.remove_missing_fails = True
+        self.runner.ps_fails = True
+
+        error = await runtime._stop_and_remove(container_id)
+
+        self.assertIsNotNone(error)
+        self.assertIn(container_id, runtime._containers["unverified-gone"])
+        self.assertIsNotNone(runtime.blocked_reason)
 
     async def test_startup_cleanup_removes_all_containers_in_private_namespace(self):
         runtime = self.runtime()
@@ -293,6 +600,79 @@ class DockerSandboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("label=com.orchestrator.sandbox=true", ps)
         self.assertIn("label=com.orchestrator.namespace=test-suite", ps)
         self.assertFalse(self.runner.extra_ps_ids)
+
+    async def test_global_cleanup_barrier_refuses_creation_after_its_snapshot(self):
+        runtime = self.runtime()
+        self.runner.pause_ps = True
+
+        cleanup = asyncio.create_task(runtime.stop_all_managed())
+        await asyncio.wait_for(self.runner.ps_started.wait(), timeout=1)
+        with self.assertRaises(SandboxStoppedError):
+            await runtime.run_command(
+                "too-late", self.workspace, ("python", "script.py")
+            )
+        self.runner.release_ps.set()
+        result = await cleanup
+
+        self.assertTrue(result.ok)
+        self.assertFalse(runtime._stopping_all)
+        self.assertFalse(self.runner.docker_calls("create"))
+
+    async def test_global_cleanup_waits_for_creation_already_in_progress(self):
+        runtime = self.runtime()
+        self.runner.pause_create = True
+
+        command = asyncio.create_task(
+            runtime.run_command(
+                "already-creating", self.workspace, ("python", "script.py")
+            )
+        )
+        await asyncio.wait_for(self.runner.create_started.wait(), timeout=1)
+        cleanup = asyncio.create_task(runtime.stop_all_managed())
+        await asyncio.sleep(0)
+        self.assertFalse(cleanup.done())
+
+        self.runner.release_create.set()
+        with self.assertRaises(SandboxStoppedError):
+            await command
+        result = await cleanup
+
+        self.assertTrue(result.ok)
+        self.assertFalse(self.runner.containers)
+        self.assertFalse(runtime._stopping_all)
+
+    async def test_concurrent_global_cleanups_share_barrier_and_result(self):
+        runtime = self.runtime()
+        self.runner.extra_ps_ids.add(FakeDockerRunner.CONTAINER_ID)
+        self.runner.pause_stop = True
+
+        first = asyncio.create_task(runtime.stop_all_managed())
+        await asyncio.wait_for(self.runner.stop_started.wait(), timeout=1)
+        second = asyncio.create_task(runtime.stop_all_managed())
+        await asyncio.sleep(0)
+        self.runner.release_stop.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertEqual(first_result, second_result)
+        self.assertTrue(first_result.ok)
+        self.assertEqual(len(self.runner.docker_calls("ps")), 1)
+        self.assertEqual(len(self.runner.docker_calls("stop")), 1)
+        self.assertEqual(len(self.runner.docker_calls("rm")), 1)
+        self.assertFalse(runtime._stopping_all)
+
+    async def test_startup_cleanup_rejects_invalid_docker_ps_identifiers(self):
+        runtime = self.runtime()
+        self.runner.extra_ps_ids.update({
+            FakeDockerRunner.CONTAINER_ID,
+            "not-a-container-id",
+        })
+
+        result = await runtime.stop_all_managed(strict=False)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any(item == "recherche" for item, _ in result.failed))
+        self.assertNotIn(FakeDockerRunner.CONTAINER_ID, self.runner.extra_ps_ids)
+        self.assertIsNotNone(runtime.blocked_reason)
 
     async def test_launch_requires_explicit_network_and_binds_loopback_only(self):
         runtime = self.runtime(allow_network=True)
@@ -364,11 +744,49 @@ class DockerSandboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.runner.containers)
         self.assertTrue(self.runner.docker_calls("stop"))
 
+    async def test_handle_liveness_is_checked_against_docker_state(self):
+        runtime = self.runtime()
+        handle = await runtime.launch(
+            "live-handle", self.workspace, ("python", "app.py")
+        )
+        self.assertTrue(await runtime.is_handle_running(handle))
+
+        self.runner.launch_running = False
+        self.assertFalse(await runtime.is_handle_running(handle))
+
+        await runtime.stop_handle(handle)
+        self.assertFalse(await runtime.is_handle_running(handle))
+
+    async def test_failed_expiry_remains_tracked_and_blocks_execution(self):
+        runtime = self.runtime(max_launch_seconds=0.03)
+        self.runner.remove_fails = True
+        handle = await runtime.launch(
+            "expiry-failure",
+            self.workspace,
+            ("python", "app.py"),
+            lifetime_seconds=0.01,
+        )
+
+        await asyncio.sleep(0.06)
+
+        self.assertIn(handle.container_id, runtime._containers["expiry-failure"])
+        self.assertIn(handle.container_id, self.runner.containers)
+        self.assertIsNotNone(runtime.blocked_reason)
+        with self.assertRaises(SandboxUnavailableError):
+            await runtime.run_command(
+                "blocked-after-expiry", self.workspace, ("python", "script.py")
+            )
+
+        self.runner.remove_fails = False
+        cleanup = await runtime.stop("expiry-failure")
+        self.assertTrue(cleanup.ok)
+        runtime.unblock_execution()
+
     async def test_probe_fails_closed_for_daemon_image_version_and_os(self):
         cases = (
             ("daemon", {"daemon_available": False}, "n'est pas démarré"),
             ("image", {"image_available": False}, "n'est pas installée"),
-            ("version", {"version": "19.03.15"}, "20.10"),
+            ("version 20.10", {"version": "20.10.27"}, "23.0"),
             ("windows containers", {"os_type": "windows"}, "conteneurs Linux"),
         )
         for name, attributes, expected in cases:
@@ -390,6 +808,23 @@ class DockerSandboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(expected, status.message)
                 with self.assertRaises(SandboxUnavailableError):
                     await runtime.ensure_available()
+
+    async def test_docker_23_is_the_supported_version_boundary(self):
+        for version, expected in (("22.99.9", False), ("23.0.0", True)):
+            with self.subTest(version=version):
+                runner = FakeDockerRunner()
+                runner.version = version
+                runtime = DockerSandboxRuntime(
+                    SandboxConfig(
+                        image="orchestrator-sandbox:test",
+                        allowed_workspace_roots=(self.root,),
+                        namespace="test-suite",
+                        user="12345:12345",
+                    ),
+                    runner=runner,
+                )
+                status = await runtime.probe()
+                self.assertEqual(status.available, expected, status.message)
 
     async def test_workspace_and_shell_strings_are_rejected_before_docker(self):
         runtime = self.runtime()

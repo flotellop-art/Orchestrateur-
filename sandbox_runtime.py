@@ -43,7 +43,7 @@ _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _MEMORY_RE = re.compile(r"^[1-9][0-9]*[kKmMgG]$")
-_DOCKER_MINIMUM_VERSION = (20, 10)
+_DOCKER_MINIMUM_VERSION = (23, 0)
 
 
 class SandboxError(RuntimeError):
@@ -380,6 +380,14 @@ class DockerSandboxRuntime:
         self._container_names: dict[str, str] = {}
         self._expiry_tasks: dict[str, asyncio.Task[None]] = {}
         self._stopping_tasks: set[str] = set()
+        self._stop_operations: dict[
+            str, asyncio.Task[SandboxStopResult]
+        ] = {}
+        self._stop_all_operation: asyncio.Task[SandboxStopResult] | None = None
+        self._stopping_all = False
+        self._container_stop_operations: dict[
+            str, asyncio.Task[str | None]
+        ] = {}
         self._creating: dict[str, set[asyncio.Future[None]]] = {}
         self._state_lock = asyncio.Lock()
         self._blocked_reason: str | None = None
@@ -514,21 +522,40 @@ class DockerSandboxRuntime:
             inspected = await self._docker(
                 "inspect",
                 "--format",
-                "{{.State.ExitCode}}",
+                "{{json .State}}",
                 container_id,
                 timeout=self.config.lifecycle_timeout,
             )
             if inspected.returncode != 0:
-                details = self._combined_output(execution)
+                details = self._combined_output(inspected) or self._combined_output(
+                    execution
+                )
                 raise SandboxExecutionError(
                     "Le résultat du conteneur ne peut pas être vérifié. " + details
                 )
             try:
-                exit_code = int(inspected.stdout.strip())
-            except ValueError as exc:
+                state = json.loads(inspected.stdout)
+                status = str(state["Status"]).strip().lower()
+                started_at = str(state["StartedAt"]).strip()
+                state_error = str(state.get("Error") or "").strip()
+                exit_code = int(state["ExitCode"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise SandboxExecutionError(
-                    "Docker a renvoyé un code de sortie incompréhensible."
+                    "Docker a renvoyé un état d'exécution incompréhensible."
                 ) from exc
+
+            never_started = (
+                not started_at
+                or started_at.startswith("0001-01-01T00:00:00")
+                or status != "exited"
+            )
+            if never_started or state_error:
+                details = state_error or self._combined_output(execution)
+                if not details:
+                    details = f"état Docker {status or 'inconnu'}"
+                raise SandboxExecutionError(
+                    "Docker n'a pas démarré correctement le conteneur : " + details
+                )
             output = self._bounded_output(self._combined_output(execution))
             result = SandboxResult(
                 task,
@@ -658,6 +685,41 @@ class DockerSandboxRuntime:
                 ) from exc
             raise
 
+    async def is_handle_running(self, handle: SandboxHandle) -> bool:
+        """Confirme qu'un handle suivi designe encore un conteneur actif."""
+
+        if not isinstance(handle, SandboxHandle):
+            raise SandboxValidationError("Le handle de bac a sable est invalide.")
+        task = self._validate_task_id(handle.task_id)
+        container_id = str(handle.container_id).strip().lower()
+        if not _CONTAINER_ID_RE.fullmatch(container_id):
+            raise SandboxValidationError("L'identifiant du conteneur est invalide.")
+
+        async with self._state_lock:
+            owners = tuple(
+                owner
+                for owner, container_ids in self._containers.items()
+                if container_id in container_ids
+            )
+            known_name = self._container_names.get(container_id)
+        if not owners:
+            return False
+        if owners != (task,) or known_name not in (None, handle.container_name):
+            raise SandboxValidationError(
+                "Ce handle ne correspond pas au conteneur suivi pour cette tache."
+            )
+
+        state = await self._docker(
+            "inspect",
+            "--format",
+            "{{.State.Running}}|{{.State.ExitCode}}|{{.State.Error}}",
+            container_id,
+            timeout=self.config.lifecycle_timeout,
+        )
+        return state.returncode == 0 and state.stdout.strip().lower().startswith(
+            "true|"
+        )
+
     async def stop(
         self, task_id: int | str, *, strict: bool = True
     ) -> SandboxStopResult:
@@ -669,60 +731,163 @@ class DockerSandboxRuntime:
 
         task = self._validate_task_id(task_id)
         async with self._state_lock:
-            if task in self._stopping_tasks:
-                raise SandboxStoppedError(
-                    "L'arrêt des conteneurs de cette tâche est déjà en cours."
+            operation = self._stop_operations.get(task)
+            if operation is None:
+                # La marque est posée avant de planifier l'opération afin qu'une
+                # création concurrente ne puisse pas se glisser entre les deux.
+                self._stopping_tasks.add(task)
+                operation = asyncio.create_task(
+                    self._perform_stop(task),
+                    name=f"sandbox-stop-{task}",
                 )
-            self._stopping_tasks.add(task)
-            pending_creations = tuple(self._creating.get(task, set()))
+                self._stop_operations[task] = operation
+
+        # L'annulation d'un appelant ne doit pas annuler l'arrêt partagé attendu
+        # par les autres appelants, ni laisser le conteneur sans surveillance.
+        result = await asyncio.shield(operation)
+        if strict and result.failed:
+            raise SandboxStopError(result)
+        return result
+
+    async def stop_handle(
+        self, handle: SandboxHandle, *, strict: bool = True
+    ) -> SandboxStopResult:
+        """Arrête exactement le conteneur d'un handle encore suivi.
+
+        Un handle déjà nettoyé produit un succès vide, ce qui rend l'appel
+        idempotent. Un identifiant suivi par une autre tâche est refusé.
+        """
+
+        if not isinstance(handle, SandboxHandle):
+            raise SandboxValidationError("Le handle de bac à sable est invalide.")
+        task = self._validate_task_id(handle.task_id)
+        container_id = str(handle.container_id).strip().lower()
+        if not _CONTAINER_ID_RE.fullmatch(container_id):
+            raise SandboxValidationError("L'identifiant du conteneur est invalide.")
+
+        async with self._state_lock:
+            owners = tuple(
+                owner
+                for owner, container_ids in self._containers.items()
+                if container_id in container_ids
+            )
+            known_name = self._container_names.get(container_id)
+        if not owners:
+            return SandboxStopResult(task, (), ())
+        if owners != (task,) or known_name not in (None, handle.container_name):
+            raise SandboxValidationError(
+                "Ce handle ne correspond pas au conteneur suivi pour cette tâche."
+            )
+
+        error = await self._stop_and_remove(container_id)
+        result = SandboxStopResult(
+            task,
+            () if error else (container_id,),
+            ((container_id, error),) if error else (),
+        )
+        if strict and error:
+            raise SandboxStopError(result)
+        return result
+
+    async def _perform_stop(self, task: str) -> SandboxStopResult:
+        """Réalise l'unique arrêt partagé d'une tâche."""
+
         stopped: list[str] = []
         failed: list[tuple[str, str]] = []
         try:
+            async with self._state_lock:
+                pending_creations = tuple(self._creating.get(task, set()))
             if pending_creations:
                 await asyncio.gather(
                     *(asyncio.shield(marker) for marker in pending_creations)
                 )
             engine = await self._probe_engine()
             if not engine.available:
-                raise SandboxUnavailableError(engine.message)
-            async with self._state_lock:
-                tracked = set(self._containers.get(task, set()))
+                failed.append(("moteur Docker", engine.message))
+            else:
+                async with self._state_lock:
+                    tracked = set(self._containers.get(task, set()))
 
-            discovered, discovery_error = await self._discover_task_containers(task)
-            tracked.update(discovered)
-            if discovery_error:
-                failed.append(("recherche", discovery_error))
+                discovered, discovery_error = await self._discover_task_containers(task)
+                tracked.update(discovered)
+                if discovered:
+                    async with self._state_lock:
+                        self._containers.setdefault(task, set()).update(discovered)
+                if discovery_error:
+                    failed.append(("recherche", discovery_error))
 
-            for container_id in sorted(tracked):
-                error = await self._stop_and_remove(container_id)
-                if error:
-                    failed.append((container_id, error))
-                else:
-                    stopped.append(container_id)
+                attempted: set[str] = set()
+                for container_id in sorted(tracked):
+                    attempted.add(container_id)
+                    error = await self._stop_and_remove(container_id)
+                    if error:
+                        failed.append((container_id, error))
+                    else:
+                        stopped.append(container_id)
 
-            # Une création déjà envoyée à Docker au moment de stop() peut
-            # apparaître après le premier balayage. La marque _stopping_tasks
-            # l'empêche de démarrer et ce second passage la récupère.
-            late, late_error = await self._discover_task_containers(task)
-            if late_error:
-                failed.append(("seconde recherche", late_error))
-            for container_id in sorted(set(late) - set(stopped)):
-                error = await self._stop_and_remove(container_id)
-                if error:
-                    failed.append((container_id, error))
-                else:
-                    stopped.append(container_id)
+                # Une création déjà envoyée à Docker au moment de stop() peut
+                # apparaître après le premier balayage. La marque _stopping_tasks
+                # l'empêche de démarrer et ce second passage la récupère.
+                late, late_error = await self._discover_task_containers(task)
+                if late_error:
+                    failed.append(("seconde recherche", late_error))
+                if late:
+                    async with self._state_lock:
+                        self._containers.setdefault(task, set()).update(late)
+                for container_id in sorted(set(late) - attempted):
+                    error = await self._stop_and_remove(container_id)
+                    if error:
+                        failed.append((container_id, error))
+                    else:
+                        stopped.append(container_id)
         finally:
             async with self._state_lock:
                 self._stopping_tasks.discard(task)
+                current = self._stop_operations.get(task)
+                if current is asyncio.current_task():
+                    self._stop_operations.pop(task, None)
 
-        result = SandboxStopResult(task, tuple(stopped), tuple(failed))
-        if strict and failed:
-            raise SandboxStopError(result)
+        result = SandboxStopResult(
+            task, tuple(dict.fromkeys(stopped)), tuple(failed)
+        )
+        if failed:
+            self.block_execution(
+                "Le nettoyage Docker de la tâche "
+                f"{task} est incomplet : "
+                + "; ".join(f"{item}: {reason}" for item, reason in failed)
+            )
         return result
 
     async def stop_all_managed(self, *, strict: bool = True) -> SandboxStopResult:
-        """Nettoie tous les conteneurs portant les labels de cette installation."""
+        """Nettoie tous les conteneurs de l'installation en une opération partagée."""
+        async with self._state_lock:
+            operation = self._stop_all_operation
+            if operation is None:
+                # La barrière précède tous les snapshots. Une création déjà
+                # enregistrée sera attendue ; une nouvelle création sera
+                # refusée jusqu'à la fin du second balayage Docker.
+                self._stopping_all = True
+                operation = asyncio.create_task(
+                    self._perform_stop_all_managed(),
+                    name="sandbox-stop-all",
+                )
+                self._stop_all_operation = operation
+
+        result = await asyncio.shield(operation)
+        if strict and result.failed:
+            raise SandboxStopError(result)
+        return result
+
+    async def _perform_stop_all_managed(self) -> SandboxStopResult:
+        try:
+            return await self._stop_all_managed_inner()
+        finally:
+            async with self._state_lock:
+                if self._stop_all_operation is asyncio.current_task():
+                    self._stop_all_operation = None
+                    self._stopping_all = False
+
+    async def _stop_all_managed_inner(self) -> SandboxStopResult:
         async with self._state_lock:
             known_tasks = tuple(sorted(set(self._containers) | set(self._creating)))
         stopped: list[str] = []
@@ -746,10 +911,22 @@ class DockerSandboxRuntime:
                 failed.append(("recherche", self._combined_output(discovered)))
                 ids: tuple[str, ...] = ()
             else:
-                ids = tuple(
-                    line.strip() for line in discovered.stdout.splitlines()
-                    if _CONTAINER_ID_RE.fullmatch(line.strip())
-                )
+                valid_ids: list[str] = []
+                invalid_ids: list[str] = []
+                for line in discovered.stdout.splitlines():
+                    candidate = line.strip()
+                    if not candidate:
+                        continue
+                    if not _CONTAINER_ID_RE.fullmatch(candidate):
+                        invalid_ids.append(candidate[:80])
+                    else:
+                        valid_ids.append(candidate)
+                ids = tuple(valid_ids)
+                if invalid_ids:
+                    failed.append((
+                        "recherche",
+                        "Docker a renvoyé un identifiant de conteneur invalide.",
+                    ))
         except (SandboxError, CliTimeoutError) as exc:
             failed.append(("recherche", str(exc)))
             ids = ()
@@ -765,8 +942,11 @@ class DockerSandboxRuntime:
         result = SandboxStopResult(
             "*", tuple(dict.fromkeys(stopped)), tuple(failed)
         )
-        if strict and failed:
-            raise SandboxStopError(result)
+        if failed:
+            self.block_execution(
+                "Le nettoyage global des conteneurs Docker est incomplet : "
+                + "; ".join(f"{item}: {reason}" for item, reason in failed)
+            )
         return result
 
     async def _probe_engine(self) -> SandboxStatus:
@@ -796,7 +976,7 @@ class DockerSandboxRuntime:
         if parsed is None or parsed < _DOCKER_MINIMUM_VERSION:
             return SandboxStatus(
                 False,
-                "Docker 20.10 ou plus récent est requis pour appliquer toutes les "
+                "Docker 23.0 ou plus récent est requis pour appliquer toutes les "
                 "protections du bac à sable.",
                 version_text,
             )
@@ -886,6 +1066,34 @@ class DockerSandboxRuntime:
             )
         finally:
             await self._end_creation(task, marker)
+
+    async def _protected_best_effort_remove(
+        self, identifier: str, *, task: str
+    ) -> str | None:
+        """Attend le nettoyage incertain avant de liberer la barriere de creation."""
+
+        cleanup = asyncio.create_task(
+            self._best_effort_remove(identifier),
+            name=f"sandbox-uncertain-create-{task}",
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                error = await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError as exc:
+                # Le conteneur peut deja exister sans identifiant connu. Ne pas
+                # rendre la main a stop_all tant que son absence n'est pas
+                # confirmee, meme si le client annule une seconde fois.
+                if cleanup.done():
+                    raise
+                cancellation = cancellation or exc
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+        if cancellation is not None:
+            raise cancellation
+        return error
 
     async def _create_container_inner(
         self,
@@ -990,23 +1198,58 @@ class DockerSandboxRuntime:
             result = await self._docker(
                 *create, timeout=self.config.lifecycle_timeout
             )
-        except (CliTimeoutError, asyncio.TimeoutError) as exc:
-            await self._best_effort_remove(name)
-            raise SandboxExecutionError(
-                "Docker a dépassé le délai pendant la création du bac à sable."
-            ) from exc
+        except BaseException as exc:
+            # Le daemon peut avoir créé le conteneur alors que le client Docker
+            # est annulé avant de rendre son identifiant. Le nom, généré avant
+            # l'appel, reste alors notre capacité de récupération. Le nettoyage
+            # est protégé de l'annulation et confirme l'absence avant d'accepter
+            # comme idempotent un `rm` qui a échoué.
+            cleanup_error = await self._protected_best_effort_remove(
+                name, task=task
+            )
+            if cleanup_error:
+                raise SandboxExecutionError(
+                    "La création Docker a été interrompue et l'absence de son "
+                    f"conteneur n'a pas pu être confirmée : {cleanup_error}"
+                ) from exc
+            if isinstance(exc, (CliTimeoutError, asyncio.TimeoutError)):
+                raise SandboxExecutionError(
+                    "Docker a dépassé le délai pendant la création du bac à sable."
+                ) from exc
+            raise
         if result.returncode != 0:
-            await self._best_effort_remove(name)
+            cleanup_error = await self._protected_best_effort_remove(
+                name, task=task
+            )
+            if cleanup_error:
+                raise SandboxExecutionError(
+                    "Docker a refuse la creation et l'absence du conteneur "
+                    f"n'a pas pu etre confirmee : {cleanup_error}"
+                )
             raise SandboxExecutionError(
                 "Docker a refusé la création du bac à sable : "
                 + self._combined_output(result)
             )
         container_id = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
         if not _CONTAINER_ID_RE.fullmatch(container_id):
-            await self._best_effort_remove(name)
+            cleanup_error = await self._protected_best_effort_remove(
+                name, task=task
+            )
+            if cleanup_error:
+                raise SandboxExecutionError(
+                    "Docker a renvoye un identifiant invalide et l'absence du "
+                    f"conteneur n'a pas pu etre confirmee : {cleanup_error}"
+                )
             raise SandboxExecutionError(
                 "Docker n'a pas renvoyé un identifiant de conteneur vérifiable."
             )
+
+        # Dès que Docker fournit un identifiant fiable, le conteneur reste suivi
+        # jusqu'à ce qu'un ``rm`` réussi confirme sa disparition. Cela couvre
+        # aussi un refus de politique ou un arrêt demandé pendant l'inspection.
+        async with self._state_lock:
+            self._containers.setdefault(task, set()).add(container_id)
+            self._container_names[container_id] = name
         try:
             await self._verify_container_policy(
                 container_id,
@@ -1019,7 +1262,9 @@ class DockerSandboxRuntime:
                 workspace_hash=workspace_hash,
             )
         except BaseException as exc:
-            cleanup_error = await self._best_effort_remove(container_id)
+            cleanup_error = await self._cleanup_container(
+                container_id, stop_first=False
+            )
             if cleanup_error:
                 raise SandboxExecutionError(
                     "Les protections Docker ne peuvent pas être vérifiées et le "
@@ -1029,11 +1274,15 @@ class DockerSandboxRuntime:
 
         async with self._state_lock:
             stopped_during_creation = task in self._stopping_tasks
-            if not stopped_during_creation:
-                self._containers.setdefault(task, set()).add(container_id)
-                self._container_names[container_id] = name
         if stopped_during_creation:
-            await self._best_effort_remove(container_id)
+            cleanup_error = await self._cleanup_container(
+                container_id, stop_first=False
+            )
+            if cleanup_error:
+                raise SandboxExecutionError(
+                    "La tâche a été arrêtée pendant la création, mais son "
+                    f"conteneur n'a pas pu être supprimé : {cleanup_error}"
+                )
             raise SandboxStoppedError(
                 "La tâche a été arrêtée pendant la création de son bac à sable."
             )
@@ -1227,6 +1476,11 @@ class DockerSandboxRuntime:
     async def _begin_creation(self, task: str) -> asyncio.Future[None]:
         marker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         async with self._state_lock:
+            if self._stopping_all:
+                raise SandboxStoppedError(
+                    "Le nettoyage global des conteneurs est en cours ; aucun "
+                    "nouveau conteneur ne peut être créé."
+                )
             if task in self._stopping_tasks:
                 raise SandboxStoppedError(
                     "La tâche est en cours d'arrêt ; aucun nouveau conteneur ne "
@@ -1278,7 +1532,67 @@ class DockerSandboxRuntime:
             ids.append(candidate)
         return tuple(ids), None
 
+    async def _confirm_container_absent(
+        self, identifier: str
+    ) -> tuple[bool, str | None]:
+        """Confirme via une nouvelle lecture Docker qu'un conteneur a disparu.
+
+        Un ``docker rm`` peut perdre sa réponse après que le daemon a bien
+        supprimé le conteneur. L'erreur du client n'est donc ni un succès ni
+        un échec suffisant : seule une liste relue avec succès permet de rendre
+        le nettoyage idempotent sans ouvrir la frontière en cas de panne du
+        daemon.
+        """
+
+        if _CONTAINER_ID_RE.fullmatch(identifier):
+            filter_value = f"id={identifier}"
+        else:
+            # Le filtre Docker par nom accepte une sous-chaîne. Le suffixe
+            # aléatoire de nos noms rend une collision irréaliste et un faux
+            # positif resterait sûr (nettoyage refusé), tandis que des ancres
+            # échappées différemment selon les versions du moteur pourraient
+            # produire un faux vide dangereux.
+            filter_value = f"name={identifier}"
+        try:
+            result = await self._docker(
+                "ps",
+                "--all",
+                "--no-trunc",
+                "--quiet",
+                "--filter",
+                filter_value,
+                timeout=self.config.lifecycle_timeout,
+            )
+        except (SandboxError, CliTimeoutError, asyncio.TimeoutError) as exc:
+            return False, f"absence non vérifiable : {exc}"
+        if result.returncode != 0:
+            details = self._combined_output(result) or "liste Docker refusée"
+            return False, f"absence non vérifiable : {details}"
+
+        present: list[str] = []
+        for line in result.stdout.splitlines():
+            candidate = line.strip()
+            if not candidate:
+                continue
+            if not _CONTAINER_ID_RE.fullmatch(candidate):
+                return False, "Docker a renvoyé un identifiant de conteneur invalide."
+            present.append(candidate)
+        if present:
+            return False, "Docker confirme que le conteneur existe encore."
+        return True, None
+
     async def _stop_and_remove(self, container_id: str) -> str | None:
+        async with self._state_lock:
+            operation = self._container_stop_operations.get(container_id)
+            if operation is None:
+                operation = asyncio.create_task(
+                    self._perform_stop_and_remove(container_id),
+                    name=f"sandbox-container-stop-{container_id[:12]}",
+                )
+                self._container_stop_operations[container_id] = operation
+        return await asyncio.shield(operation)
+
+    async def _perform_stop_and_remove(self, container_id: str) -> str | None:
         messages: list[str] = []
         needs_kill = False
         try:
@@ -1288,7 +1602,8 @@ class DockerSandboxRuntime:
                     "--time",
                     str(self.config.stop_timeout),
                     container_id,
-                    timeout=self.config.stop_timeout + self.config.lifecycle_timeout,
+                    timeout=self.config.stop_timeout
+                    + self.config.lifecycle_timeout,
                 )
                 if stopped.returncode != 0:
                     needs_kill = True
@@ -1311,42 +1626,80 @@ class DockerSandboxRuntime:
                 except (SandboxError, CliTimeoutError, asyncio.TimeoutError) as exc:
                     messages.append(str(exc))
 
+            removal_error: str | None = None
             try:
                 removed = await self._docker(
-                "rm", "--force", container_id,
-                timeout=self.config.lifecycle_timeout,
+                    "rm",
+                    "--force",
+                    container_id,
+                    timeout=self.config.lifecycle_timeout,
                 )
             except (SandboxError, CliTimeoutError, asyncio.TimeoutError) as exc:
-                messages.append(str(exc))
-                return "; ".join(message for message in messages if message)
-            if removed.returncode != 0:
-                messages.append(
-                    self._combined_output(removed) or "suppression Docker refusée"
+                removal_error = str(exc)
+            else:
+                if removed.returncode != 0:
+                    removal_error = (
+                        self._combined_output(removed)
+                        or "suppression Docker refusée"
+                    )
+            if removal_error:
+                absent, confirmation_error = await self._confirm_container_absent(
+                    container_id
                 )
-                return "; ".join(message for message in messages if message)
-        finally:
+                if absent:
+                    await self._unregister(container_id)
+                    return None
+                messages.append(removal_error)
+                if confirmation_error:
+                    messages.append(confirmation_error)
+                error = "; ".join(message for message in messages if message)
+                self.block_execution(
+                    f"Le conteneur Docker {container_id} n'a pas pu être supprimé : {error}"
+                )
+                return error
             await self._unregister(container_id)
-        return None
+            return None
+        finally:
+            async with self._state_lock:
+                current = self._container_stop_operations.get(container_id)
+                if current is asyncio.current_task():
+                    self._container_stop_operations.pop(container_id, None)
 
     async def _cleanup_container(
         self, container_id: str, *, stop_first: bool
     ) -> str | None:
-        try:
-            if stop_first:
-                return await self._stop_and_remove(container_id)
-            return await self._best_effort_remove(container_id)
-        finally:
-            await self._unregister(container_id)
+        # Même après une fin normale, le nettoyage peut courir en parallèle
+        # avec stop(task) ou stop_handle(). Tous les chemins doivent partager
+        # l'opération par conteneur, sinon le second `docker rm` voit un faux
+        # échec « No such container » et bloque globalement le runtime.
+        return await self._stop_and_remove(container_id)
 
     async def _best_effort_remove(self, identifier: str) -> str | None:
+        removal_error: str | None = None
         try:
             removed = await self._docker(
                 "rm", "--force", identifier, timeout=self.config.lifecycle_timeout
             )
             if removed.returncode != 0:
-                return self._combined_output(removed) or "suppression Docker refusée"
+                removal_error = (
+                    self._combined_output(removed) or "suppression Docker refusée"
+                )
         except (SandboxError, CliTimeoutError, asyncio.TimeoutError) as exc:
-            return str(exc)
+            removal_error = str(exc)
+        if removal_error:
+            absent, confirmation_error = await self._confirm_container_absent(
+                identifier
+            )
+            if absent:
+                await self._unregister(identifier)
+                return None
+            error = removal_error
+            if confirmation_error:
+                error += "; " + confirmation_error
+            self.block_execution(
+                f"Le conteneur Docker {identifier} n'a pas pu être supprimé : {error}"
+            )
+            return error
         return None
 
     async def _unregister(self, container_id: str) -> None:
@@ -1367,6 +1720,10 @@ class DockerSandboxRuntime:
             await asyncio.sleep(lifetime)
             error = await self._stop_and_remove(container_id)
             if error:
+                self.block_execution(
+                    "L'expiration du conteneur Docker "
+                    f"{container_id} a échoué : {error}"
+                )
                 log.error(
                     "Le conteneur %s de la tâche %s a résisté à son expiration : %s",
                     container_id,

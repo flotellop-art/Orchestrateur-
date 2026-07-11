@@ -50,6 +50,7 @@ class _Services:
 
 
 _services: _Services | None = None
+_services_error: str | None = None
 
 
 def _configured_channel_names(gateway: MessagingGateway | None) -> tuple[str, ...]:
@@ -109,7 +110,7 @@ def configure(
         public_channel_names = tuple(sorted(set(channel_names)))
         if messaging is not None and not set(public_channel_names).issubset(gateway_names):
             raise TypeError("channel_names contient un canal absent de la messagerie.")
-    global _services
+    global _services, _services_error
     _services = _Services(
         store=store,
         queue=queue,
@@ -117,11 +118,25 @@ def configure(
         task_exists=checker,
         channel_names=public_channel_names,
     )
+    _services_error = None
+
+
+def disable(reason: str) -> None:
+    """Ferme l'API quand le planificateur n'est plus réellement actif."""
+    message = " ".join(str(reason or "").split())
+    if not message:
+        message = "Les services de planification sont indisponibles."
+    global _services, _services_error
+    _services = None
+    _services_error = message[:500]
 
 
 def _get_services() -> _Services:
     if _services is None:
-        raise HTTPException(503, "Les planifications ne sont pas encore initialisees.")
+        raise HTTPException(
+            503,
+            _services_error or "Les planifications ne sont pas encore initialisees.",
+        )
     return _services
 
 

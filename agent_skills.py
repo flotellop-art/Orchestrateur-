@@ -13,6 +13,7 @@ pas activer deux versions portant le même nom.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import os
 import re
@@ -148,9 +149,37 @@ _SAFE_ACTOR_RE = re.compile(
 _SAFE_TAG_RE = re.compile(
     r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?\Z", re.ASCII
 )
-_RAW_HTML_RE = re.compile(r"<\s*/?\s*[A-Za-z][^>\r\n]*>", re.IGNORECASE)
+_ANGLE_BLOCK_RE = re.compile(r"<[^>]*>")
+_SAFE_AUTOLINK_RE = re.compile(
+    r"<(?:https?://[^\s<>]+|[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
+    r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+)>",
+    re.IGNORECASE,
+)
+_SAFE_PLACEHOLDER_RE = re.compile(
+    r"<[A-Za-z][A-Za-z0-9]{0,31}(?:[_.][A-Za-z0-9]{1,32}){1,3}>"
+)
+_HTML_LIKE_RE = re.compile(r"</?[A-Za-z][^>]*>", re.IGNORECASE)
+_UNTERMINATED_HTML_RE = re.compile(
+    r"</?[A-Za-z][^<>\r\n]*(?=\r?$|\Z)", re.IGNORECASE | re.MULTILINE
+)
+_RAW_DECLARATION_START_RE = re.compile(
+    r"<(?:!--|\?|!\[CDATA\[|![A-Z])", re.IGNORECASE
+)
 _UNSAFE_URI_RE = re.compile(
     r"(?:\]\s*\(|<)\s*(?:javascript|vbscript|data|file)\s*:", re.IGNORECASE
+)
+_UNSAFE_REFERENCE_URI_RE = re.compile(
+    r"^[ \t]*\[(?:\\[^\r\n]|[^\\\]\r\n])+\]:[ \t]*"
+    r"(?:\r?\n[ \t]*)?"
+    r"(?:<[ \t]*)?(?:javascript|vbscript|data|file)[ \t]*:",
+    re.IGNORECASE | re.MULTILINE,
+)
+_COMMONMARK_BACKSLASH_ESCAPE_RE = re.compile(
+    r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])"
+)
+_COMMONMARK_CONTAINER_PREFIX_RE = re.compile(
+    r"^[ \t]{0,3}(?:>[ \t]?|(?:[-+*]|[0-9]{1,9}[.)])[ \t]+)"
 )
 _WORD_RE = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
 _WINDOWS_RESERVED = {
@@ -261,6 +290,45 @@ def _has_forbidden_control(value: str) -> bool:
     return False
 
 
+def _contains_raw_html(value: str) -> bool:
+    """Distinguish HTML from safe Markdown angle-bracket notation."""
+    # Les parseurs HTML corrigent souvent une balise privée de son ``>``.
+    # Exiger l'absence de blanc juste après ``<`` préserve le texte comparatif
+    # légitime (« a < b ») tout en fermant ``<script`` et ``<img src=...``.
+    if (
+        _UNTERMINATED_HTML_RE.search(value)
+        or _RAW_DECLARATION_START_RE.search(value)
+    ):
+        return True
+    for match in _ANGLE_BLOCK_RE.finditer(value):
+        candidate = match.group(0)
+        if _SAFE_AUTOLINK_RE.fullmatch(candidate):
+            continue
+        # Les placeholders documentaires utilisent volontairement ``_`` ou
+        # ``.``. Un nom simple ou contenant ``-`` serait un vrai élément HTML,
+        # y compris un ancien tag (<plaintext>) ou un custom element.
+        if _SAFE_PLACEHOLDER_RE.fullmatch(candidate):
+            continue
+        if candidate.lstrip().startswith(("<!", "<?")):
+            return True
+        if _HTML_LIKE_RE.fullmatch(candidate):
+            return True
+    return False
+
+
+def _security_normal_form(value: str) -> str:
+    """Décode les entités avant d'inspecter balises et schémas actifs."""
+
+    decoded = value
+    # Plusieurs passes couvrent aussi ``&amp;colon;`` sans boucle non bornée.
+    for _ in range(4):
+        expanded = html.unescape(decoded)
+        if expanded == decoded:
+            break
+        decoded = expanded
+    return unicodedata.normalize("NFKC", decoded)
+
+
 def _validate_document(
     value: object,
     label: str,
@@ -279,11 +347,33 @@ def _validate_document(
         raise SkillValidationError(f"{label} est trop long.")
     if single_line and ("\n" in value or "\t" in value):
         raise SkillValidationError(f"{label} doit tenir sur une seule ligne.")
-    if _has_forbidden_control(value):
+    security_value = _security_normal_form(value)
+    markdown_value = _COMMONMARK_BACKSLASH_ESCAPE_RE.sub(r"\1", security_value)
+    exposed_lines = []
+    for line in markdown_value.splitlines():
+        exposed = line
+        # Les définitions de liens restent actives dans les citations et les
+        # listes CommonMark. Retirer seulement leurs marqueurs structurels les
+        # expose au même contrôle que les définitions de premier niveau.
+        while True:
+            stripped = _COMMONMARK_CONTAINER_PREFIX_RE.sub("", exposed, count=1)
+            if stripped == exposed:
+                break
+            exposed = stripped
+        exposed_lines.append(exposed)
+    exposed_markdown = "\n".join(exposed_lines)
+    if _has_forbidden_control(value) or _has_forbidden_control(security_value):
         raise SkillValidationError(f"{label} contient des caractères de contrôle interdits.")
+    if single_line and ("\n" in security_value or "\t" in security_value):
+        raise SkillValidationError(f"{label} doit tenir sur une seule ligne.")
     # Le stockage ne rend pas le Markdown. Refuser le HTML brut et les schémas
     # actifs empêche aussi une future interface de les rendre par erreur.
-    if _RAW_HTML_RE.search(value) or _UNSAFE_URI_RE.search(value):
+    if (
+        _contains_raw_html(security_value)
+        or _UNSAFE_URI_RE.search(markdown_value)
+        or _UNSAFE_REFERENCE_URI_RE.search(markdown_value)
+        or _UNSAFE_REFERENCE_URI_RE.search(exposed_markdown)
+    ):
         raise SkillValidationError(
             f"{label} doit rester documentaire : HTML brut et URI actives sont interdits."
         )

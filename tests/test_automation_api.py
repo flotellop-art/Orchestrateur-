@@ -253,12 +253,27 @@ class AutomationApiTests(unittest.TestCase):
 
     def test_routes_fail_cleanly_before_configuration(self):
         previous = automation_api._services
+        previous_error = automation_api._services_error
         automation_api._services = None
+        automation_api._services_error = None
         try:
             response = self.client.get("/api/automations")
             self.assertEqual(response.status_code, 503)
         finally:
             automation_api._services = previous
+            automation_api._services_error = previous_error
+
+    def test_disable_exposes_the_runtime_failure_and_configure_recovers(self):
+        automation_api.disable(
+            "Le planificateur n'a pas pu redemarrer. Redemarrez Orchestrateur."
+        )
+        unavailable = self.client.get("/api/automations")
+        self.assertEqual(unavailable.status_code, 503)
+        self.assertIn("Redemarrez Orchestrateur", unavailable.json()["detail"])
+
+        configure(self.store, self.queue, self.gateway)
+        available = self.client.get("/api/automations")
+        self.assertEqual(available.status_code, 200)
 
 
 if __name__ == "__main__":

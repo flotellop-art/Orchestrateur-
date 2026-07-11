@@ -58,7 +58,8 @@ def _positive_env_int(name: str, default: int) -> int:
 # The UI shell remains readable. Sensitive operations all live outside these
 # paths and are protected by local-only mode or the configured API key.
 PUBLIC_PATHS: set[str] = {
-    "/", "/control", "/workspace", "/sw.js",
+    "/", "/control", "/workspace", "/chat", "/memory", "/skills", "/automations",
+    "/sw.js",
     "/favicon.ico", "/manifest.webmanifest", "/static/manifest.webmanifest",
     "/health", "/api/health", "/api/runtime/prepare-shutdown",
 }
@@ -72,6 +73,19 @@ MIN_API_SECRET_LENGTH = 24
 # LRU of fixed-size, expiring deques. The peer IP comes from the socket, never
 # from a caller-controlled X-Forwarded-For header.
 _rate_counters: OrderedDict[str, deque[float]] = OrderedDict()
+
+_HTML_SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
+    (
+        "Content-Security-Policy",
+        "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+        "form-action 'self'",
+    ),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+)
 
 
 def _client_ip(request: Request) -> str:
@@ -115,6 +129,23 @@ def _is_public(path: str) -> bool:
 def _json_error(status: int, detail: str, **headers: str) -> JSONResponse:
     response_headers = {"Cache-Control": "no-store", **headers}
     return JSONResponse(status_code=status, content={"detail": detail}, headers=response_headers)
+
+
+def _secure_html_response(response: Response) -> Response:
+    """Apply the common browser boundary without weakening route-specific policy."""
+    media_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+    if media_type != "text/html":
+        return response
+
+    cache_control = response.headers.get("cache-control", "")
+    if "no-store" not in {part.strip().lower() for part in cache_control.split(",")}:
+        response.headers["Cache-Control"] = (
+            f"{cache_control}, no-store" if cache_control else "no-store"
+        )
+    for header, value in _HTML_SECURITY_HEADERS:
+        if header not in response.headers:
+            response.headers[header] = value
+    return response
 
 
 def _browser_mutation_allowed(request: Request, host: str | None) -> bool:
@@ -165,33 +196,49 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
 
         path = request.url.path
         if _is_public(path):
-            return await call_next(request)
+            return _secure_html_response(await call_next(request))
 
         peer_ip = _client_ip(request)
         if not self._api_secret:
             if is_unproxied_local_request(peer_ip, request.headers):
-                return await call_next(request)
+                return _secure_html_response(await call_next(request))
             log.warning("[AUTH] acces distant refuse sans cle peer=%s path=%s", peer_ip, path)
             return _json_error(
                 403,
                 "Acces distant refuse : configurez API_SECRET_KEY.",
             )
 
-        if not _rate_ok(peer_ip):
-            log.warning("[AUTH] rate-limit peer=%s path=%s", peer_ip, path)
+        token = _extract_token(request)
+        if token is None:
+            if not _rate_ok("invalid:" + peer_ip):
+                log.warning("[AUTH] rate-limit invalide peer=%s path=%s", peer_ip, path)
+                return _json_error(
+                    429,
+                    "Too Many Requests",
+                    **{"Retry-After": str(RATE_LIMIT_WINDOW)},
+                )
+            return _json_error(401, "Cle API requise (X-API-Key ou Bearer).")
+        if not hmac.compare_digest(token, self._api_secret):
+            if not _rate_ok("invalid:" + peer_ip):
+                log.warning("[AUTH] rate-limit invalide peer=%s path=%s", peer_ip, path)
+                return _json_error(
+                    429,
+                    "Too Many Requests",
+                    **{"Retry-After": str(RATE_LIMIT_WINDOW)},
+                )
+            log.warning("[AUTH] cle invalide peer=%s path=%s", peer_ip, path)
+            return _json_error(403, "Cle API invalide.")
+        # Les essais sans cle ou avec une mauvaise cle ont leur propre quota.
+        # Un client derriere le meme tunnel ne peut donc pas bloquer les appels
+        # authentifies en saturant d'abord le compteur de l'adresse du proxy.
+        if not _rate_ok("authenticated:" + peer_ip):
+            log.warning("[AUTH] rate-limit authentifie peer=%s path=%s", peer_ip, path)
             return _json_error(
                 429,
                 "Too Many Requests",
                 **{"Retry-After": str(RATE_LIMIT_WINDOW)},
             )
-
-        token = _extract_token(request)
-        if token is None:
-            return _json_error(401, "Cle API requise (X-API-Key ou Bearer).")
-        if not hmac.compare_digest(token, self._api_secret):
-            log.warning("[AUTH] cle invalide peer=%s path=%s", peer_ip, path)
-            return _json_error(403, "Cle API invalide.")
-        return await call_next(request)
+        return _secure_html_response(await call_next(request))
 
 
 def add_auth_middleware(app: FastAPI) -> bool:

@@ -78,41 +78,75 @@ async function startServer(){
   srv=spawn(command,args,{cwd:packagedBackend?path.dirname(packagedBackend):root,env,stdio:['ignore','pipe','pipe'],windowsHide:true});
   srv.stdout.on('data',d=>console.log('[py]',d.toString().trim()));
   srv.stderr.on('data',d=>console.warn('[py!]',d.toString().trim()));
+  srv.on('error',error=>console.error('[srv] child process error',error.message));
   srv.on('close',code=>{srv=null;if(!quitting)dialog.showErrorBox('Serveur arrete','Code: '+code);});
-  return new Promise(res=>{
-    const t=Date.now();
-    const iv=setInterval(async()=>{
-      if(await checkServer()){clearInterval(iv);console.log('[srv] ready');res(true);}
-      else if(Date.now()-t>30000){clearInterval(iv);console.error('[srv] timeout');stopServer();res(false);}
-    },500);
-  });
+  const child=srv;
+  const deadline=Date.now()+30000;
+  while(Date.now()<deadline){
+    if(await checkServer()){
+      console.log('[srv] ready');
+      return true;
+    }
+    if(srv!==child||child.exitCode!==null)return false;
+    await new Promise(resolve=>setTimeout(resolve,500));
+  }
+  console.error('[srv] timeout');
+  const stopped=await stopServer({force:true});
+  if(!stopped)console.error('[srv] backend still active after forced stop');
+  return false;
 }
 
 function prepareBackendShutdown(){
   return new Promise(resolve=>{
-    if(!BASE){resolve();return;}
+    if(!BASE){resolve(true);return;}
     const req=http.request(BASE+'/api/runtime/prepare-shutdown',{
       method:'POST',headers:{'X-Orchestrator-Instance':INSTANCE_TOKEN}
-    },resp=>{resp.resume();resp.on('end',resolve);});
-    req.on('error',resolve);
-    req.setTimeout(12000,()=>{req.destroy();resolve();});
+    },resp=>{const ok=resp.statusCode>=200&&resp.statusCode<300;resp.resume();resp.on('end',()=>resolve(ok));});
+    req.on('error',()=>resolve(false));
+    req.setTimeout(12000,()=>{req.destroy();resolve(false);});
     req.end();
   });
 }
 
-function stopServer(){
+function waitForChildClose(child,timeoutMs){
+  return new Promise(resolve=>{
+    if(child.exitCode!==null){resolve(true);return;}
+    let settled=false;
+    const finish=value=>{
+      if(settled)return;
+      settled=true;
+      clearTimeout(timer);
+      child.removeListener('close',onClose);
+      resolve(value);
+    };
+    const onClose=()=>finish(true);
+    const timer=setTimeout(()=>finish(child.exitCode!==null),timeoutMs);
+    child.once('close',onClose);
+  });
+}
+
+function stopServer(options){
   if(stopPromise)return stopPromise;
   const child=srv;
-  if(!child)return Promise.resolve();
+  if(!child)return Promise.resolve(true);
+  const force=Boolean(options&&options.force);
   stopPromise=(async()=>{
-    await prepareBackendShutdown();
-    if(child.exitCode===null&&!child.killed)child.kill('SIGTERM');
-    await new Promise(resolve=>{
-      if(child.exitCode!==null){resolve();return;}
-      const timer=setTimeout(()=>{if(child.exitCode===null)child.kill();resolve();},5000);
-      child.once('close',()=>{clearTimeout(timer);resolve();});
-    });
+    const prepared=await prepareBackendShutdown();
+    if(!prepared&&!force){stopPromise=null;return false;}
+    if(child.exitCode===null){
+      try{child.kill('SIGTERM');}catch(e){console.warn('[srv] SIGTERM failed',e.message);}
+    }
+    let closed=await waitForChildClose(child,5000);
+    if(!closed&&child.exitCode===null){
+      try{child.kill();}catch(e){console.warn('[srv] forced stop failed',e.message);}
+      closed=await waitForChildClose(child,3000);
+    }
+    if(!closed&&child.exitCode===null){
+      stopPromise=null;
+      return false;
+    }
     if(srv===child)srv=null;
+    return true;
   })();
   return stopPromise;
 }
@@ -170,7 +204,12 @@ function show(){if(win){win.show();win.focus();if(win.isMinimized())win.restore(
 async function quit(){
   if(quitting)return;
   quitting=true;
-  await stopServer();
+  const stopped=await stopServer();
+  if(!stopped){
+    quitting=false;
+    dialog.showErrorBox('Fermeture suspendue','Des conteneurs sont encore actifs. Vérifiez Docker puis réessayez.');
+    return;
+  }
   app.quit();
 }
 
@@ -217,10 +256,17 @@ app.whenReady().then(async()=>{
   createSplash();
   const ok=await startServer();
   if(!ok){
-    if(splash&&!splash.isDestroyed())splash.close();
-    const c=dialog.showMessageBoxSync({type:'error',title:'Erreur',message:'Impossible de demarrer le serveur local.',detail:'Moteur: '+(backendPath()||pyPath())+'\nDonnees: '+app.getPath('userData'),buttons:['Reessayer','Quitter']});
-    if(c===0){relaunching=true;app.relaunch();}
-    app.quit();return;
+    while(true){
+      const c=dialog.showMessageBoxSync({type:'error',title:'Erreur',message:'Impossible de demarrer le serveur local.',detail:'Moteur: '+(backendPath()||pyPath())+'\nDonnees: '+app.getPath('userData'),buttons:['Reessayer','Quitter']});
+      const stopped=!srv||await stopServer({force:true});
+      if(!stopped){
+        dialog.showErrorBox('Fermeture suspendue','Le serveur local reste actif. Fermez-le depuis le gestionnaire des taches, puis reessayez.');
+        continue;
+      }
+      if(splash&&!splash.isDestroyed())splash.close();
+      if(c===0){relaunching=true;app.relaunch();}
+      app.quit();return;
+    }
   }
   createWin();
   createTray();
@@ -230,8 +276,14 @@ app.on('activate',()=>{if(BrowserWindow.getAllWindows().length===0)createWin();e
 app.on('before-quit',event=>{
   if(!relaunching&&srv){
     event.preventDefault();
-    if(!quitting)quitting=true;
-    stopServer().finally(()=>app.quit());
+    if(!quitting){
+      quitting=true;
+      stopServer().then(stopped=>{
+        if(stopped){app.quit();return;}
+        quitting=false;
+        dialog.showErrorBox('Fermeture suspendue','Des conteneurs sont encore actifs. Vérifiez Docker puis réessayez.');
+      });
+    }
   }else{
     quitting=true;
   }

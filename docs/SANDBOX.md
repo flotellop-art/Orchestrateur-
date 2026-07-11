@@ -38,7 +38,8 @@ seul le code du projet est exécuté dans Docker.
 
 - image présente localement, jamais téléchargée à la demande d'un agent
   (`--pull=never`) ;
-- conteneurs Linux et Docker 20.10 minimum ;
+- conteneurs Linux et Docker 23.0 minimum (requis notamment pour le profil
+  `seccomp=builtin`) ;
 - utilisateur numérique non administrateur ;
 - seul le dossier de la tâche est monté en lecture/écriture dans `/workspace` ;
 - racine du conteneur en lecture seule ;

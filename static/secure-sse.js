@@ -20,13 +20,33 @@
     return {type: eventName, data: data.join('\n'), lastEventId: lastEventId, retry: retry};
   }
 
-  function storedApiKey() {
-    try { return global.localStorage.getItem('ORCH_API_KEY') || ''; }
+  function sessionApiKey() {
+    try { return global.sessionStorage.getItem('ORCH_API_KEY') || ''; }
     catch (_) { return ''; }
   }
 
+  function requireSameOrigin(url) {
+    var value = String(url || '');
+    var location = global.location;
+    if (location && location.href) {
+      var base = new URL(location.href);
+      var resolved = new URL(value, base);
+      if (resolved.origin !== base.origin) {
+        throw new TypeError('SecureEventSource refuse une URL d\'une autre origine.');
+      }
+      return;
+    }
+    // En environnement sans ``location`` (tests/worker), aucune URL absolue
+    // ne peut être prouvée comme appartenant à l'origine courante.
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(value)) {
+      throw new TypeError('SecureEventSource exige une URL relative.');
+    }
+  }
+
   function SecureEventSource(url, options) {
-    this.url = String(url);
+    var urlText = String(url);
+    requireSameOrigin(urlText);
+    this.url = urlText;
     this.readyState = SecureEventSource.CONNECTING;
     this.onopen = null;
     this.onmessage = null;
@@ -69,7 +89,7 @@
   SecureEventSource.prototype._currentKey = function () {
     if (typeof this._apiKey === 'function') return String(this._apiKey() || '');
     if (typeof this._apiKey === 'string') return this._apiKey;
-    return storedApiKey();
+    return sessionApiKey();
   };
 
   SecureEventSource.prototype._connect = async function () {
@@ -87,6 +107,7 @@
         headers: headers,
         cache: 'no-store',
         credentials: 'same-origin',
+        redirect: 'error',
         signal: self._controller.signal
       });
       if (!response.ok || !response.body) throw new Error('SSE HTTP ' + response.status);

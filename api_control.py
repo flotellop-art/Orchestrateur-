@@ -989,7 +989,7 @@ async def sse_events(request: Request):
 
     Utilisation JS ::
 
-        const key = localStorage.getItem('ORCH_API_KEY') || '';
+        const key = sessionStorage.getItem('ORCH_API_KEY') || '';
         const response = await fetch('/api/events', {
             headers: {'Accept': 'text/event-stream', 'X-API-Key': key}
         });

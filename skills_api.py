@@ -46,6 +46,7 @@ from agent_skills import (
     reject_skill,
 )
 from app_paths import DATA_ROOT, DB_PATH, STATIC_ROOT
+from auth_middleware import MIN_API_SECRET_LENGTH, get_api_secret
 
 
 log = logging.getLogger(__name__)
@@ -68,16 +69,6 @@ async def _skills_router_lifespan(_app):
 # Le cycle de vie du routeur initialise le schéma lorsqu'il est inclus dans
 # FastAPI. L'intégration ne demande donc qu'un import et include_router().
 router = APIRouter(lifespan=_skills_router_lifespan)
-
-# La coquille HTML ne contient aucune donnée. Comme les autres pages du produit,
-# elle peut donc être publique ; toutes les routes /api restent authentifiées.
-try:
-    from auth_middleware import PUBLIC_PATHS
-
-    PUBLIC_PATHS.add("/skills")
-except ImportError:  # pragma: no cover - permet l'utilisation autonome du routeur
-    pass
-
 
 class SkillDecisionBody(BaseModel):
     """Le client choisit une action, jamais l'identité ou la preuve humaine."""
@@ -136,6 +127,39 @@ def _origin_is_same_host(request: Request) -> bool:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return False
     return hmac.compare_digest(parsed.netloc.casefold(), host.casefold())
+
+
+def _require_review_authorization(request: Request) -> None:
+    """Exige la clé serveur même si ce routeur est monté seul.
+
+    Les métadonnées d'origine et la session à usage unique limitent les erreurs
+    d'interface, mais un programme local peut les forger. La clé configurée est
+    donc obligatoire pour les sessions et décisions, y compris sur loopback.
+    """
+    secret = get_api_secret()
+    if len(secret) < MIN_API_SECRET_LENGTH:
+        raise HTTPException(
+            503,
+            "La revue humaine exige une API_SECRET_KEY forte configurée sur le serveur.",
+            headers={"Cache-Control": "no-store"},
+        )
+    token = request.headers.get("X-API-Key", "").strip()
+    if not token:
+        authorization = request.headers.get("Authorization", "").strip()
+        if authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(
+            401,
+            "Clé API requise pour la revue humaine.",
+            headers={"Cache-Control": "no-store"},
+        )
+    if not hmac.compare_digest(token, secret):
+        raise HTTPException(
+            403,
+            "Clé API invalide.",
+            headers={"Cache-Control": "no-store"},
+        )
 
 
 def _issue_review_session(request: Request) -> tuple[str, str]:
@@ -260,6 +284,7 @@ async def http_get_skill(skill_id: int):
 
 @router.post("/api/skills/review-session")
 async def http_create_review_session(request: Request, response: Response):
+    _require_review_authorization(request)
     session_id, review_token = _issue_review_session(request)
     response.set_cookie(
         REVIEW_COOKIE,
@@ -283,6 +308,7 @@ async def http_decide_skill(
     body: SkillDecisionBody,
     request: Request,
 ):
+    _require_review_authorization(request)
     if skill_id <= 0:
         raise HTTPException(400, "Identifiant de compétence invalide.")
     # Cette preuve est consommée avant toute transition. La couche HTTP est la
