@@ -252,11 +252,22 @@ def resolve_allowed_target_path(
     if not requested.is_absolute():
         raise ValueError("Le chemin du depot local doit etre absolu.")
 
-    # First compare the normalized lexical path. This rejects another drive or
-    # root before resolve(strict=True) can touch an attacker-controlled share.
+    # Comparer d'abord le chemin lexical. Sous Windows, TemporaryDirectory et
+    # certains selecteurs natifs peuvent renvoyer un alias 8.3 (RUNNER~1)
+    # alors que ``resolve`` developpe le nom long. Dans ce seul cas, on accepte
+    # de poursuivre sur le meme volume local ; l'UNC a deja ete refuse et le
+    # controle canonique ci-dessous reste obligatoire.
     lexical = Path(os.path.abspath(os.path.normpath(str(requested))))
-    if not any(lexical == root or root in lexical.parents for root in trusted_roots):
-        raise ValueError("Le depot local est hors des racines autorisees.")
+    lexically_allowed = any(
+        lexical == root or root in lexical.parents for root in trusted_roots
+    )
+    if not lexically_allowed:
+        same_windows_volume = os.name == "nt" and any(
+            lexical.drive.casefold() == root.drive.casefold()
+            for root in trusted_roots
+        )
+        if not same_windows_volume:
+            raise ValueError("Le depot local est hors des racines autorisees.")
 
     # Resolve once the lexical boundary passed, then check again to catch a
     # symlink or junction that escapes an allowed root.
@@ -264,7 +275,9 @@ def resolve_allowed_target_path(
     if not resolved.is_dir():
         raise ValueError("Le chemin cible n'est pas un dossier.")
     if not any(resolved == root or root in resolved.parents for root in trusted_roots):
-        raise ValueError("Le depot local sort de la racine via un lien.")
+        raise ValueError(
+            "Le depot local est hors des racines autorisees apres resolution."
+        )
     if not (resolved / ".git").exists():
         raise ValueError("Le dossier cible n'est pas un depot Git.")
     return resolved

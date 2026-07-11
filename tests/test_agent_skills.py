@@ -326,7 +326,10 @@ class AgentSkillsTests(unittest.IsolatedAsyncioTestCase):
 
         active = await self.approve(pending.id)
         path = await export_skill_md(active.id, export_root, db_path=self.db_path)
-        self.assertEqual(path, export_root / "secure-review" / "SKILL.md")
+        self.assertEqual(
+            path.resolve(),
+            (export_root / "secure-review" / "SKILL.md").resolve(),
+        )
         content = path.read_text(encoding="utf-8")
         self.assertIn("name: secure-review", content)
         self.assertIn(f"# {active.name}", content)
