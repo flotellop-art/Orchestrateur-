@@ -60,6 +60,7 @@ class FakeDockerRunner:
         self.remove_missing_fails = False
         self.last_create = None
         self.unsafe_policy = False
+        self.desktop_inspect_format = False
 
     async def run(self, argv, *, timeout=None):
         argv = tuple(argv)
@@ -215,6 +216,14 @@ class FakeDockerRunner:
         entrypoint = create[entrypoint_index + 1]
         command = list(create[entrypoint_index + 3 :])
         memory = bytes_value(value("--memory"))
+        host_mount = {
+            "Type": mount_parts["type"],
+            "Source": mount_parts["source"],
+            "Target": mount_parts["target"],
+            "ReadOnly": False,
+        }
+        if self.desktop_inspect_format:
+            host_mount.pop("ReadOnly")
         payload = {
             "Config": {
                 "User": value("--user"),
@@ -237,7 +246,11 @@ class FakeDockerRunner:
                 "SecurityOpt": values("--security-opt"),
                 "Memory": memory,
                 "MemorySwap": bytes_value(value("--memory-swap")),
-                "MemorySwappiness": int(value("--memory-swappiness")),
+                "MemorySwappiness": (
+                    None
+                    if self.desktop_inspect_format
+                    else int(value("--memory-swappiness"))
+                ),
                 "NanoCpus": int(float(value("--cpus")) * 1_000_000_000),
                 "PidsLimit": int(value("--pids-limit")),
                 "RestartPolicy": {"Name": value("--restart")},
@@ -246,14 +259,7 @@ class FakeDockerRunner:
                 "DeviceRequests": None,
                 "DeviceCgroupRules": None,
                 "Binds": None,
-                "Mounts": [
-                    {
-                        "Type": mount_parts["type"],
-                        "Source": mount_parts["source"],
-                        "Target": mount_parts["target"],
-                        "ReadOnly": False,
-                    }
-                ],
+                "Mounts": [host_mount],
                 "Tmpfs": tmpfs,
                 "Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 1024}],
                 "LogConfig": {
@@ -262,6 +268,14 @@ class FakeDockerRunner:
                 },
                 "PortBindings": ports,
             },
+            "Mounts": [
+                {
+                    "Type": mount_parts["type"],
+                    "Source": mount_parts["source"],
+                    "Destination": mount_parts["target"],
+                    "RW": True,
+                }
+            ],
         }
         if self.unsafe_policy:
             payload["HostConfig"]["Privileged"] = True
@@ -320,6 +334,7 @@ class DockerSandboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(create[position + 1], value)
         for flag in ("--read-only", "--init", "--pull=never"):
             self.assertIn(flag, create)
+        self.assertIn("compress=false", create)
         mount = create[create.index("--mount") + 1]
         self.assertEqual(
             mount,
@@ -337,6 +352,37 @@ class DockerSandboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(SandboxExecutionError, "pas démarré"):
             await runtime.run_command(
                 "false-start", self.workspace, ("python", "script.py")
+            )
+
+        self.assertNotIn(FakeDockerRunner.CONTAINER_ID, self.runner.containers)
+        self.assertTrue(self.runner.docker_calls("rm"))
+
+    async def test_docker_desktop_cgroup_v2_inspect_format_is_accepted(self):
+        self.runner.desktop_inspect_format = True
+        runtime = self.runtime()
+
+        result = await runtime.run_command(
+            "desktop-cgroup-v2", self.workspace, ("python", "script.py")
+        )
+
+        self.assertTrue(result.ok)
+        self.assertNotIn(FakeDockerRunner.CONTAINER_ID, self.runner.containers)
+
+    async def test_docker_desktop_still_rejects_a_read_only_project_mount(self):
+        self.runner.desktop_inspect_format = True
+        original_payload = self.runner._policy_payload
+
+        def read_only_payload():
+            payload = original_payload()
+            payload["Mounts"][0]["RW"] = False
+            return payload
+
+        runtime = self.runtime()
+        with patch.object(
+            self.runner, "_policy_payload", side_effect=read_only_payload
+        ), self.assertRaisesRegex(SandboxExecutionError, "lecture/écriture"):
+            await runtime.run_command(
+                "desktop-read-only", self.workspace, ("python", "script.py")
             )
 
         self.assertNotIn(FakeDockerRunner.CONTAINER_ID, self.runner.containers)

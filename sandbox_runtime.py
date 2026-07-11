@@ -1178,6 +1178,8 @@ class DockerSandboxRuntime:
             "max-size=1m",
             "--log-opt",
             "max-file=1",
+            "--log-opt",
+            "compress=false",
             "--restart",
             "no",
             "--stop-timeout",
@@ -1369,7 +1371,11 @@ class DockerSandboxRuntime:
             errors.append("limite mémoire non confirmée")
         if host.get("MemorySwap") != expected_memory:
             errors.append("limite mémoire et swap non confirmée")
-        if host.get("MemorySwappiness") != 0:
+        # Sous cgroup v2 (Docker Desktop/WSL2), Docker confirme
+        # ``--memory-swap == --memory`` mais sérialise swappiness à null. Cette
+        # combinaison interdit tout swap supplémentaire et équivaut donc au 0
+        # explicite rapporté par les moteurs cgroup v1.
+        if host.get("MemorySwappiness") not in (None, 0):
             errors.append("swap anonyme non désactivé")
         if host.get("NanoCpus") != int(self.config.cpus * 1_000_000_000):
             errors.append("limite CPU non confirmée")
@@ -1393,10 +1399,26 @@ class DockerSandboxRuntime:
             target = mount.get("Target", mount.get("Destination"))
             if mount.get("Type") != "bind" or target != "/workspace":
                 errors.append("montage du projet invalide")
-            if mount.get("ReadOnly") is not False:
-                errors.append("projet non monté en lecture/écriture")
             if not self._mount_source_matches(mount.get("Source"), workspace):
                 errors.append("source du projet monté inattendue")
+            actual_mounts = data.get("Mounts")
+            if actual_mounts:
+                matching = [
+                    item
+                    for item in actual_mounts
+                    if isinstance(item, dict)
+                    and item.get("Type") == "bind"
+                    and item.get("Destination", item.get("Target")) == "/workspace"
+                    and self._mount_source_matches(item.get("Source"), workspace)
+                ]
+                if (
+                    len(actual_mounts) != 1
+                    or len(matching) != 1
+                    or matching[0].get("RW") is not True
+                ):
+                    errors.append("projet non monté en lecture/écriture")
+            elif mount.get("ReadOnly") is not False:
+                errors.append("projet non monté en lecture/écriture")
 
         tmpfs = host.get("Tmpfs") or {}
         if set(tmpfs) != {"/tmp", "/home/sandbox"}:
@@ -1419,7 +1441,11 @@ class DockerSandboxRuntime:
         log_options = log_config.get("Config") or {}
         if log_config.get("Type") != "local":
             errors.append("journal borné non activé")
-        if log_options.get("max-size") != "1m" or log_options.get("max-file") != "1":
+        if (
+            log_options.get("max-size") != "1m"
+            or log_options.get("max-file") != "1"
+            or log_options.get("compress") != "false"
+        ):
             errors.append("taille du journal non bornée")
 
         actual_bindings = host.get("PortBindings") or {}
