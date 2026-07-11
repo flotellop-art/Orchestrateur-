@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Memoire — Notes utilisateur</title>
+<script src="/static/session-auth.js"></script>
 <style>
   :root {
     --bg: #f8f9fa; --white: #fff; --dark: #1a1a2e; --orange: #e8825a;
@@ -67,8 +68,10 @@
 <body>
 
 <header>
-  <h1>Memoire <span>Arty</span></h1>
+  <h1>Mémoire <span>Orchestrateur</span></h1>
   <div>
+    <a href="/automations" style="color:#aaa;margin-right:14px">Programmations</a>
+    <a href="/skills" style="color:#aaa;margin-right:14px">Comp&eacute;tences</a>
     <a href="/workspace" style="color:#aaa;margin-right:14px">&larr; Espace agents</a>
     <span class="status" id="status">verification...</span>
   </div>
@@ -105,7 +108,7 @@ function toast(msg, err) {
   t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), 2400);
 }
-function key() { try { return localStorage.getItem('ORCH_API_KEY')||''; } catch(e) { return ''; } }
+function key() { try { return sessionStorage.getItem('ORCH_API_KEY')||''; } catch(e) { return ''; } }
 async function api(path, opts) {
   opts = opts || {};
   const k = key();

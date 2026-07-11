@@ -1,68 +1,71 @@
-# Multi-Agent Orchestrator - Application Desktop
+# Application desktop Orchestrateur
 
-Application desktop construite avec Electron qui encapsule le serveur FastAPI Python.
+Ce dossier contient l'enveloppe Electron de l'application. En développement,
+elle lance `orchestrator.py` avec le Python du dépôt. Dans un paquet installé,
+elle lance le serveur autonome placé dans `resources/backend/`.
 
-## Structure
+## Développement Windows
 
-```
-claude-managed-agents/
-├── electron-app/          # Wrapper Electron
-│   ├── main.js            # Process principal Electron
-│   ├── preload.js         # Bridge securise renderer/main
-│   ├── package.json       # Dependances Node.js
-│   └── assets/            # Icones
-│       └── icon.svg       # Icone source
-├── orchestrator.py        # Serveur FastAPI
-├── chat_agent.py          # Agent de chat
-├── run.py                 # Point d entree serveur
-├── install_desktop.bat    # Installation
-├── start_desktop.bat      # Lancement en dev
-└── build_desktop.bat      # Build executable
+Prérequis : Python 3.12 et Node.js 24. Depuis la racine du dépôt :
+
+```powershell
+python -m pip install --require-hashes -r requirements-lock.txt
+cd electron-app
+npm ci
+npm start
 ```
 
-## Installation rapide (Windows)
+Le script `start_desktop.bat`, à la racine, effectue seulement le lancement. Il
+ne ferme aucun autre processus Electron et ne tue aucun programme attaché à un
+port.
 
-### 1. Prerequis
-- Node.js >= 18 (https://nodejs.org)
-- Python >= 3.9 avec les dependances (requirements_orchestrator.txt)
+## Construction
 
-### 2. Installer et lancer
-```bat
-install_desktop.bat    # Installe les dependances npm
-start_desktop.bat      # Lance l app en mode developpement
+Depuis la racine du dépôt :
+
+```powershell
+.\build_desktop.bat
 ```
 
-### 3. Build executable .exe
-```bat
-build_desktop.bat      # Cree un .exe dans electron-app/dist/
-```
+Les sorties se trouvent dans `electron-app/dist/` :
 
-## Fonctionnement
+- `Multi-Agent Orchestrator Setup <version>.exe` : installateur NSIS ;
+- `Multi-Agent Orchestrator <version>.exe` : version portable.
 
-Au demarrage, Electron:
-1. Affiche un splash screen
-2. Cherche si le serveur Python tourne deja (port 8001)
-3. Si non: lance automatiquement `python run.py`
-4. Attend que le serveur soit pret (max 30s)
-5. Ouvre la fenetre principale sur http://localhost:8001
+Le serveur Python, la licence, le numéro de version et les fichiers nécessaires
+à la construction du bac à sable sont ajoutés avec `extraResources`. Docker et
+l'image Docker déjà construite ne sont pas inclus.
 
-## Icone
+## Démarrage et données
 
-L icone SVG est dans `electron-app/assets/icon.svg`.
-Pour la production, convertissez-la:
-- Windows: icon.ico (256x256)
-- macOS: icon.icns
-- Linux: icon.png (512x512)
+Electron :
 
-Outil en ligne: https://convertio.co/svg-ico/
+1. choisit un port libre sur `127.0.0.1` ;
+2. crée un jeton d'instance aléatoire ;
+3. lance le serveur avec son propre dossier de données utilisateur ;
+4. attend une réponse `/health` qui correspond à la version et au jeton ;
+5. ouvre ensuite la fenêtre principale.
 
-## Raccourcis clavier
+La base, les projets et le fichier `.env` de l'application installée restent
+dans le dossier `userData` d'Electron, jamais dans les ressources immuables.
+
+## Sécurité de la fenêtre
+
+La fenêtre utilise l'isolation de contexte, le bac à sable Electron et une
+politique de navigation limitée à l'origine locale choisie au démarrage. Les
+liens externes sont ouverts séparément et les fonctions système exposées à la
+page sont réduites au strict nécessaire.
+
+## Raccourcis
 
 | Raccourci | Action |
-|-----------|--------|
-| Ctrl+1 | Tableau de bord |
-| Ctrl+2 | Chat |
-| Ctrl+R | Recharger |
-| Ctrl+Q | Quitter |
-| F12 | DevTools |
-| F11 | Plein ecran |
+| --- | --- |
+| `Ctrl+1` | tableau de bord |
+| `Ctrl+2` | chat |
+| `Ctrl+R` | recharger |
+| `Ctrl+Q` | quitter |
+| `F11` | plein écran |
+| `F12` | outils de développement |
+
+Le guide complet de construction et de publication se trouve dans
+[`../docs/PACKAGING.md`](../docs/PACKAGING.md).

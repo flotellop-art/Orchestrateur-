@@ -41,3 +41,5 @@ chat_workspace/
 # Node (electron-app)
 electron-app/node_modules/
 electron-app/dist/
+electron-app/backend/
+build/

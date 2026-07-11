@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <title>Compétences réutilisables — Orchestrator</title>
+  <script src="/static/session-auth.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f6f8;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #667085;
+      --line: #d9dee8;
+      --accent: #d96f45;
+      --accent-dark: #b95531;
+      --green: #1e8652;
+      --red: #bb3d3d;
+      --amber: #a96800;
+      --radius: 14px;
+      --shadow: 0 8px 30px rgba(23, 32, 51, .08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 18px 28px;
+      color: white;
+      background: var(--ink);
+    }
+    header h1 { margin: 0; font-size: 1.12rem; }
+    header h1 span { color: #f49a74; }
+    header a { color: #d4d9e3; text-decoration: none; font-size: .88rem; }
+    header a:hover, header a:focus-visible { color: white; text-decoration: underline; }
+    main { max-width: 1120px; margin: 0 auto; padding: 34px 22px 64px; }
+    .intro {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 24px;
+      margin-bottom: 22px;
+    }
+    .intro h2 { margin: 0 0 8px; font-size: 1.65rem; }
+    .intro p { max-width: 720px; margin: 0; color: var(--muted); line-height: 1.55; }
+    .toolbar { display: flex; align-items: center; gap: 10px; }
+    label { color: var(--muted); font-size: .84rem; font-weight: 650; }
+    select, button {
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: white;
+      color: var(--ink);
+      padding: 9px 12px;
+      font: inherit;
+    }
+    button { cursor: pointer; font-weight: 700; }
+    button:hover:not(:disabled) { border-color: #a9b1c1; background: #f8f9fb; }
+    button:focus-visible, select:focus-visible {
+      outline: 3px solid rgba(217, 111, 69, .25);
+      outline-offset: 2px;
+    }
+    button:disabled { cursor: wait; opacity: .58; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(330px, .82fr); gap: 20px; }
+    .panel {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 17px 19px;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-head h3 { margin: 0; font-size: 1rem; }
+    .count { color: var(--muted); font-size: .8rem; }
+    #skill-list { padding: 10px; }
+    .skill-card {
+      width: 100%;
+      display: block;
+      margin: 0 0 8px;
+      padding: 14px;
+      border: 1px solid transparent;
+      text-align: left;
+      font-weight: 400;
+    }
+    .skill-card:last-child { margin-bottom: 0; }
+    .skill-card.selected { border-color: var(--accent); background: #fff8f4; }
+    .card-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .card-name { font-weight: 760; overflow-wrap: anywhere; }
+    .summary { margin: 8px 0; color: #475467; line-height: 1.45; font-size: .9rem; }
+    .meta, .tags { color: var(--muted); font-size: .76rem; overflow-wrap: anywhere; }
+    .badge {
+      flex: none;
+      border-radius: 99px;
+      padding: 4px 8px;
+      font-size: .7rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .03em;
+    }
+    .badge.pending { color: var(--amber); background: #fff3d6; }
+    .badge.active { color: var(--green); background: #dff5e9; }
+    .badge.rejected { color: var(--red); background: #fde7e7; }
+    #detail { padding: 20px; }
+    #detail h3 { margin: 0 0 7px; overflow-wrap: anywhere; }
+    #detail-summary { color: #475467; line-height: 1.5; margin: 12px 0; }
+    .detail-row { margin: 8px 0; color: var(--muted); font-size: .82rem; overflow-wrap: anywhere; }
+    pre {
+      max-height: 430px;
+      overflow: auto;
+      margin: 17px 0;
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #f8f9fb;
+      color: #273249;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: .86rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    .actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 18px; }
+    .approve { border-color: var(--green); background: var(--green); color: white; }
+    .approve:hover:not(:disabled) { background: #176b41; border-color: #176b41; }
+    .reject { border-color: var(--red); color: var(--red); }
+    .notice, .empty {
+      margin: 0;
+      padding: 28px 20px;
+      color: var(--muted);
+      text-align: center;
+      line-height: 1.5;
+    }
+    .human-note {
+      margin-top: 18px;
+      padding: 13px 15px;
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      background: #fff5ef;
+      color: #68402f;
+      font-size: .85rem;
+      line-height: 1.45;
+    }
+    #toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      max-width: 420px;
+      padding: 12px 16px;
+      border-radius: 9px;
+      background: var(--ink);
+      color: white;
+      box-shadow: var(--shadow);
+      opacity: 0;
+      transform: translateY(18px);
+      pointer-events: none;
+      transition: .2s ease;
+    }
+    #toast.visible { opacity: 1; transform: translateY(0); }
+    #toast.error { background: var(--red); }
+    [hidden] { display: none !important; }
+    @media (max-width: 800px) {
+      .intro { align-items: stretch; flex-direction: column; }
+      .layout { grid-template-columns: 1fr; }
+      header { padding: 16px 20px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Orchestrator <span>Compétences</span></h1>
+    <a href="/workspace">← Retour à l'espace agents</a>
+  </header>
+
+  <main>
+    <section class="intro" aria-labelledby="page-title">
+      <div>
+        <h2 id="page-title">Méthodes proposées par les agents</h2>
+        <p>
+          Une proposition n'est jamais utilisée automatiquement. Lis son contenu
+          complet, puis active-la ou refuse-la depuis cet écran.
+        </p>
+      </div>
+      <div class="toolbar">
+        <label for="status-filter">Afficher</label>
+        <select id="status-filter">
+          <option value="pending">En attente</option>
+          <option value="active">Actives</option>
+          <option value="rejected">Refusées</option>
+          <option value="">Toutes</option>
+        </select>
+        <button id="refresh" type="button">Actualiser</button>
+      </div>
+    </section>
+
+    <div class="layout">
+      <section class="panel" aria-labelledby="list-title">
+        <div class="panel-head">
+          <h3 id="list-title">Compétences</h3>
+          <span class="count" id="count">0</span>
+        </div>
+        <div id="skill-list" aria-live="polite">
+          <p class="empty">Chargement…</p>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="detail-title">
+        <div class="panel-head">
+          <h3 id="detail-title">Détail</h3>
+        </div>
+        <div id="detail">
+          <p class="notice" id="detail-empty">
+            Choisis une compétence pour lire son contenu complet.
+          </p>
+          <div id="detail-content" hidden>
+            <div class="card-top">
+              <h3 id="detail-name"></h3>
+              <span class="badge" id="detail-status"></span>
+            </div>
+            <p id="detail-summary"></p>
+            <div class="detail-row" id="detail-origin"></div>
+            <div class="detail-row" id="detail-tags"></div>
+            <pre id="detail-instructions"></pre>
+            <div class="detail-row" id="detail-decision"></div>
+            <div class="actions" id="decision-actions" hidden>
+              <button class="approve" id="approve" type="button">Activer et exporter</button>
+              <button class="reject" id="reject" type="button">Refuser</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <p class="human-note">
+      Les boutons de décision utilisent une session de revue courte et à usage
+      unique. Pour prendre une décision, configurez une API_SECRET_KEY forte
+      sur le serveur, puis saisissez-la dans Réglages sur la page Contrôle. La
+      clé reste uniquement dans cet onglet et disparaît à sa fermeture. Cette
+      capacité n'est pas exposée aux outils des agents.
+    </p>
+  </main>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    'use strict';
+
+    const state = {
+      selectedId: null,
+      selected: null,
+      reviewToken: '',
+      busy: false,
+    };
+
+    const elements = {
+      filter: document.getElementById('status-filter'),
+      refresh: document.getElementById('refresh'),
+      count: document.getElementById('count'),
+      list: document.getElementById('skill-list'),
+      detailEmpty: document.getElementById('detail-empty'),
+      detailContent: document.getElementById('detail-content'),
+      detailName: document.getElementById('detail-name'),
+      detailStatus: document.getElementById('detail-status'),
+      detailSummary: document.getElementById('detail-summary'),
+      detailOrigin: document.getElementById('detail-origin'),
+      detailTags: document.getElementById('detail-tags'),
+      detailInstructions: document.getElementById('detail-instructions'),
+      detailDecision: document.getElementById('detail-decision'),
+      actions: document.getElementById('decision-actions'),
+      approve: document.getElementById('approve'),
+      reject: document.getElementById('reject'),
+      toast: document.getElementById('toast'),
+    };
+
+    function apiKey() {
+      try {
+        return sessionStorage.getItem('ORCH_API_KEY') || '';
+      } catch (_error) {
+        return '';
+      }
+    }
+
+    async function api(path, options = {}) {
+      const url = new URL(path, window.location.origin);
+      if (url.origin !== window.location.origin) {
+        throw new Error('Adresse API refusée.');
+      }
+      const headers = new Headers(options.headers || {});
+      const key = apiKey();
+      if (key) headers.set('X-API-Key', key);
+      const response = await fetch(url, { ...options, headers, credentials: 'same-origin' });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const error = new Error(payload.detail || `Erreur HTTP ${response.status}`);
+        error.status = response.status;
+        throw error;
+      }
+      return payload;
+    }
+
+    function node(tag, className, text) {
+      const item = document.createElement(tag);
+      if (className) item.className = className;
+      if (text !== undefined) item.textContent = String(text);
+      return item;
+    }
+
+    function statusLabel(status) {
+      return ({ pending: 'En attente', active: 'Active', rejected: 'Refusée' })[status]
+        || status || 'Inconnu';
+    }
+
+    let toastTimer = null;
+    function toast(message, error = false) {
+      window.clearTimeout(toastTimer);
+      elements.toast.textContent = String(message);
+      elements.toast.classList.toggle('error', error);
+      elements.toast.classList.add('visible');
+      toastTimer = window.setTimeout(() => elements.toast.classList.remove('visible'), 3000);
+    }
+
+    function setBusy(value) {
+      state.busy = value;
+      elements.refresh.disabled = value;
+      elements.approve.disabled = value;
+      elements.reject.disabled = value;
+    }
+
+    function renderList(skills) {
+      elements.list.replaceChildren();
+      elements.count.textContent = String(skills.length);
+      if (!skills.length) {
+        elements.list.append(node('p', 'empty', 'Aucune compétence dans cette catégorie.'));
+        return;
+      }
+      for (const skill of skills) {
+        const card = node('button', 'skill-card');
+        card.type = 'button';
+        card.dataset.skillId = String(skill.id);
+        if (skill.id === state.selectedId) card.classList.add('selected');
+
+        const top = node('div', 'card-top');
+        top.append(node('span', 'card-name', skill.name));
+        top.append(node('span', `badge ${skill.status}`, statusLabel(skill.status)));
+        card.append(top);
+        card.append(node('p', 'summary', skill.summary));
+        const tags = Array.isArray(skill.tags) ? skill.tags.join(', ') : '';
+        card.append(node('div', 'tags', tags ? `Tags : ${tags}` : 'Aucun tag'));
+        card.append(node('div', 'meta', `Tâche ${skill.task_id} · ${skill.proposed_by}`));
+        card.addEventListener('click', () => loadDetail(skill.id));
+        elements.list.append(card);
+      }
+    }
+
+    function renderDetail(skill) {
+      state.selected = skill;
+      state.selectedId = skill.id;
+      elements.detailEmpty.hidden = true;
+      elements.detailContent.hidden = false;
+      elements.detailName.textContent = skill.name;
+      elements.detailStatus.textContent = statusLabel(skill.status);
+      elements.detailStatus.className = `badge ${skill.status}`;
+      elements.detailSummary.textContent = skill.summary;
+      elements.detailOrigin.textContent = `Proposée par ${skill.proposed_by} · tâche ${skill.task_id}`;
+      const tags = Array.isArray(skill.tags) ? skill.tags.join(', ') : '';
+      elements.detailTags.textContent = tags ? `Tags : ${tags}` : 'Aucun tag';
+      elements.detailInstructions.textContent = skill.instructions;
+      elements.detailDecision.textContent = skill.decided_by
+        ? `Décision : ${skill.decided_by}${skill.decision_reason ? ` — ${skill.decision_reason}` : ''}`
+        : 'Aucune décision humaine.';
+      elements.actions.hidden = skill.status !== 'pending';
+    }
+
+    async function loadList() {
+      try {
+        const status = elements.filter.value;
+        const query = status ? `?status=${encodeURIComponent(status)}` : '';
+        const result = await api(`/api/skills${query}`);
+        renderList(Array.isArray(result.skills) ? result.skills : []);
+      } catch (error) {
+        elements.list.replaceChildren(node('p', 'empty', error.message));
+        toast(error.message, true);
+      }
+    }
+
+    async function loadDetail(skillId) {
+      try {
+        const result = await api(`/api/skills/${encodeURIComponent(skillId)}`);
+        renderDetail(result.skill);
+        await loadList();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    }
+
+    async function acquireReviewToken() {
+      const result = await api('/api/skills/review-session', {
+        method: 'POST',
+        headers: { 'X-Orchestrator-Human-UI': 'skills-page' },
+      });
+      state.reviewToken = result.review_token || '';
+      if (!state.reviewToken) throw new Error('Session de revue non créée.');
+    }
+
+    async function sendDecision(decision, reason = null, replaceExisting = false) {
+      if (!state.selectedId || state.busy) return;
+      setBusy(true);
+      try {
+        await acquireReviewToken();
+        const body = { decision, replace_existing: replaceExisting };
+        if (reason !== null) body.reason = reason;
+        const result = await api(`/api/skills/${state.selectedId}/decision`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Orchestrator-Human-UI': 'skills-page',
+            'X-Orchestrator-Review-Token': state.reviewToken,
+          },
+          body: JSON.stringify(body),
+        });
+        state.reviewToken = '';
+        renderDetail(result.skill);
+        await loadList();
+        if (decision === 'approve') {
+          toast(result.exported
+            ? `Compétence activée et exportée : ${result.export_name}`
+            : (result.export_error || 'Compétence activée.'));
+        } else {
+          toast('Proposition refusée.');
+        }
+      } catch (error) {
+        state.reviewToken = '';
+        if (decision === 'approve' && error.status === 409 && !replaceExisting) {
+          const replace = window.confirm(
+            'Une version portant ce nom est déjà active. La remplacer ?'
+          );
+          setBusy(false);
+          if (replace) await sendDecision('approve', null, true);
+          return;
+        }
+        toast(error.message, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    elements.refresh.addEventListener('click', loadList);
+    elements.filter.addEventListener('change', loadList);
+    elements.approve.addEventListener('click', async () => {
+      if (!window.confirm('Activer cette compétence après lecture complète ?')) return;
+      await sendDecision('approve');
+    });
+    elements.reject.addEventListener('click', async () => {
+      const reason = window.prompt('Pourquoi refuses-tu cette proposition ?');
+      if (reason === null) return;
+      if (reason.trim().length < 3) {
+        toast('La raison doit contenir au moins 3 caractères.', true);
+        return;
+      }
+      await sendDecision('reject', reason.trim());
+    });
+
+    loadList();
+  </script>
+</body>
+</html>

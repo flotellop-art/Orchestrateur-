@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Espace de travail multi-agents</title>
+<script src="/static/session-auth.js"></script>
 <link rel="manifest" href="/static/manifest.webmanifest">
 <meta name="theme-color" content="#1a1a2e">
 <link rel="icon" href="/static/icon-app.svg" type="image/svg+xml">
@@ -97,6 +98,14 @@ textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
 .msg ul { margin: 6px 0 0 18px; font-size: .85rem; line-height: 1.5; }
 .msg.user { border-left: 4px solid var(--purple); background: #f3effa; }
 .msg.user .who { color: var(--purple); }
+.permission-area { margin-bottom: 12px; }
+.permission-card { background: #fff8e8; border: 2px solid #e6a23c; border-radius: 10px;
+  padding: 13px 14px; margin-bottom: 10px; box-shadow: var(--sh); }
+.permission-title { font-weight: 800; color: #8a4b08; margin-bottom: 5px; }
+.permission-meta { font-size: .82rem; color: var(--grey); line-height: 1.45; }
+.permission-reason { margin-top: 7px; white-space: pre-wrap; word-break: break-word; }
+.permission-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+.permission-actions button:disabled { opacity: .55; cursor: wait; }
 .chat-bar { position: sticky; bottom: 0; display: flex; gap: 7px; background: var(--bg);
   padding: 10px 0; border-top: 1px solid var(--border); margin-top: 10px; }
 .chat-bar input { flex: 1; }
@@ -123,6 +132,7 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 .result-box h4 { color: var(--green); margin-bottom: 6px; }
 .badge { font-size: .72rem; padding: 2px 9px; border-radius: 12px; font-weight: 700; }
 .badge.running { background: #eafaf1; color: var(--green); }
+.badge.queued { background: #eef3ff; color: #3459a6; }
 .badge.paused { background: #fff3e0; color: var(--orange-d); }
 .badge.stopped { background: #f5f5f5; color: var(--grey); }
 .badge.done { background: #eafaf1; color: var(--green); }
@@ -134,6 +144,8 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
 <header>
   <h1>Equipe d'<span>agents</span> autonomes</h1>
   <div style="display:flex;align-items:center;gap:16px">
+    <a href="/automations" style="color:var(--orange);text-decoration:none;font-weight:600;font-size:.82rem">Programmations</a>
+    <a href="/skills" style="color:var(--orange);text-decoration:none;font-weight:600;font-size:.82rem">Comp&eacute;tences</a>
     <span class="turn" id="turn-info"></span> <span class="badge" id="status-badge" style="display:none"></span>
     <span class="turn" id="cost-info" style="display:none"></span>
     <a href="/memory" style="color:var(--orange);text-decoration:none;font-weight:600;font-size:.82rem">Gérer la mémoire →</a>
@@ -172,7 +184,27 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
         <label for="max-cost">Budget max ($, 0 = illimite)</label>
         <input type="number" id="max-cost" value="0" min="0" step="0.5">
       </div>
+      <div>
+        <label for="install-policy">Droit d'installation</label>
+        <select id="install-policy">
+          <option value="blocked">Aucune installation</option>
+          <option value="ask" selected>Demander avant chaque dépendance</option>
+          <option value="project">Dépendances du projet automatiques</option>
+          <option value="user">Projet automatique + applications du compte sur accord</option>
+          <option value="admin">Projet automatique + ordinateur entier sur accord</option>
+        </select>
+      </div>
+      <div>
+        <label for="execution-mode">Exécution du code</label>
+        <select id="execution-mode">
+          <option value="docker" selected>Isolée avec Docker (recommandé)</option>
+          <option value="local">Locale, sans isolation (développement)</option>
+        </select>
+      </div>
     </div>
+    <p class="muted">Le serveur calcule toujours le niveau réel. Chaque modification du compte ou de
+      l'ordinateur demande un nouvel accord. Le mode Docker refuse de démarrer si Docker est absent ;
+      il ne revient jamais silencieusement vers une exécution locale.</p>
 
     <div class="checkbox-row">
       <input type="checkbox" id="web-enabled" checked>
@@ -185,12 +217,12 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
     </div>
     <div id="company-box" style="display:none;margin-top:10px;border-left:3px solid var(--purple);padding-left:12px">
       <label for="target-repo-url">Depot GitHub a auditer (l'app le clone toute seule)</label>
-      <input type="text" id="target-repo-url" placeholder="https://github.com/flotellop-art/Arty">
+      <input type="text" id="target-repo-url" placeholder="https://github.com/organisation/projet">
       <input type="password" id="github-token" placeholder="Token GitHub (uniquement si le depot est prive)"
         style="margin-top:8px" autocomplete="off">
       <p class="muted" style="margin-top:8px">— ou —</p>
       <label for="target-path" style="margin-top:4px">Chemin d'un depot deja clone en local (optionnel)</label>
-      <input type="text" id="target-path" placeholder="C:\\Users\\Tellop\\arty-repo">
+      <input type="text" id="target-path" placeholder="C:\\Users\\vous\\projet">
       <p class="muted">L'entreprise lit le depot en <b>lecture seule</b> et ecrit ses livrables dans un dossier
         <b>delivery/</b> local (elle ne pousse jamais, ne merge pas). Le token sert au clone puis n'est ni
         stocke ni journalise. Limites etendues (jusqu'a 24 agents / 300 tours).</p>
@@ -228,7 +260,6 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
     <div class="controls">
       <button class="btn btn-ghost btn-small" id="btn-pause" onclick="ctrl('pause')">Pause</button>
       <button class="btn btn-ghost btn-small" id="btn-resume" onclick="ctrl('resume')" style="display:none">Reprendre</button>
-      <button class="btn btn-ghost btn-small" id="btn-step" onclick="ctrl('step')">Etape</button>
       <button class="btn btn-primary btn-small" id="btn-restart" onclick="restartTask()" style="display:none">Reprendre la tache</button>
       <button class="btn btn-ghost btn-small" onclick="ctrl('stop')">Arreter</button>
       <button class="btn btn-ghost btn-small" onclick="launchApp()">Lancer l'app</button>
@@ -237,6 +268,7 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
       <button class="btn btn-ghost btn-small" onclick="runBuild()">Build &amp; Test</button>
       <button class="btn btn-ghost btn-small" onclick="newTask()">Nouvel objectif</button>
     </div>
+    <div id="permission-area" class="permission-area" aria-live="assertive"></div>
     <div id="result-area"></div>
     <div id="launch-area"></div>
     <div id="build-area"></div>
@@ -275,33 +307,27 @@ details summary { cursor: pointer; color: var(--grey); font-size: .8rem; }
   </div>
 </div>
 
+<script src="/static/secure-sse.js"></script>
 <script>
-// Si une cle API est definie (page /control -> Reglages, stockee dans localStorage),
+// Si une cle API est definie (page /control -> Reglages, gardee pour cet onglet),
 // on l'attache automatiquement a toutes les requetes. Transparent si aucune cle.
 (function () {
-  function key() { try { return localStorage.getItem('ORCH_API_KEY') || ''; } catch (e) { return ''; } }
+  function key() { try { return sessionStorage.getItem('ORCH_API_KEY') || ''; } catch (e) { return ''; } }
   var _fetch = window.fetch.bind(window);
   window.fetch = function (input, init) {
     var k = key();
     if (k) {
       init = init || {};
       var h = new Headers(init.headers || (input && input.headers) || {});
-      if (!h.has('X-API-Key')) h.set('X-API-Key', k);
+      var rawUrl = input && input.url ? input.url : input;
+      var requestUrl = new URL(rawUrl, window.location.href);
+      if (requestUrl.origin === window.location.origin && !h.has('X-API-Key')) {
+        h.set('X-API-Key', k);
+      }
       init.headers = h;
     }
     return _fetch(input, init);
   };
-  var _ES = window.EventSource;
-  if (_ES) {
-    window.EventSource = function (url, cfg) {
-      var k = key();
-      if (k && typeof url === 'string' && url.indexOf('api_key=') < 0) {
-        url += (url.indexOf('?') < 0 ? '?' : '&') + 'api_key=' + encodeURIComponent(k);
-      }
-      return new _ES(url, cfg);
-    };
-    window.EventSource.prototype = _ES.prototype;
-  }
 })();
 // Enregistre le service worker (rend l'app installable en PWA, et garde l'UI hors-ligne).
 if ('serviceWorker' in navigator) {
@@ -311,12 +337,18 @@ if ('serviceWorker' in navigator) {
 }
 var taskId = null;
 var evtSource = null;
+var evtReconnectTimer = null;
 var seedCount = 0;
 var teamNames = {};
 var designImageData = null;   // data URL de la maquette (#17)
 var currentFile = null;       // fichier ouvert dans l'editeur (#13)
 var graphAgents = [];         // noms d'agents pour le graphe (#11)
 var activeAgent = null;
+var currentTaskStatus = null;
+var resolvedPermissionIds = {};
+
+function activeTaskStorageKey() { return 'ORCH_ACTIVE_TASK_ID'; }
+function eventCursorStorageKey(id) { return 'ORCH_TASK_' + String(id) + '_LAST_EVENT'; }
 
 // ── Mode Entreprise Tech ────────────────────────────────────────────────────────
 function toggleCompany() {
@@ -407,6 +439,8 @@ async function launch() {
     max_iterations: parseInt(document.getElementById('max-iter').value) || 15,
     max_agents: parseInt(document.getElementById('max-agents').value) || 4,
     max_cost_usd: parseFloat(document.getElementById('max-cost').value) || 0,
+    install_policy: document.getElementById('install-policy').value,
+    execution_mode: document.getElementById('execution-mode').value,
     image: designImageData,
     company_mode: company,
     target_path: company ? (targetPath || null) : null,
@@ -422,8 +456,11 @@ async function launch() {
     if (!r.ok) { throw new Error((await r.json()).detail || 'Erreur'); }
     var d = await r.json();
     taskId = d.id;
-    await fetch('/api/tasks/' + taskId + '/start', {method: 'POST'});
-    startLive();
+    try { sessionStorage.setItem(activeTaskStorageKey(), String(taskId)); } catch (_) {}
+    var started = await fetch('/api/tasks/' + taskId + '/start', {method: 'POST'});
+    var startedBody = await started.json().catch(function(){ return {}; });
+    if (!started.ok) { throw new Error(startedBody.detail || 'Demarrage refuse'); }
+    startLive(startedBody.status || 'queued');
   } catch(e) {
     errEl.style.color = 'var(--red)';
     errEl.textContent = 'Erreur : ' + e.message;
@@ -432,7 +469,7 @@ async function launch() {
 }
 
 // ── Live ──────────────────────────────────────────────────────────────────────
-function startLive() {
+function startLive(initialStatus) {
   document.getElementById('setup').style.display = 'none';
   document.getElementById('live').classList.add('show');
   document.getElementById('feed').innerHTML = '';
@@ -440,6 +477,7 @@ function startLive() {
   document.getElementById('result-area').innerHTML = '';
   document.getElementById('launch-area').innerHTML = '';
   document.getElementById('build-area').innerHTML = '';
+  document.getElementById('permission-area').innerHTML = '';
   document.getElementById('chat-input').value = '';
   document.getElementById('file-edit').style.display = 'none';
   document.getElementById('editor-bar').style.display = 'none';
@@ -447,9 +485,11 @@ function startLive() {
   teamNames = {};
   graphAgents = [];
   activeAgent = null;
+  resolvedPermissionIds = {};
   currentFile = null;
-  setStatus('running');
+  setStatus(initialStatus || 'queued');
   connectStream();
+  loadPendingPermissions();
   refreshFiles();
   showCompanyInfo();
 }
@@ -476,14 +516,29 @@ document.addEventListener('keydown', function(e) {
 });
 
 function connectStream() {
+  if (evtReconnectTimer) { clearTimeout(evtReconnectTimer); evtReconnectTimer = null; }
   if (evtSource) evtSource.close();
-  evtSource = new EventSource('/api/tasks/' + taskId + '/stream');
+  var cursor = '0';
+  try { cursor = sessionStorage.getItem(eventCursorStorageKey(taskId)) || '0'; } catch (_) {}
+  if (!/^\d+$/.test(cursor)) cursor = '0';
+  evtSource = new SecureEventSource('/api/tasks/' + taskId + '/stream?after_id=' + encodeURIComponent(cursor));
   evtSource.onmessage = function(e) {
     var ev;
     try { ev = JSON.parse(e.data); } catch(_) { return; }
+    if (ev.id) {
+      try { sessionStorage.setItem(eventCursorStorageKey(taskId), String(ev.id)); } catch (_) {}
+    }
     handleEvent(ev);
   };
-  evtSource.onerror = function() { /* le navigateur retente automatiquement */ };
+  evtSource.onerror = function() {
+    var failedSource = evtSource;
+    failedSource.close();
+    if (evtReconnectTimer) return;
+    evtReconnectTimer = setTimeout(function() {
+      evtReconnectTimer = null;
+      if (taskId && evtSource === failedSource) connectStream();
+    }, 1000);
+  };
 }
 
 function feedAdd(html) {
@@ -514,6 +569,10 @@ function handleEvent(ev) {
       addTeamCard(ev.name, ev.role, ev.model);
       feedAdd('<div class="msg sys">Nouvel agent : <b>' + esc(ev.name) + '</b> (' + esc(ev.role) + ')</div>');
       break;
+    case 'skill_proposed':
+      feedAdd('<div class="msg sys">Comp&eacute;tence propos&eacute;e : <b>' + esc(ev.name)
+        + '</b>. <a href="/skills">La relire et d&eacute;cider</a>.</div>');
+      break;
     case 'agent_message':
       setActive(ev.agent);
       var cls = ev.kind === 'result' ? 'result' : 'agent';
@@ -528,6 +587,16 @@ function handleEvent(ev) {
     case 'tool_result':
       feedAdd('<div class="msg tool"><details><summary>' + esc(ev.tool)
         + ' : resultat</summary><pre>' + esc(ev.output) + '</pre></details></div>');
+      break;
+    case 'permission_requested':
+      renderPermissionRequest(ev);
+      break;
+    case 'permission_resolved':
+      resolvePermissionRequest(ev.request_id, ev.decision || ev.status || 'resolved');
+      break;
+    case 'installation_result':
+      resolvePermissionRequest(ev.request_id, ev.ok ? 'Installation terminée' : 'Installation échouée');
+      feedAdd('<div class="msg ' + (ev.ok ? 'sys' : 'err') + '">' + esc(ev.message || '') + '</div>');
       break;
     case 'challenge_round':
       feedAdd('<div class="msg turn" style="background:var(--purple)">Challenge &mdash; round '
@@ -557,23 +626,142 @@ function handleEvent(ev) {
     case 'info':
       feedAdd('<div class="msg sys">' + esc(ev.msg) + '</div>');
       break;
+    case 'queued': setStatus('queued'); break;
     case 'paused': setStatus('paused'); break;
-    case 'resumed': setStatus('running'); break;
-    case 'stopped': setStatus('stopped'); break;
+    case 'resumed': setStatus(ev.step ? 'running' : 'queued'); break;
+    case 'stopped':
+      document.getElementById('permission-area').innerHTML = '';
+      setStatus('stopped');
+      break;
     case 'done':
       document.getElementById('result-area').innerHTML =
         '<div class="result-box"><h4>Objectif termine</h4><div>' + esc(ev.summary) + '</div></div>';
       setStatus('done');
+      document.getElementById('permission-area').innerHTML = '';
       break;
     case 'error':
       feedAdd('<div class="msg err">Erreur : ' + esc(ev.msg) + '</div>');
+      document.getElementById('permission-area').innerHTML = '';
       setStatus('failed');
       break;
     case 'end':
       if (evtSource) evtSource.close();
+      document.getElementById('permission-area').innerHTML = '';
       if (ev.status && ev.status !== 'done') setStatus(ev.status);
       break;
   }
+}
+
+function installAccessLabel(level) {
+  return ({project:'Dans ce projet', user:'Pour votre compte', admin:'Ordinateur / administrateur'})[level]
+    || String(level || 'Installation');
+}
+
+function renderPermissionRequest(req) {
+  if (!req || !req.request_id || !taskId) return;
+  if (resolvedPermissionIds[req.request_id]) return;
+  var area = document.getElementById('permission-area');
+  var cardId = 'permission-' + String(req.request_id).replace(/[^A-Za-z0-9_-]/g, '');
+  if (document.getElementById(cardId)) return;
+
+  var card = document.createElement('div');
+  card.className = 'permission-card';
+  card.id = cardId;
+
+  var title = document.createElement('div');
+  title.className = 'permission-title';
+  title.textContent = 'Demande d’installation — ' + installAccessLabel(req.access_level);
+  card.appendChild(title);
+
+  var meta = document.createElement('div');
+  meta.className = 'permission-meta';
+  meta.textContent = String(req.agent || 'Agent') + ' demande ' + String(req.package || '')
+    + ' ' + String(req.version || '') + ' depuis ' + String(req.source || req.manager || 'source officielle')
+    + '. Destination : ' + String(req.destination || 'définie par le serveur') + '.';
+  card.appendChild(meta);
+
+  var reason = document.createElement('div');
+  reason.className = 'permission-reason';
+  reason.textContent = 'Pourquoi l’agent le demande : ' + String(req.reason || 'Aucune raison fournie.');
+  card.appendChild(reason);
+
+  if (req.risk_reason) {
+    var risk = document.createElement('div');
+    risk.className = 'permission-meta';
+    risk.textContent = 'Ce que cela autorise : ' + String(req.risk_reason);
+    card.appendChild(risk);
+  }
+
+  if (req.command_preview) {
+    var details = document.createElement('details');
+    var summary = document.createElement('summary');
+    summary.textContent = 'Détails';
+    var preview = document.createElement('div');
+    preview.className = 'permission-meta';
+    preview.textContent = Array.isArray(req.command_preview)
+      ? req.command_preview.join(' ') : String(req.command_preview);
+    details.appendChild(summary); details.appendChild(preview); card.appendChild(details);
+  }
+
+  var actions = document.createElement('div');
+  actions.className = 'permission-actions';
+  function button(label, decision, primary) {
+    var b = document.createElement('button');
+    b.className = 'btn ' + (primary ? 'btn-primary' : 'btn-ghost') + ' btn-small';
+    b.textContent = label;
+    b.onclick = function() { decidePermission(req.request_id, decision, card); };
+    actions.appendChild(b);
+  }
+  button('Autoriser une fois', 'allow_once', true);
+  button('Refuser', 'deny', false);
+  card.appendChild(actions);
+  area.appendChild(card);
+}
+
+async function decidePermission(requestId, decision, card) {
+  var buttons = card.querySelectorAll('button');
+  buttons.forEach(function(button) { button.disabled = true; });
+  try {
+    var response = await fetch('/api/tasks/' + taskId + '/install-requests/'
+      + encodeURIComponent(requestId) + '/decision', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({decision: decision})
+      });
+    if (!response.ok) {
+      var detail = (await response.json()).detail || 'Décision refusée';
+      if (response.status === 409 || response.status === 410) {
+        resolvePermissionRequest(requestId, detail);
+        await loadPendingPermissions();
+        return;
+      }
+      throw new Error(detail);
+    }
+    resolvePermissionRequest(requestId, decision === 'deny' ? 'Refusée' : 'Autorisée');
+  } catch (error) {
+    buttons.forEach(function(button) { button.disabled = false; });
+    feedAdd('<div class="msg err">Décision impossible : ' + esc(error.message) + '</div>');
+  }
+}
+
+function resolvePermissionRequest(requestId, label) {
+  resolvedPermissionIds[requestId] = true;
+  var cardId = 'permission-' + String(requestId || '').replace(/[^A-Za-z0-9_-]/g, '');
+  var card = document.getElementById(cardId);
+  if (!card) return;
+  card.querySelectorAll('button').forEach(function(button) { button.disabled = true; });
+  var title = card.querySelector('.permission-title');
+  if (title) title.textContent = String(label || 'Demande traitée');
+  setTimeout(function() { if (card.parentNode) card.parentNode.removeChild(card); }, 1800);
+}
+
+async function loadPendingPermissions() {
+  if (!taskId) return;
+  try {
+    var response = await fetch('/api/tasks/' + taskId + '/install-requests?status=pending');
+    if (!response.ok) return;
+    var data = await response.json();
+    (data.requests || []).forEach(renderPermissionRequest);
+  } catch (_) {}
 }
 
 function addTeamCard(name, role, model) {
@@ -591,7 +779,8 @@ function addTeamCard(name, role, model) {
 }
 
 function setStatus(s) {
-  var labels = {running:'En cours', paused:'En pause', stopped:'Arrete', done:'Termine', failed:'Echec'};
+  currentTaskStatus = s;
+  var labels = {queued:'En attente', running:'En cours', paused:'En pause', stopped:'Arrete', done:'Termine', failed:'Echec'};
   var b = document.getElementById('status-badge');
   b.style.display = '';
   b.className = 'badge ' + s;
@@ -605,9 +794,13 @@ function setStatus(s) {
 
 async function ctrl(action) {
   if (!taskId) return;
-  await fetch('/api/tasks/' + taskId + '/' + action, {method: 'POST'});
-  if (action === 'pause') setStatus('paused');
-  if (action === 'resume') setStatus('running');
+  var response = await fetch('/api/tasks/' + taskId + '/' + action, {method: 'POST'});
+  var data = await response.json().catch(function(){ return {}; });
+  if (!response.ok) {
+    feedAdd('<div class="msg err">Action impossible : ' + esc(data.detail || '') + '</div>');
+    return;
+  }
+  setStatus(data.status || (action === 'pause' ? 'paused' : 'queued'));
 }
 
 async function restartTask() {
@@ -635,7 +828,8 @@ async function restartTask() {
   document.getElementById('team-list').innerHTML = '<p class="muted">Reprise...</p>';
   document.getElementById('agent-graph').innerHTML = '';
   teamNames = {}; graphAgents = []; activeAgent = null;
-  setStatus('running');
+  var restartData = await r.json().catch(function(){ return {}; });
+  setStatus(restartData.status || 'queued');
   connectStream();   // re-tail le flux complet (historique + nouveaux messages)
   refreshFiles();
 }
@@ -652,9 +846,15 @@ async function refreshFiles() {
 function renderFiles(files) {
   var el = document.getElementById('file-list');
   if (!files || !files.length) { el.innerHTML = '<p class="muted">Aucun fichier pour l\'instant.</p>'; return; }
-  el.innerHTML = files.map(function(f) {
-    return '<div class="file-item" onclick="viewFile(\'' + esc(f).replace(/'/g, "\\'") + '\')">' + esc(f) + '</div>';
-  }).join('');
+  el.textContent = '';
+  files.forEach(function(f) {
+    var path = String(f);
+    var item = document.createElement('div');
+    item.className = 'file-item';
+    item.textContent = path;
+    item.addEventListener('click', function() { viewFile(path); });
+    el.appendChild(item);
+  });
 }
 
 async function viewFile(path) {
@@ -846,21 +1046,33 @@ async function newTaskFromMessage() {
   if (!t) return;
   inp.value = '';
   var chefSel = document.getElementById('chef-model');
+  if (taskId && (currentTaskStatus === 'running' || currentTaskStatus === 'paused')) {
+    try { await fetch('/api/tasks/' + taskId + '/stop', {method: 'POST'}); } catch (_) {}
+  }
   var body = {
     objective: t, chef_model: chefSel ? chefSel.value : 'claude-opus-4-8',
-    web_enabled: true, max_iterations: 15, max_agents: 4
+    web_enabled: true, max_iterations: 15, max_agents: 4,
+    install_policy: document.getElementById('install-policy').value,
+    execution_mode: document.getElementById('execution-mode').value
   };
   var d = await (await fetch('/api/tasks', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
   })).json();
   taskId = d.id;
+  try { sessionStorage.setItem(activeTaskStorageKey(), String(taskId)); } catch (_) {}
   await fetch('/api/tasks/' + taskId + '/start', {method: 'POST'});
   startLive();
 }
 
-function newTask() {
+async function newTask() {
+  if (taskId && (currentTaskStatus === 'running' || currentTaskStatus === 'paused')) {
+    try { await fetch('/api/tasks/' + taskId + '/stop', {method: 'POST'}); } catch (_) {}
+  }
   if (evtSource) evtSource.close();
+  if (evtReconnectTimer) { clearTimeout(evtReconnectTimer); evtReconnectTimer = null; }
+  try { sessionStorage.removeItem(activeTaskStorageKey()); } catch (_) {}
   taskId = null;
+  currentTaskStatus = null;
   designImageData = null;
   var di = document.getElementById('design-image'); if (di) di.value = '';
   var dp = document.getElementById('design-preview'); if (dp) dp.innerHTML = '';
@@ -874,6 +1086,24 @@ function newTask() {
   var cm = document.getElementById('company-mode');
   if (cm) { cm.checked = false; toggleCompany(); }
 }
+
+async function restoreActiveTask() {
+  var stored = null;
+  try { stored = sessionStorage.getItem(activeTaskStorageKey()); } catch (_) {}
+  if (!stored || !/^\d+$/.test(stored)) return;
+  try {
+    var response = await fetch('/api/tasks/' + stored);
+    if (!response.ok) throw new Error('introuvable');
+    var task = await response.json();
+    taskId = parseInt(stored, 10);
+    startLive();
+    setStatus(task.status || 'running');
+  } catch (_) {
+    try { sessionStorage.removeItem(activeTaskStorageKey()); } catch (_) {}
+  }
+}
+
+restoreActiveTask();
 </script>
 </body>
 </html>

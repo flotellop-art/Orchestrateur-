@@ -12,6 +12,7 @@ include_router.
 """
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -19,10 +20,14 @@ import os
 import re
 import shlex
 import shutil
+import signal
+import socket
 import sys
 import uuid
+import weakref
 import zipfile
-from datetime import datetime
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -33,15 +38,52 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from app_paths import APP_ROOT, DATA_ROOT, DB_PATH, PROJECTS_ROOT, STATIC_ROOT
+import agent_skills
+from automations import AutomationStore
+from durable_queue import (
+    DurableQueue,
+    JobLease,
+    JobState,
+    LeaseLost,
+    TaskReservationConflict,
+)
 import managed_agents  # pont vers les Agents geres Anthropic (delegation depuis le chef)
+from messaging import (
+    MAX_MESSAGE_CHARACTERS,
+    MessageRequest,
+    MessagingGateway,
+    MessagingConfigurationError,
+    ServerChannelRegistry,
+)
+from install_permissions import (
+    AccessLevel,
+    DecisionOutcome,
+    InstallValidationError,
+    build_install_argv,
+    evaluate_install,
+    make_install_plan,
+)
+from security_policy import (
+    build_child_environment,
+    resolve_allowed_target_path,
+    validate_github_repo_url,
+)
+from sandbox_runtime import (
+    DockerSandboxRuntime,
+    SandboxConfig,
+    SandboxError,
+    SandboxStopError,
+    SandboxUnavailableError,
+)
 
-load_dotenv(Path(__file__).parent / ".env", override=False)
+load_dotenv(APP_ROOT / ".env", override=False)
+load_dotenv(DATA_ROOT / ".env", override=False)
 log = logging.getLogger(__name__)
 
 # Configuration
-DB_PATH = Path(__file__).parent / "apps.db"
-STATIC = Path(__file__).parent / "static"
-PROJECTS = Path(__file__).parent / "projects"
+STATIC = STATIC_ROOT
+PROJECTS = PROJECTS_ROOT
 PROJECTS.mkdir(exist_ok=True)
 
 # Modeles par defaut par provider (verifies via recherche web, mai 2026).
@@ -86,9 +128,13 @@ MAX_TOKENS = 16000  # sortie max par appel : assez large pour ecrire des fichier
 COMPANY_MAX_AGENTS = 24
 COMPANY_MAX_ITER = 300
 COMPANY_WORKER_STEPS = 40
+EXECUTION_MODES = frozenset({"docker", "local"})
+DEFAULT_EXECUTION_MODE = (os.getenv("ORCHESTRATOR_DEFAULT_EXECUTION") or "docker").strip().lower()
+if DEFAULT_EXECUTION_MODE not in EXECUTION_MODES:
+    DEFAULT_EXECUTION_MODE = "docker"
 
 COMMAND_WHITELIST = {
-    "python", "python3", "pip", "pip3", "pytest",
+    "python", "python3", "pytest",
     "ls", "cat", "echo", "pwd", "head", "tail", "wc",
     "node", "npm",
 }
@@ -100,12 +146,126 @@ _client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 # task_id -> {"task": asyncio.Task, "pause": asyncio.Event, "step": bool, "inbox": list}
 running_tasks: dict[int, dict] = {}
+# Verrou court couvrant les changements de cycle de vie d'une tache. La table
+# faible evite de conserver un verrou pour chaque ancienne tache jusqu'a la fin
+# du processus, tout en donnant le meme objet a tous les appels concurrents.
+_task_lifecycle_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+_preview_shutdown_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
 # task_id -> {"proc": Process, "url": str|None, "output": list}
 launched_apps: dict[int, dict] = {}
+_launched_app_locks: dict[int, asyncio.Lock] = {}
+# request_id -> Future resolue par l'endpoint de decision.
+install_waiters: dict[str, asyncio.Future] = {}
+install_waiter_tasks: dict[str, int] = {}
 _KNOWLEDGE_FTS = True  # FTS5 disponible pour la memoire long terme ?
 # Cache des recherches web (requete normalisee -> resultat). Borne pour ne pas grossir sans fin.
 _web_cache: dict[str, str] = {}
 _WEB_CACHE_MAX = 256
+
+# Services durables, initialises par ``start_runtime_services`` dans le lifespan.
+task_queue: Optional[DurableQueue] = None
+automation_store: Optional[AutomationStore] = None
+messaging_gateway: Optional[MessagingGateway] = None
+sandbox_runtime: Optional[DockerSandboxRuntime] = None
+_runtime_background_tasks: list[asyncio.Task] = []
+_runtime_shutdown: Optional[asyncio.Event] = None
+_runtime_service_error: Optional[str] = None
+_QUEUE_LEASE_SECONDS = 90.0
+_DURABLE_JOB_RETENTION = timedelta(days=30)
+_PREVIEW_STOP_TIMEOUT_SECONDS = 3.0
+
+
+class CompletionNotificationError(RuntimeError):
+    """La tache est terminee, mais sa notification doit etre reessayee."""
+
+
+class PreviewStopError(SandboxError):
+    """Un apercu local n'a pas confirme sa terminaison."""
+
+
+def _task_lifecycle_lock(task_id: int) -> asyncio.Lock:
+    lock = _task_lifecycle_locks.get(task_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _task_lifecycle_locks[task_id] = lock
+    return lock
+
+
+def _preview_shutdown_lock() -> asyncio.Lock:
+    loop_key = id(asyncio.get_running_loop())
+    lock = _preview_shutdown_locks.get(loop_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _preview_shutdown_locks[loop_key] = lock
+    return lock
+
+
+def _require_runtime_services() -> None:
+    if _runtime_service_error:
+        raise HTTPException(503, _runtime_service_error)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on", "oui"}
+
+
+def _env_number(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if minimum <= value <= maximum else default
+
+
+def _make_sandbox_runtime() -> DockerSandboxRuntime:
+    """Construit l'unique frontiere Docker depuis la configuration serveur."""
+    return DockerSandboxRuntime(
+        SandboxConfig(
+            allowed_workspace_roots=(PROJECTS.resolve(),),
+            cpus=_env_number("ORCHESTRATOR_SANDBOX_CPUS", 1.0, minimum=0.1, maximum=64),
+            memory=(os.getenv("ORCHESTRATOR_SANDBOX_MEMORY") or "1g").strip(),
+            pids_limit=int(_env_number(
+                "ORCHESTRATOR_SANDBOX_PIDS", 128, minimum=16, maximum=4096
+            )),
+            # Le plafond inclut les installations approuvees ; les commandes
+            # ordinaires gardent leur propre delai, plus court.
+            default_timeout=_env_number(
+                "ORCHESTRATOR_SANDBOX_TIMEOUT", 300, minimum=60, maximum=900
+            ),
+            # Double opt-in : le runtime l'autorise, mais seuls les appels
+            # serveur d'installation/lancement passent network_enabled=True.
+            allow_network=(
+                _env_bool("ORCHESTRATOR_SANDBOX_ALLOW_INSTALL_NETWORK", False)
+                or _env_bool("ORCHESTRATOR_SANDBOX_ALLOW_APP_NETWORK", False)
+            ),
+            allowed_env_keys=(
+                "CI", "NODE_ENV", "NO_COLOR", "PORT", "PYTHONPATH",
+                "PYTHONUNBUFFERED", "NODE_PATH",
+            ),
+        )
+    )
+
+
+def get_sandbox_runtime() -> DockerSandboxRuntime:
+    global sandbox_runtime
+    if sandbox_runtime is None:
+        sandbox_runtime = _make_sandbox_runtime()
+    return sandbox_runtime
+
+
+def sandbox_install_network_allowed() -> bool:
+    return _env_bool("ORCHESTRATOR_SANDBOX_ALLOW_INSTALL_NETWORK", False)
+
+
+def sandbox_app_network_allowed() -> bool:
+    return _env_bool("ORCHESTRATOR_SANDBOX_ALLOW_APP_NETWORK", False)
 
 NL = chr(10)
 
@@ -133,6 +293,12 @@ async def init_team_db():
                 target_path   TEXT,
                 total_cost_usd REAL DEFAULT 0,
                 max_cost_usd  REAL DEFAULT 0,
+                install_policy TEXT DEFAULT 'ask',
+                execution_mode TEXT DEFAULT 'docker',
+                queue_job_id  TEXT,
+                run_number    INTEGER DEFAULT 0,
+                source_job_id TEXT,
+                source_ready  INTEGER DEFAULT 1,
                 created_at    TEXT
             )
         """)
@@ -164,7 +330,13 @@ async def init_team_db():
                     "ALTER TABLE tasks ADD COLUMN company_mode INTEGER DEFAULT 0",
                     "ALTER TABLE tasks ADD COLUMN target_path TEXT",
                     "ALTER TABLE tasks ADD COLUMN total_cost_usd REAL DEFAULT 0",
-                    "ALTER TABLE tasks ADD COLUMN max_cost_usd REAL DEFAULT 0"):
+                    "ALTER TABLE tasks ADD COLUMN max_cost_usd REAL DEFAULT 0",
+                    "ALTER TABLE tasks ADD COLUMN install_policy TEXT DEFAULT 'ask'",
+                    "ALTER TABLE tasks ADD COLUMN execution_mode TEXT DEFAULT 'docker'",
+                    "ALTER TABLE tasks ADD COLUMN queue_job_id TEXT",
+                    "ALTER TABLE tasks ADD COLUMN run_number INTEGER DEFAULT 0",
+                    "ALTER TABLE tasks ADD COLUMN source_job_id TEXT",
+                    "ALTER TABLE tasks ADD COLUMN source_ready INTEGER DEFAULT 1"):
             try:
                 await db.execute(ddl)
             except Exception:
@@ -190,6 +362,67 @@ async def init_team_db():
                 created_at TEXT
             )
         """)
+        # Demandes d'installation + accords lies au plan exact et a la tache.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS install_requests (
+                id            TEXT PRIMARY KEY,
+                task_id       INTEGER NOT NULL,
+                iteration     INTEGER DEFAULT 0,
+                agent         TEXT DEFAULT '',
+                plan_hash     TEXT NOT NULL,
+                manager       TEXT NOT NULL,
+                package       TEXT NOT NULL,
+                version       TEXT NOT NULL,
+                scope         TEXT NOT NULL,
+                access_level  TEXT NOT NULL,
+                reason        TEXT DEFAULT '',
+                source        TEXT,
+                allow_scripts INTEGER DEFAULT 0,
+                status        TEXT NOT NULL,
+                decision      TEXT,
+                result        TEXT,
+                created_at    TEXT NOT NULL,
+                expires_at    TEXT,
+                resolved_at   TEXT
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_install_requests_task_status "
+            "ON install_requests(task_id, status)"
+        )
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_source_job "
+            "ON tasks(source_job_id) WHERE source_job_id IS NOT NULL"
+        )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS completion_notification_outbox (
+                run_job_id  TEXT PRIMARY KEY,
+                task_id     INTEGER NOT NULL,
+                iteration   INTEGER NOT NULL,
+                channel     TEXT NOT NULL,
+                text        TEXT NOT NULL,
+                ready       INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+        """)
+        # Les lignes creees avant l'introduction des intentions preliminaires
+        # contenaient deja un texte final : elles sont donc immediatement pretes.
+        try:
+            await db.execute(
+                "ALTER TABLE completion_notification_outbox "
+                "ADD COLUMN ready INTEGER NOT NULL DEFAULT 1"
+            )
+        except Exception:
+            pass
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_completion_outbox_created "
+            "ON completion_notification_outbox(created_at)"
+        )
+        try:
+            await db.execute("ALTER TABLE install_requests ADD COLUMN source TEXT")
+        except Exception:
+            pass
         # Memoire long terme partagee (inter-taches). FTS5 si dispo, sinon table simple.
         global _KNOWLEDGE_FTS
         try:
@@ -199,20 +432,47 @@ async def init_team_db():
             await db.execute("CREATE TABLE IF NOT EXISTS knowledge "
                              "(id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT, created_at TEXT)")
             _KNOWLEDGE_FTS = False
-        # Les taches en cours ne survivent pas a un redemarrage du serveur.
-        await db.execute("UPDATE tasks SET status='stopped' WHERE status IN ('running','paused')")
+        # Les taches en cours sont reprises par la file durable. On ne les
+        # transforme plus silencieusement en taches arretees au redemarrage.
+        await db.execute("UPDATE tasks SET status='queued' WHERE status='running'")
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id,task_id,iteration,agent FROM install_requests WHERE status='pending'"
+        ) as cursor:
+            pending_on_restart = [dict(row) for row in await cursor.fetchall()]
+        for row in pending_on_restart:
+            await db.execute(
+                "INSERT INTO messages (task_id,iteration,agent,kind,content,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    row["task_id"], row.get("iteration", 0), row.get("agent") or "Agent",
+                    "permission_resolved",
+                    json.dumps({"request_id": row["id"], "decision": "server_restart"}),
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+        await db.execute(
+            "UPDATE install_requests SET status='expired', decision='server_restart', resolved_at=? "
+            "WHERE status='pending'",
+            (datetime.utcnow().isoformat(),),
+        )
         await db.commit()
 
 
 async def db_create_task(objective, folder, max_iterations, max_agents, web_enabled, chef_model,
-                         company_mode=False, target_path=None, max_cost_usd=0.0):
+                         company_mode=False, target_path=None, max_cost_usd=0.0,
+                         install_policy="ask", execution_mode="local",
+                         source_job_id=None, source_ready=True):
     async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
         cur = await db.execute(
             "INSERT INTO tasks (objective,folder,status,max_iterations,max_agents,web_enabled,chef_model,"
-            "company_mode,target_path,max_cost_usd,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "company_mode,target_path,max_cost_usd,install_policy,execution_mode,source_job_id,source_ready,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (objective, folder, "idle", max_iterations, max_agents,
              1 if web_enabled else 0, chef_model,
-             1 if company_mode else 0, target_path, max_cost_usd, datetime.utcnow().isoformat()),
+             1 if company_mode else 0, target_path, max_cost_usd, install_policy, execution_mode,
+             source_job_id, 1 if source_ready else 0,
+             datetime.utcnow().isoformat()),
         )
         await db.commit()
         return cur.lastrowid
@@ -239,7 +499,9 @@ async def db_list_tasks():
 _TASKS_COLUMNS_ALLOWED = frozenset({
     "objective", "folder", "status", "iteration", "max_iterations", "max_agents",
     "web_enabled", "chef_model", "company_mode", "target_path", "image_path",
-    "total_cost_usd", "max_cost_usd",
+    "total_cost_usd", "max_cost_usd", "install_policy", "execution_mode",
+    "queue_job_id", "run_number",
+    "source_job_id", "source_ready",
 })
 
 async def db_update_task(task_id, **kwargs):
@@ -255,10 +517,1188 @@ async def db_update_task(task_id, **kwargs):
 
 async def db_delete_task(task_id):
     async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        # Les competences sont liees a leur tache source. Elles sont retirees
+        # avant la tache afin de ne pas conserver de contenu sans provenance.
+        async with db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_skills'"
+        ) as cursor:
+            if await cursor.fetchone():
+                await db.execute("DELETE FROM agent_skills WHERE task_id=?", (task_id,))
         await db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
         await db.execute("DELETE FROM task_agents WHERE task_id=?", (task_id,))
         await db.execute("DELETE FROM messages WHERE task_id=?", (task_id,))
+        await db.execute("DELETE FROM prompts WHERE task_id=?", (task_id,))
+        await db.execute("DELETE FROM builds WHERE task_id=?", (task_id,))
+        await db.execute("DELETE FROM install_requests WHERE task_id=?", (task_id,))
+        await db.execute(
+            "DELETE FROM completion_notification_outbox WHERE task_id=?", (task_id,)
+        )
         await db.commit()
+
+
+async def db_transition_task_status(
+    task_id: int, new_status: str, allowed_current: set[str] | frozenset[str]
+) -> bool:
+    if not allowed_current or any(not isinstance(item, str) for item in allowed_current):
+        raise ValueError("Etats sources invalides.")
+    placeholders = ",".join("?" for _ in allowed_current)
+    values = [new_status, task_id, *sorted(allowed_current)]
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cursor = await db.execute(
+            f"UPDATE tasks SET status=? WHERE id=? AND status IN ({placeholders})",
+            values,
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def db_claim_task_for_job(task_id: int, job_id: str) -> bool:
+    """Reserve atomiquement une tache encore demarrable pour ce travail.
+
+    Le controle de l'etat et le passage a ``running`` partagent une seule
+    instruction SQL. Une pause ou un arret gagne donc la course au lieu d'etre
+    ecrase par un snapshot lu avant la verification de Docker.
+    """
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cursor = await db.execute(
+            "UPDATE tasks SET status='running', queue_job_id=? "
+            "WHERE id=? AND ("
+            "(status IN ('idle','queued') AND (queue_job_id IS NULL OR queue_job_id=?)) "
+            "OR (status='running' AND queue_job_id=?))",
+            (job_id, task_id, job_id, job_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def db_detach_task_job(task_id: int, job_id: str) -> bool:
+    """Retire uniquement une reference de job devenue incoherente."""
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cursor = await db.execute(
+            "UPDATE tasks SET queue_job_id=NULL "
+            "WHERE id=? AND queue_job_id=? "
+            "AND status IN ('queued','running','paused')",
+            (task_id, job_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def db_transition_task_status_for_job(
+    task_id: int,
+    job_id: str,
+    new_status: str,
+    allowed_current: set[str] | frozenset[str],
+) -> bool:
+    """Transitionne uniquement si ce travail possede encore la tache."""
+    if not allowed_current or any(not isinstance(item, str) for item in allowed_current):
+        raise ValueError("Etats sources invalides.")
+    placeholders = ",".join("?" for _ in allowed_current)
+    values = [new_status, task_id, job_id, *sorted(allowed_current)]
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cursor = await db.execute(
+            f"UPDATE tasks SET status=? WHERE id=? AND queue_job_id=? "
+            f"AND status IN ({placeholders})",
+            values,
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def db_transition_task_status_for_source_job(
+    task_id: int,
+    source_job_id: str,
+    new_status: str,
+    allowed_current: set[str] | frozenset[str],
+) -> bool:
+    """Transition equivalente pour une execution creee par automatisation."""
+    if not allowed_current or any(not isinstance(item, str) for item in allowed_current):
+        raise ValueError("Etats sources invalides.")
+    placeholders = ",".join("?" for _ in allowed_current)
+    values = [new_status, task_id, source_job_id, *sorted(allowed_current)]
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cursor = await db.execute(
+            f"UPDATE tasks SET status=? WHERE id=? AND source_job_id=? "
+            f"AND status IN ({placeholders})",
+            values,
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+# -- File durable, reprise et planifications ---------------------------------
+async def _configured_channels() -> tuple[str, ...]:
+    if messaging_gateway is None:
+        return ()
+    return messaging_gateway._registry.channel_names
+
+
+async def enqueue_task_run(
+    task_id: int,
+    *,
+    resume: bool,
+    notification_channel: Optional[str] = None,
+    source: str = "user",
+    expected_statuses: set[str] | frozenset[str] | None = None,
+):
+    """Enregistre un lancement avant de l'executer.
+
+    Le numero de lancement persiste avec la tache. Une seconde requete pendant
+    qu'un travail est deja actif renvoie le meme travail au lieu de le doubler.
+    """
+    if task_queue is None:
+        raise RuntimeError("La file durable n'est pas initialisee.")
+    if notification_channel:
+        channels = await _configured_channels()
+        if notification_channel not in channels:
+            raise ValueError("Canal de notification non configure.")
+    allowed = expected_statuses or {"idle", "queued"}
+    job = await task_queue.reserve_task_run(
+        task_id=task_id,
+        payload={
+            "task_id": task_id,
+            "resume": bool(resume),
+            "notification_channel": notification_channel,
+            "source": source,
+        },
+        allowed_task_states=allowed,
+    )
+    task = await db_get_task(task_id)
+    await emit(task_id, int((task or {}).get("iteration") or 0), "systeme", "queued", {
+        "job_id": job.id,
+        "source": source,
+    })
+    return job
+
+
+async def enqueue_notification(
+    *, task_id: int, iteration: int, agent: str, channel: str, text: str
+) -> str:
+    if task_queue is None:
+        raise RuntimeError("La file durable n'est pas initialisee.")
+    clean_text = (text or "").strip()
+    if not clean_text or len(clean_text) > MAX_MESSAGE_CHARACTERS:
+        raise ValueError(
+            f"Le message doit contenir entre 1 et {MAX_MESSAGE_CHARACTERS} caracteres."
+        )
+    MessageRequest(channel=channel, text=clean_text)
+    if channel not in await _configured_channels():
+        raise ValueError("Canal de notification non configure.")
+    digest = hashlib.sha256(clean_text.encode("utf-8")).hexdigest()[:20]
+    job = await task_queue.enqueue(
+        kind="notify",
+        payload={"channel": channel, "text": clean_text, "task_id": task_id},
+        idempotency_key=(
+            f"notify:{task_id}:{max(0, int(iteration))}:"
+            f"{hashlib.sha256((agent or 'agent').encode()).hexdigest()[:10]}:{digest}"
+        ),
+        max_attempts=4,
+        base_backoff_seconds=10,
+    )
+    return job.id
+
+
+async def _ensure_completion_notification_intent(
+    *,
+    run_job_id: str,
+    task_id: int,
+    channel: str,
+) -> None:
+    """Persiste l'intention avant que l'agent puisse terminer sa tache."""
+    if not isinstance(run_job_id, str) or not run_job_id:
+        raise ValueError("run_job_id invalide.")
+    if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 1:
+        raise ValueError("task_id invalide.")
+    MessageRequest(channel=channel, text="Notification de fin en attente.")
+    current_text = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO completion_notification_outbox (
+                run_job_id,task_id,iteration,channel,text,ready,created_at,updated_at
+            ) VALUES (?,?,0,?,'',0,?,?)
+            """,
+            (run_job_id, task_id, channel, current_text, current_text),
+        )
+        async with db.execute(
+            "SELECT task_id,channel FROM completion_notification_outbox "
+            "WHERE run_job_id=?",
+            (run_job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None or (row["task_id"], row["channel"]) != (task_id, channel):
+            await db.rollback()
+            raise RuntimeError("Conflit dans l'intention de notification.")
+        await db.commit()
+
+
+async def _discard_pending_completion_intents(task_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cursor = await db.execute(
+            "DELETE FROM completion_notification_outbox "
+            "WHERE task_id=? AND ready=0",
+            (task_id,),
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def _stage_completion_notification(
+    *,
+    run_job_id: str,
+    task_id: int,
+    iteration: int,
+    channel: str,
+    text: str,
+) -> None:
+    """Persiste l'intention avant de terminer le travail d'agent."""
+    if not isinstance(run_job_id, str) or not run_job_id:
+        raise ValueError("run_job_id invalide.")
+    clean_text = (text or "").strip()
+    if not clean_text or len(clean_text) > MAX_MESSAGE_CHARACTERS:
+        raise ValueError("Texte de notification invalide.")
+    MessageRequest(channel=channel, text=clean_text)
+    current_text = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT * FROM completion_notification_outbox WHERE run_job_id=?",
+            (run_job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        normalized_iteration = max(0, int(iteration))
+        if row is None:
+            await db.execute(
+                """
+                INSERT INTO completion_notification_outbox (
+                    run_job_id,task_id,iteration,channel,text,ready,created_at,updated_at
+                ) VALUES (?,?,?,?,?,1,?,?)
+                """,
+                (
+                    run_job_id,
+                    task_id,
+                    normalized_iteration,
+                    channel,
+                    clean_text,
+                    current_text,
+                    current_text,
+                ),
+            )
+        elif (row["task_id"], row["channel"]) != (task_id, channel):
+            await db.rollback()
+            raise RuntimeError("Conflit dans l'outbox de notification.")
+        elif bool(row["ready"]):
+            if (row["iteration"], row["text"]) != (
+                normalized_iteration,
+                clean_text,
+            ):
+                await db.rollback()
+                raise RuntimeError("Conflit dans l'outbox de notification.")
+        else:
+            await db.execute(
+                "UPDATE completion_notification_outbox "
+                "SET iteration=?, text=?, ready=1, updated_at=? "
+                "WHERE run_job_id=? AND ready=0",
+                (normalized_iteration, clean_text, current_text, run_job_id),
+            )
+        await db.commit()
+
+
+async def _try_dispatch_completion_notification(run_job_id: str) -> str | None:
+    """Transforme une intention en job notify, sans perdre l'intention."""
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM completion_notification_outbox "
+            "WHERE run_job_id=? AND ready=1",
+            (run_job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+    if row is None:
+        return None
+    task_id = int(row["task_id"])
+    async with _task_lifecycle_lock(task_id):
+        async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM completion_notification_outbox "
+                "WHERE run_job_id=? AND ready=1",
+                (run_job_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+        if await db_get_task(task_id) is None:
+            async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+                await db.execute(
+                    "DELETE FROM completion_notification_outbox WHERE run_job_id=?",
+                    (run_job_id,),
+                )
+                await db.commit()
+            return None
+        try:
+            notification_job_id = await enqueue_notification(
+                task_id=task_id,
+                iteration=int(row["iteration"]),
+                agent="systeme",
+                channel=row["channel"],
+                text=row["text"],
+            )
+        except Exception as exc:
+            log.warning(
+                "Notification de fin en attente pour le travail %s (%s).",
+                run_job_id,
+                type(exc).__name__,
+            )
+            return None
+        async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+            await db.execute(
+                "DELETE FROM completion_notification_outbox WHERE run_job_id=?",
+                (run_job_id,),
+            )
+            await db.commit()
+        return notification_job_id
+
+
+async def _recover_completion_notification_intents(*, limit: int = 100) -> int:
+    """Finalise les intentions dont la tache a termine avant un crash."""
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT o.run_job_id,o.task_id,o.channel,j.state AS job_state "
+            "FROM completion_notification_outbox AS o "
+            "LEFT JOIN durable_jobs AS j ON j.id=o.run_job_id "
+            "WHERE o.ready=0 ORDER BY o.created_at ASC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    recovered = 0
+    for row in rows:
+        task_id = int(row["task_id"])
+        async with _task_lifecycle_lock(task_id):
+            task = await db_get_task(task_id)
+            if task is None:
+                async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+                    await db.execute(
+                        "DELETE FROM completion_notification_outbox "
+                        "WHERE run_job_id=? AND ready=0",
+                        (row["run_job_id"],),
+                    )
+                    await db.commit()
+                continue
+            status = task.get("status")
+            if status == "stopped":
+                await _discard_pending_completion_intents(task_id)
+                continue
+            if status not in {"done", "failed"}:
+                continue
+            # ``_run_task`` peut poser ``failed`` avant que le worker durable
+            # ne le remette en file. Ne notifier qu'apres la fin definitive du
+            # job (ou apres sa purge de retention) evite un faux echec pendant
+            # une reprise encore possible.
+            if row["job_state"] not in {
+                None,
+                JobState.SUCCEEDED.value,
+                JobState.FAILED.value,
+            }:
+                continue
+            text = await _task_completion_text(task_id, status)
+            await _stage_completion_notification(
+                run_job_id=row["run_job_id"],
+                task_id=task_id,
+                iteration=int(task.get("iteration") or 0),
+                channel=row["channel"],
+                text=text,
+            )
+            recovered += 1
+    return recovered
+
+
+async def _flush_completion_notification_outbox(*, limit: int = 100) -> int:
+    """Retente les notifications dont le job n'a pas encore pu etre cree."""
+    await _recover_completion_notification_intents(limit=limit)
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        async with db.execute(
+            "SELECT run_job_id FROM completion_notification_outbox "
+            "WHERE ready=1 ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    dispatched = 0
+    for row in rows:
+        if await _try_dispatch_completion_notification(row[0]):
+            dispatched += 1
+    return dispatched
+
+
+def _job_payload(job) -> dict:
+    payload = job.payload if isinstance(job.payload, dict) else {}
+    # Une occurrence planifiee enveloppe le payload de l'automatisation.
+    nested = payload.get("payload")
+    return nested if isinstance(nested, dict) else payload
+
+
+def _active_job_owns_task(task: dict, job) -> bool:
+    if job.kind != "run_task":
+        return False
+    if task.get("source_job_id") == job.id:
+        nested = job.payload.get("payload") if isinstance(job.payload, dict) else None
+        return (
+            isinstance(job.payload, dict)
+            and bool(job.payload.get("automation_id"))
+            and isinstance(nested, dict)
+            and isinstance(nested.get("task_id"), int)
+            and not isinstance(nested.get("task_id"), bool)
+        )
+    payload = _job_payload(job)
+    run_number = int(task.get("run_number") or 0)
+    payload_task_id = payload.get("task_id")
+    return (
+        task.get("queue_job_id") == job.id
+        and isinstance(payload_task_id, int)
+        and not isinstance(payload_task_id, bool)
+        and payload_task_id == task.get("id")
+        and job.idempotency_key == f"task:{task['id']}:run:{run_number}"
+    )
+
+
+async def _complete_automation_execution_clone(
+    execution_id: int, template_id: int
+) -> bool:
+    """Finalise idempotemment la copie avant d'autoriser son execution."""
+    execution = await db_get_task(execution_id)
+    if not execution:
+        raise ValueError("L'execution planifiee n'existe plus.")
+    if bool(execution.get("source_ready")):
+        return False
+    template = await db_get_task(template_id)
+    if not template:
+        raise ValueError("Le modele de tache planifiee n'existe plus.")
+
+    agents = await db_list_agents(template_id)
+    image_path = None
+    source_image = template.get("image_path")
+    if source_image:
+        source = Path(source_image)
+        if source.is_file() and not source.is_symlink():
+            destination = Path(execution["folder"]) / (
+                "design_reference" + source.suffix.lower()
+            )
+            staging = destination.with_name(destination.name + ".pending")
+            await asyncio.to_thread(shutil.copy2, source, staging)
+            await asyncio.to_thread(os.replace, staging, destination)
+            image_path = str(destination)
+
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT source_ready FROM tasks WHERE id=?", (execution_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            await db.rollback()
+            raise ValueError("L'execution planifiee n'existe plus.")
+        if bool(row["source_ready"]):
+            await db.commit()
+            return False
+        await db.execute("DELETE FROM task_agents WHERE task_id=?", (execution_id,))
+        if agents:
+            await db.executemany(
+                "INSERT INTO task_agents "
+                "(task_id,name,role,provider,model,created_by,created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                [
+                    (
+                        execution_id,
+                        agent["name"],
+                        agent.get("role") or "",
+                        agent.get("provider") or "claude",
+                        agent.get("model") or "",
+                        "automation",
+                        datetime.utcnow().isoformat(),
+                    )
+                    for agent in agents
+                ],
+            )
+        await db.execute(
+            "UPDATE tasks SET image_path=?, source_ready=1 WHERE id=?",
+            (image_path, execution_id),
+        )
+        await db.commit()
+    return True
+
+
+async def _automation_execution_task(job, template_id: int) -> tuple[int, bool]:
+    """Cree une execution distincte et idempotente pour une occurrence."""
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id FROM tasks WHERE source_job_id=?", (job.id,)
+        ) as cursor:
+            existing = await cursor.fetchone()
+    if existing:
+        execution_id = int(existing["id"])
+        initialized = await _complete_automation_execution_clone(
+            execution_id, template_id
+        )
+        return execution_id, initialized
+
+    template = await db_get_task(template_id)
+    if not template:
+        raise ValueError("Le modele de tache planifiee n'existe plus.")
+    if template.get("execution_mode") != "docker":
+        raise ValueError("Les planifications exigent une tache Docker isolee.")
+    folder = str(PROJECTS / (
+        "scheduled_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        + "_" + uuid.uuid4().hex[:6]
+    ))
+    Path(folder).mkdir(parents=True, exist_ok=True)
+    if template.get("company_mode"):
+        (Path(folder) / "delivery").mkdir(exist_ok=True)
+    try:
+        task_id = await db_create_task(
+            template["objective"], folder,
+            int(template.get("max_iterations") or 15),
+            int(template.get("max_agents") or 4),
+            bool(template.get("web_enabled")),
+            template.get("chef_model") or DEFAULT_CLAUDE,
+            company_mode=bool(template.get("company_mode")),
+            target_path=template.get("target_path"),
+            max_cost_usd=float(template.get("max_cost_usd") or 0),
+            install_policy=template.get("install_policy") or "ask",
+            execution_mode="docker",
+            source_job_id=job.id,
+            source_ready=False,
+        )
+    except Exception:
+        async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id FROM tasks WHERE source_job_id=?", (job.id,)
+            ) as cursor:
+                raced = await cursor.fetchone()
+        if raced:
+            await asyncio.to_thread(_rmtree_force, Path(folder))
+            execution_id = int(raced["id"])
+            initialized = await _complete_automation_execution_clone(
+                execution_id, template_id
+            )
+            return execution_id, initialized
+        await asyncio.to_thread(_rmtree_force, Path(folder))
+        raise
+    await _complete_automation_execution_clone(task_id, template_id)
+    await emit(task_id, 0, "systeme", "info", {
+        "msg": f"Execution planifiee issue de la tache modele #{template_id}.",
+        "automation_id": (job.payload or {}).get("automation_id") if isinstance(job.payload, dict) else None,
+    })
+    return task_id, True
+
+
+async def _task_completion_text(task_id: int, status: str) -> str:
+    summary = ""
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT content FROM messages WHERE task_id=? AND kind='done' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+    if row:
+        try:
+            summary = str(json.loads(row["content"]).get("summary") or "").strip()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            summary = ""
+    label = "terminee" if status == "done" else "en echec"
+    text = f"Orchestrator : la tache planifiee #{task_id} est {label}."
+    if summary:
+        text += " " + summary
+    return text[:1900]
+
+
+async def _execute_run_job(job) -> dict:
+    payload = _job_payload(job)
+    template_id = payload.get("task_id")
+    if not isinstance(template_id, int) or isinstance(template_id, bool):
+        raise ValueError("Travail sans identifiant de tache valide.")
+    scheduled = isinstance(job.payload, dict) and bool(job.payload.get("automation_id"))
+    if scheduled:
+        task_id, created = await _automation_execution_task(job, template_id)
+    else:
+        task_id, created = template_id, False
+    channel = payload.get("notification_channel")
+    async with _task_lifecycle_lock(task_id):
+        task = await db_get_task(task_id)
+        if not task:
+            return {"status": "missing", "task_id": task_id}
+        if (
+            not _active_job_owns_task(task, job)
+            or task.get("status")
+            not in {"idle", "queued", "running", "done", "failed"}
+        ):
+            return {"status": task.get("status"), "task_id": task_id}
+        if channel:
+            # Cette ligne existe avant la premiere action de l'agent. Meme si le
+            # dernier bail meurt juste apres le passage a ``done``, le
+            # planificateur pourra reconstruire le texte depuis la tache.
+            await _ensure_completion_notification_intent(
+                run_job_id=job.id,
+                task_id=task_id,
+                channel=channel,
+            )
+    existing_runner = (running_tasks.get(task_id) or {}).get("task")
+    if existing_runner is not None:
+        await existing_runner
+    else:
+        if task.get("execution_mode") == "docker":
+            await get_sandbox_runtime().ensure_available()
+
+        resume = (not created) and (
+            bool(payload.get("resume"))
+            or int(task.get("iteration") or 0) > 0
+            or float(task.get("total_cost_usd") or 0) > 0
+        )
+        runner = None
+        async with _task_lifecycle_lock(task_id):
+            claimable = await db_get_task(task_id)
+            if (
+                claimable
+                and _active_job_owns_task(claimable, job)
+                and claimable.get("status") in {"idle", "queued", "running"}
+            ):
+                # Le verrou couvre le commit du CAS et l'enregistrement du
+                # runner. Stop voit donc soit aucune reservation, soit un ctrl
+                # complet qu'il peut annuler.
+                claimed = await db_claim_task_for_job(task_id, job.id)
+                if claimed:
+                    runner = _spawn_loop(task_id, resume=resume)
+        if runner is not None:
+            await runner
+
+    notification_job_id = None
+    notification_ready = False
+    async with _task_lifecycle_lock(task_id):
+        finished = await db_get_task(task_id)
+        status = finished.get("status") if finished else "missing"
+        if channel and status in {"done", "failed"}:
+            completion_text = await _task_completion_text(task_id, status)
+            try:
+                await _stage_completion_notification(
+                    run_job_id=job.id,
+                    task_id=task_id,
+                    iteration=int((finished or {}).get("iteration") or 0),
+                    channel=channel,
+                    text=completion_text,
+                )
+            except Exception as exc:
+                # Si meme l'intention ne peut pas etre finalisee, le lancement
+                # est retente. L'intention preliminaire reste recuperable.
+                raise CompletionNotificationError(
+                    f"Notification de fin non persistee pour la tache {task_id}."
+                ) from exc
+            notification_ready = True
+    if notification_ready:
+        notification_job_id = await _try_dispatch_completion_notification(job.id)
+    return {
+        "status": status,
+        "task_id": task_id,
+        "template_task_id": template_id if scheduled else None,
+        "notification_job_id": notification_job_id,
+    }
+
+
+async def _execute_queue_job(job):
+    if job.kind == "run_task":
+        return await _execute_run_job(job)
+    if job.kind == "notify":
+        if messaging_gateway is None:
+            raise RuntimeError("messaging_unavailable")
+        payload = job.payload if isinstance(job.payload, dict) else {}
+        task_id = payload.get("task_id")
+        if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 1:
+            raise ValueError("Notification sans identifiant de tache valide.")
+        async with _task_lifecycle_lock(task_id):
+            if await db_get_task(task_id) is None:
+                return {"channel": payload.get("channel", ""), "status": "deleted"}
+            receipt = await messaging_gateway.send(MessageRequest(
+                channel=payload.get("channel", ""), text=payload.get("text", "")
+            ))
+            return {"channel": receipt.channel, "status": receipt.status_code}
+    raise ValueError("Type de travail inconnu.")
+
+
+async def _run_with_heartbeat(lease: JobLease):
+    if task_queue is None:
+        raise RuntimeError("queue_unavailable")
+    work = asyncio.create_task(_execute_queue_job(lease.job))
+    current = lease
+    try:
+        while True:
+            done, _ = await asyncio.wait({work}, timeout=_QUEUE_LEASE_SECONDS / 3)
+            if work in done:
+                return await work, current
+            current = await task_queue.heartbeat(
+                current, lease_seconds=_QUEUE_LEASE_SECONDS
+            )
+    except BaseException:
+        if not work.done():
+            work.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await work
+        raise
+
+
+async def _queue_worker(worker_number: int) -> None:
+    assert task_queue is not None
+    assert _runtime_shutdown is not None
+    worker_id = f"local:{os.getpid()}:{worker_number}"
+    while not _runtime_shutdown.is_set():
+        try:
+            lease = await task_queue.claim(
+                worker_id=worker_id, lease_seconds=_QUEUE_LEASE_SECONDS
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("File durable momentanement indisponible (%s).", type(exc).__name__)
+            try:
+                await asyncio.wait_for(_runtime_shutdown.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        if lease is None:
+            try:
+                await asyncio.wait_for(_runtime_shutdown.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        try:
+            result, current = await _run_with_heartbeat(lease)
+            await task_queue.complete(current, result=result)
+        except LeaseLost:
+            # Pause, annulation ou reprise par un autre worker : aucun ancien
+            # worker ne peut enregistrer un resultat avec un bail retire.
+            continue
+        except asyncio.CancelledError:
+            # Une pause/annulation peut interrompre le travail imbrique sans
+            # signifier l'arret du worker permanent.
+            if _runtime_shutdown.is_set():
+                with suppress(Exception):
+                    await task_queue.release(lease)
+                raise
+            continue
+        except Exception as exc:
+            log.warning("Travail durable %s echoue (%s).", lease.job.id, type(exc).__name__)
+            try:
+                updated = await task_queue.fail(lease, error_code="worker_error")
+                if lease.job.kind == "run_task":
+                    notification_retry = isinstance(
+                        exc, CompletionNotificationError
+                    )
+                    payload = _job_payload(lease.job)
+                    if isinstance(payload.get("task_id"), int):
+                        failed_task_id = payload["task_id"]
+                        execution = None
+                        if (
+                            isinstance(lease.job.payload, dict)
+                            and lease.job.payload.get("automation_id")
+                        ):
+                            async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+                                db.row_factory = aiosqlite.Row
+                                async with db.execute(
+                                    "SELECT id,iteration FROM tasks WHERE source_job_id=?",
+                                    (lease.job.id,),
+                                ) as cursor:
+                                    execution = await cursor.fetchone()
+                            if execution:
+                                failed_task_id = int(execution["id"])
+                        # Une occurrence planifiee dont la copie a deja ete
+                        # supprimee ne doit jamais retomber sur la tache modele.
+                        if not (
+                            isinstance(lease.job.payload, dict)
+                            and lease.job.payload.get("automation_id")
+                            and execution is None
+                        ):
+                            dispatch_notification = False
+                            async with _task_lifecycle_lock(failed_task_id):
+                                current_task = await db_get_task(failed_task_id)
+                                if current_task and _active_job_owns_task(
+                                    current_task, lease.job
+                                ):
+                                    next_status = (
+                                        "queued"
+                                        if updated.state is JobState.QUEUED
+                                        else "failed"
+                                    )
+                                    transitioned = False
+                                    if not notification_retry:
+                                        if execution:
+                                            transitioned = await db_transition_task_status_for_source_job(
+                                                failed_task_id,
+                                                lease.job.id,
+                                                next_status,
+                                                {"idle", "running", "queued", "failed"},
+                                            )
+                                        else:
+                                            transitioned = await db_transition_task_status_for_job(
+                                                failed_task_id,
+                                                lease.job.id,
+                                                next_status,
+                                                {"running", "queued", "failed"},
+                                            )
+                                    if updated.state is JobState.FAILED:
+                                        if (
+                                            notification_retry
+                                            and current_task.get("status")
+                                            in {"done", "failed"}
+                                        ):
+                                            await emit(
+                                                failed_task_id, 0, "systeme", "error",
+                                                {"msg": "La notification de fin n'a pas pu etre enfilee."},
+                                            )
+                                        elif transitioned:
+                                            await emit(
+                                                failed_task_id, 0, "systeme", "error",
+                                                {"msg": "La tache a echoue apres plusieurs tentatives."},
+                                            )
+                                            channel = payload.get("notification_channel")
+                                            if channel:
+                                                failed_task = await db_get_task(
+                                                    failed_task_id
+                                                )
+                                                text = await _task_completion_text(
+                                                    failed_task_id, "failed"
+                                                )
+                                                await _stage_completion_notification(
+                                                    run_job_id=lease.job.id,
+                                                    task_id=failed_task_id,
+                                                    iteration=int(
+                                                        (failed_task or {}).get("iteration")
+                                                        or 0
+                                                    ),
+                                                    channel=channel,
+                                                    text=text,
+                                                )
+                                                dispatch_notification = True
+                            if dispatch_notification:
+                                await _try_dispatch_completion_notification(
+                                    lease.job.id
+                                )
+            except LeaseLost:
+                pass
+            except Exception as queue_exc:
+                log.warning(
+                    "Echec d'enregistrement du travail %s (%s).",
+                    lease.job.id, type(queue_exc).__name__,
+                )
+
+
+async def _scheduler_loop() -> None:
+    assert automation_store is not None
+    assert task_queue is not None
+    assert _runtime_shutdown is not None
+    while not _runtime_shutdown.is_set():
+        try:
+            await automation_store.dispatch_due(task_queue, limit=100)
+            await task_queue.purge_terminal(
+                older_than=datetime.now(timezone.utc) - _DURABLE_JOB_RETENTION,
+                limit=1000,
+            )
+        except Exception as exc:
+            log.warning("Planificateur indisponible (%s).", type(exc).__name__)
+        try:
+            await _flush_completion_notification_outbox(limit=100)
+        except Exception as exc:
+            log.warning(
+                "Outbox de notifications indisponible (%s).", type(exc).__name__
+            )
+        try:
+            await asyncio.wait_for(_runtime_shutdown.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _reconcile_durable_tasks() -> None:
+    if task_queue is None:
+        return
+    for task in await db_list_tasks():
+        if task.get("status") not in {"queued", "paused", "running"}:
+            continue
+        job = await task_queue.get(task.get("queue_job_id")) if task.get("queue_job_id") else None
+        if job and job.state in {JobState.QUEUED, JobState.RUNNING, JobState.PAUSED}:
+            if _active_job_owns_task(task, job):
+                if task.get("status") == "paused" and job.state is not JobState.PAUSED:
+                    await task_queue.pause(job.id)
+                elif task.get("status") != "paused" and job.state is JobState.PAUSED:
+                    await task_queue.resume(job.id)
+                continue
+            # Ne jamais annuler ici un job qui peut appartenir a une autre
+            # tache. Seule la reference incoherente est detachee par CAS.
+            if not await db_detach_task_job(task["id"], job.id):
+                continue
+            task["queue_job_id"] = None
+        job = await enqueue_task_run(
+            task["id"],
+            resume=True,
+            source="restart",
+            expected_statuses={str(task.get("status"))},
+        )
+        if task.get("status") == "paused":
+            await task_queue.pause(job.id)
+            await db_update_task(task["id"], status="paused")
+
+
+async def start_runtime_services() -> None:
+    global task_queue, automation_store, messaging_gateway
+    global _runtime_shutdown, _runtime_background_tasks, _runtime_service_error
+    task_queue = DurableQueue(DB_PATH)
+    automation_store = AutomationStore(DB_PATH)
+    await task_queue.init()
+    await automation_store.init()
+    await agent_skills.init_agent_skills_db(db_path=DB_PATH)
+    await task_queue.recover_expired_leases()
+
+    try:
+        registry = ServerChannelRegistry.from_environment(os.environ)
+    except MessagingConfigurationError as exc:
+        log.error("Notifications desactivees : %s", exc)
+        registry = ServerChannelRegistry.from_environment({})
+    messaging_gateway = MessagingGateway(registry)
+    runtime = get_sandbox_runtime()
+    cleanup = await runtime.stop_all_managed(strict=False)
+    if cleanup.failed:
+        details = "; ".join(f"{item}: {reason}" for item, reason in cleanup.failed)
+        log.error("Nettoyage Docker initial incomplet : %s", details)
+        runtime.block_execution(
+            "Le bac a sable Docker est bloque car d'anciens conteneurs n'ont "
+            "pas pu etre verifies ou supprimes. Redemarrez Docker Desktop puis "
+            "l'Orchestrateur."
+        )
+    else:
+        runtime.unblock_execution()
+    await _reconcile_durable_tasks()
+
+    # L'API de planification est separee pour rester testable sans lancer les
+    # workers. Sa configuration ne contient aucun secret client.
+    try:
+        import automation_api
+        automation_api.configure(
+            store=automation_store,
+            queue=task_queue,
+            channel_names=registry.channel_names,
+            task_lookup=db_get_task,
+        )
+    except (ImportError, AttributeError):
+        pass
+
+    _runtime_shutdown = asyncio.Event()
+    workers = int(_env_number(
+        "ORCHESTRATOR_QUEUE_WORKERS", 2, minimum=1, maximum=8
+    ))
+    _runtime_background_tasks = [
+        asyncio.create_task(_queue_worker(index), name=f"queue-worker-{index}")
+        for index in range(1, workers + 1)
+    ]
+    _runtime_background_tasks.append(
+        asyncio.create_task(_scheduler_loop(), name="automation-scheduler")
+    )
+    _runtime_service_error = None
+
+
+async def _restore_runtime_services_after_refused_shutdown() -> None:
+    global _runtime_shutdown, _runtime_service_error
+    _runtime_shutdown = None
+    try:
+        await start_runtime_services()
+    except Exception as restart_exc:
+        _runtime_service_error = (
+            "Les services d'execution n'ont pas pu redemarrer apres un "
+            "arret refuse. Redemarrez l'Orchestrateur."
+        )
+        try:
+            import automation_api
+            automation_api.disable(_runtime_service_error)
+        except (ImportError, AttributeError):
+            pass
+        log.error(
+            "Redemarrage des services apres echec de nettoyage impossible (%s).",
+            type(restart_exc).__name__,
+        )
+    else:
+        _runtime_service_error = None
+
+
+async def stop_runtime_services() -> None:
+    global _runtime_background_tasks, _runtime_shutdown, _runtime_service_error
+    _runtime_service_error = (
+        "Les services d'execution sont en cours d'arret. Reessayez apres le redemarrage."
+    )
+    try:
+        import automation_api
+        automation_api.disable(_runtime_service_error)
+    except (ImportError, AttributeError):
+        pass
+    runtime = sandbox_runtime
+    if runtime is not None:
+        # Fermer la frontiere avant le premier ``await``. Ainsi, aucun appel
+        # HTTP concurrent ne peut franchir _require_execution_allowed entre le
+        # dernier balayage global et la fin effective du processus.
+        runtime.block_execution(
+            "L'Orchestrateur termine son arret ; les nouveaux lancements Docker "
+            "sont temporairement refuses."
+        )
+    if _runtime_shutdown is not None:
+        _runtime_shutdown.set()
+    for background in _runtime_background_tasks:
+        background.cancel()
+    if _runtime_background_tasks:
+        await asyncio.gather(*_runtime_background_tasks, return_exceptions=True)
+    _runtime_background_tasks = []
+    # Les baux restent en base et expireront ; les taches ne sont pas perdues.
+    preview_failures: list[tuple[int, Exception]] = []
+    async with _preview_shutdown_lock():
+        for task_id in list(launched_apps):
+            try:
+                await _stop_launched(task_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                preview_failures.append((task_id, exc))
+                log.error(
+                    "Arret de l'apercu %s non confirme (%s).",
+                    task_id,
+                    type(exc).__name__,
+                )
+    if runtime is not None:
+        cleanup = await runtime.stop_all_managed(strict=False)
+        if cleanup.failed:
+            details = "; ".join(f"{item}: {reason}" for item, reason in cleanup.failed)
+            log.error("Nettoyage Docker final incomplet : %s", details)
+            runtime.block_execution(
+                "Le nettoyage Docker est incomplet ; aucune nouvelle execution "
+                "Docker n'est autorisee avant un redemarrage propre."
+            )
+            # L'arrêt n'est pas confirmé : conserver les handles pour une
+            # nouvelle tentative et remettre les workers en service afin qu'un
+            # refus de fermeture ne laisse pas l'application à moitié arrêtée.
+            await _restore_runtime_services_after_refused_shutdown()
+            raise SandboxStopError(cleanup)
+    if preview_failures:
+        if runtime is not None:
+            runtime.block_execution(
+                "Un apercu local ou Docker reste actif ; l'arret est refuse."
+            )
+        await _restore_runtime_services_after_refused_shutdown()
+        ids = ", ".join(str(task_id) for task_id, _ in preview_failures)
+        raise PreviewStopError(
+            "Arret refuse : apercu non termine pour la tache " + ids + "."
+        )
+    launched_apps.clear()
+    _runtime_shutdown = None
+
+
+async def db_create_install_request(record: dict):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        await db.execute(
+            "INSERT INTO install_requests "
+            "(id,task_id,iteration,agent,plan_hash,manager,package,version,scope,access_level,"
+            "reason,source,allow_scripts,status,decision,result,created_at,expires_at,resolved_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                record["id"], record["task_id"], record.get("iteration", 0),
+                record.get("agent", ""), record["plan_hash"], record["manager"],
+                record["package"], record["version"], record["scope"],
+                record["access_level"], record.get("reason", ""),
+                record.get("source"), 1 if record.get("allow_scripts") else 0, record["status"],
+                record.get("decision"), record.get("result"), record["created_at"],
+                record.get("expires_at"), record.get("resolved_at"),
+            ),
+        )
+        await db.commit()
+
+
+async def db_get_install_request(request_id: str):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM install_requests WHERE id=?", (request_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def db_list_install_requests(task_id: int, status: Optional[str] = None):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        db.row_factory = aiosqlite.Row
+        if status:
+            query = "SELECT * FROM install_requests WHERE task_id=? AND status=? ORDER BY created_at DESC"
+            params = (task_id, status)
+        else:
+            query = "SELECT * FROM install_requests WHERE task_id=? ORDER BY created_at DESC LIMIT 100"
+            params = (task_id,)
+        async with db.execute(query, params) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+
+async def db_resolve_install_request(task_id: int, request_id: str, decision: str) -> bool:
+    status = "denied" if decision == "deny" else "approved"
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cur = await db.execute(
+            "UPDATE install_requests SET status=?, decision=?, resolved_at=? "
+            "WHERE id=? AND task_id=? AND status='pending'",
+            (status, decision, datetime.utcnow().isoformat(), request_id, task_id),
+        )
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def db_finish_install_request(request_id: str, ok: bool, result: str):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        await db.execute(
+            "UPDATE install_requests SET status=?, result=?, resolved_at=? WHERE id=?",
+            (
+                "succeeded" if ok else "failed",
+                (result or "")[:2000],
+                datetime.utcnow().isoformat(),
+                request_id,
+            ),
+        )
+        await db.commit()
+
+
+async def db_cancel_install_request(request_id: str, result: str):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        await db.execute(
+            "UPDATE install_requests SET status='cancelled', result=?, resolved_at=? WHERE id=?",
+            ((result or "")[:2000], datetime.utcnow().isoformat(), request_id),
+        )
+        await db.commit()
+
+
+async def db_expire_install_request(request_id: str, decision: str = "expired"):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cur = await db.execute(
+            "UPDATE install_requests SET status='expired', decision=?, resolved_at=? "
+            "WHERE id=? AND status='pending'",
+            (decision, datetime.utcnow().isoformat(), request_id),
+        )
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def db_cancel_pending_install_requests(task_id: int, decision: str = "task_stopped"):
+    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+        cur = await db.execute(
+            "UPDATE install_requests SET status='cancelled', decision=?, resolved_at=? "
+            "WHERE task_id=? AND status='pending'",
+            (decision, datetime.utcnow().isoformat(), task_id),
+        )
+        await db.commit()
+        return cur.rowcount
 
 
 async def db_add_agent(task_id, name, role, provider, model, created_by):
@@ -310,7 +1750,7 @@ async def _log_prompt(task_id, iteration, agent, system, messages, image=None):
 
 
 _SNAPSHOT_IGNORE = shutil.ignore_patterns(
-    ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".git")
+    ".venv", "venv", ".orchestrator", "node_modules", "__pycache__", ".pytest_cache", ".git")
 
 
 def _snapshot(task_id, folder, iteration):
@@ -585,6 +2025,88 @@ def _extract_json(text: str) -> Optional[dict]:
 
 
 # ── Outils (cadres au dossier de la tache) ──────────────────────────────────
+_WORKSPACE_IGNORE_DIRS = {
+    ".git", ".venv", "venv", ".orchestrator", "node_modules",
+    "__pycache__", ".pytest_cache",
+}
+_NPM_MUTATING_COMMANDS = {
+    "install", "i", "add", "uninstall", "remove", "rm", "update", "upgrade",
+    "ci", "install-ci-test", "install-test", "rebuild", "dedupe", "prune",
+    "link", "config", "exec", "pkg", "init",
+}
+INSTALL_POLICY_VALUES = frozenset({"blocked", "ask", "project", "user", "admin"})
+
+
+def _task_venv_python(folder: str | Path) -> Path:
+    venv = Path(folder) / ".orchestrator" / "python"
+    subdir = "Scripts" if os.name == "nt" else "bin"
+    return venv / subdir / ("python.exe" if os.name == "nt" else "python")
+
+
+def _local_python_executable(folder: str | Path) -> Optional[str]:
+    task_python = _task_venv_python(folder)
+    if task_python.exists():
+        return str(task_python)
+    if getattr(sys, "frozen", False):
+        return None
+    return sys.executable
+
+
+def _task_npm_root(folder: str | Path) -> Path:
+    return Path(folder) / ".orchestrator" / "npm"
+
+
+def _ensure_task_private_directory(folder: str | Path, name: str) -> Path:
+    base = Path(folder).resolve()
+    private = base / ".orchestrator"
+    if private.exists() and (
+        private.is_symlink() or private.resolve().parent != base
+    ):
+        raise ValueError("Dossier prive de la tache non sur.")
+    private.mkdir(exist_ok=True)
+    target = private / name
+    if target.exists() and (
+        target.is_symlink() or target.resolve().parent != private.resolve()
+    ):
+        raise ValueError("Destination privee de la tache non sure.")
+    target.mkdir(exist_ok=True)
+    return target
+
+
+def _task_child_environment(folder: str | Path) -> dict[str, str]:
+    """Ajoute les paquets npm isoles de la tache sans exposer les secrets."""
+    env = build_child_environment()
+    root = _task_npm_root(folder)
+    node_paths = []
+    bin_paths = []
+    if root.is_dir():
+        base = Path(folder).resolve()
+        if root.is_symlink() or base not in root.resolve().parents:
+            return env
+        root_resolved = root.resolve()
+        for candidate in sorted(root.iterdir()):
+            if not candidate.is_dir() or candidate.name.startswith(".tmp-"):
+                continue
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if root_resolved not in resolved.parents:
+                continue
+            modules = resolved / "node_modules"
+            if modules.is_dir():
+                node_paths.append(str(modules))
+                binaries = modules / ".bin"
+                if binaries.is_dir():
+                    bin_paths.append(str(binaries))
+    if node_paths:
+        env["NODE_PATH"] = os.pathsep.join(node_paths)
+    if bin_paths:
+        path_key = next((key for key in env if key.upper() == "PATH"), "PATH")
+        env[path_key] = os.pathsep.join([env.get(path_key, "")] + bin_paths)
+    return env
+
+
 def _safe_path(folder: str, rel: str) -> Path:
     base = Path(folder).resolve()
     p = (base / (rel or "")).resolve()
@@ -599,8 +2121,9 @@ def _list_files(folder: str) -> list[str]:
         return []
     out = []
     for p in sorted(base.rglob("*")):
-        if p.is_file():
-            out.append(str(p.relative_to(base)))
+        rel = p.relative_to(base)
+        if p.is_file() and not any(part in _WORKSPACE_IGNORE_DIRS for part in rel.parts):
+            out.append(str(rel))
     return out[:200]
 
 
@@ -640,6 +2163,10 @@ def _rmtree_force(path):
     """Suppression robuste (Windows) : retire le flag lecture seule des fichiers .git puis reessaie."""
     import stat
 
+    path = Path(path)
+    if not path.exists():
+        return True
+
     def _onerror(func, p, _exc):
         try:
             os.chmod(p, stat.S_IWRITE)
@@ -647,15 +2174,13 @@ def _rmtree_force(path):
         except Exception:
             pass
     shutil.rmtree(path, onerror=_onerror)
-    return not Path(path).exists()
+    return not path.exists()
 
 
 async def _clone_repo(url, token=None):
     """Clone un depot GitHub en LECTURE SEULE dans un cache local, et renvoie son chemin.
     Le token (depot prive) sert au clone puis est scrubbe (remote supprime) ; jamais stocke/log."""
-    url = (url or "").strip().rstrip("/")
-    if not re.match(r"^https://", url):
-        raise ValueError("URL invalide : une URL https est requise.")
+    url = validate_github_repo_url(url)
     m = re.search(r"github\.com/([^/]+)/([^/]+?)(?:\.git)?$", url)
     name = (m.group(1) + "_" + m.group(2)) if m else re.sub(r"[^A-Za-z0-9_.-]", "_", url)[-40:]
     dest = PROJECTS / ".repos" / name
@@ -665,10 +2190,24 @@ async def _clone_repo(url, token=None):
         if not ok and dest.exists():
             # dernier recours : cloner dans un dossier voisin unique
             dest = PROJECTS / ".repos" / (name + "_" + uuid.uuid4().hex[:6])
-    auth_url = url.replace("https://", "https://" + token + "@", 1) if token else url
+    clone_env = build_child_environment()
+    clone_env["GIT_TERMINAL_PROMPT"] = "0"
+    credentials = None
+    if token:
+        # Git reads this one-shot config from the child environment. The token
+        # is therefore absent from both the process command line and remote URL.
+        credentials = base64.b64encode(
+            ("x-access-token:" + token).encode("utf-8")
+        ).decode("ascii")
+        clone_env.update({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.extraHeader",
+            "GIT_CONFIG_VALUE_0": "Authorization: Basic " + credentials,
+        })
     proc = await asyncio.create_subprocess_exec(
-        "git", "clone", "--depth", "1", auth_url, str(dest),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        "git", "clone", "--depth", "1", url, str(dest),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        env=clone_env)
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
     except asyncio.TimeoutError:
@@ -683,33 +2222,114 @@ async def _clone_repo(url, token=None):
         msg = out.decode("utf-8", "replace")
         if token:
             msg = msg.replace(token, "***")  # ne jamais fuiter le token
+        if credentials:
+            msg = msg.replace(credentials, "***")
         raise ValueError(msg.strip()[-300:] or "echec inconnu")
     # Scrubber le remote : aucune trace du token dans .git/config.
     if (dest / ".git").exists():
         try:
             p2 = await asyncio.create_subprocess_exec(
                 "git", "-C", str(dest), "remote", "remove", "origin",
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                env=build_child_environment())
             await p2.communicate()
         except Exception:
             pass
     return str(dest.resolve())
 
 
-async def _run_cmd(folder: str, cmd: str, timeout: int = 60) -> str:
+def _sandbox_task_environment(folder: str | Path) -> dict[str, str]:
+    base = Path(folder)
+    env = {
+        "PYTHONPATH": "/workspace/.orchestrator/python-packages",
+        "PYTHONUNBUFFERED": "1",
+        "NO_COLOR": "1",
+    }
+    npm_root = base / ".orchestrator" / "npm"
+    node_paths = []
+    if npm_root.is_dir():
+        for child in sorted(npm_root.iterdir(), key=lambda item: item.name):
+            if child.is_dir() and (child / "node_modules").is_dir():
+                node_paths.append(f"/workspace/.orchestrator/npm/{child.name}/node_modules")
+    if node_paths:
+        env["NODE_PATH"] = ":".join(node_paths)[:4096]
+    return env
+
+
+async def _task_uses_docker(task_id: Optional[int]) -> bool:
+    if task_id is None:
+        return False
+    task = await db_get_task(task_id)
+    return bool(task and task.get("execution_mode") == "docker")
+
+
+async def _run_cmd(
+    folder: str, cmd: str, timeout: int = 60, *, task_id: Optional[int] = None
+) -> str:
     try:
         parts = shlex.split(cmd or "")
     except ValueError:
         return "Commande invalide (guillemets non fermes)."
     if not parts:
         return "Commande vide."
-    if parts[0] not in COMMAND_WHITELIST:
+    executable = Path(parts[0]).name.lower()
+    for suffix in (".exe", ".cmd", ".bat"):
+        if executable.endswith(suffix):
+            executable = executable[:-len(suffix)]
+            break
+    if executable in {"pip", "pip3"}:
+        return "Installation directe refusee. Utilise l'outil install_package."
+    normalized_args = [str(part).lower() for part in parts[1:]]
+    if executable in {"python", "python3"} and any(
+        normalized_args[index:index + 2] in (["-m", "pip"], ["-m", "ensurepip"])
+        for index in range(max(0, len(normalized_args) - 1))
+    ):
+        return "Installation directe refusee. Utilise l'outil install_package."
+    if executable == "npm" and any(
+        argument in _NPM_MUTATING_COMMANDS for argument in normalized_args
+    ):
+        return "Modification npm directe refusee. Utilise l'outil install_package."
+    if executable not in COMMAND_WHITELIST:
         return "Commande refusee (hors liste blanche): " + parts[0]
+    if await _task_uses_docker(task_id):
+        if executable == "pytest":
+            parts = ["python", "-m", "pytest"] + parts[1:]
+        elif executable in {"python", "python3"}:
+            parts[0] = "python"
+        else:
+            parts[0] = executable
+        try:
+            result = await get_sandbox_runtime().run_command(
+                task_id,
+                folder,
+                tuple(parts),
+                timeout=timeout,
+                env=_sandbox_task_environment(folder),
+            )
+        except SandboxError as exc:
+            return "Execution isolee refusee : " + str(exc)[:1200]
+        suffix = "\n(code de sortie " + str(result.exit_code) + ")" if not result.ok else ""
+        return ((result.output or "(vide)") + suffix)[:2500]
+    local_python = _local_python_executable(folder)
+    if executable in {"python", "python3"}:
+        if not local_python:
+            return "Mode local indisponible : aucun interpreteur Python externe n'est configure."
+        parts[0] = local_python
+    elif executable == "pytest":
+        if not local_python:
+            return "Tests locaux indisponibles : aucun interpreteur Python externe n'est configure."
+        parts = [local_python, "-m", "pytest"] + parts[1:]
+    else:
+        trusted_executable = shutil.which(executable)
+        if not trusted_executable:
+            return "Programme introuvable: " + executable
+        parts[0] = trusted_executable
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *parts, cwd=folder,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=_task_child_environment(folder),
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return (out.decode("utf-8", errors="replace") or "(vide)")[:2500]
@@ -724,12 +2344,31 @@ async def _run_cmd(folder: str, cmd: str, timeout: int = 60) -> str:
         return "Programme introuvable: " + parts[0]
 
 
-async def _run_pytest(folder: str, timeout: int = 120) -> str:
+async def _run_pytest(
+    folder: str, timeout: int = 120, *, task_id: Optional[int] = None
+) -> str:
+    if await _task_uses_docker(task_id):
+        try:
+            result = await get_sandbox_runtime().run_tests(
+                task_id,
+                folder,
+                ("python", "-m", "pytest", "-q"),
+                timeout=timeout,
+                env=_sandbox_task_environment(folder),
+            )
+        except SandboxError as exc:
+            return "Tests isoles refuses : " + str(exc)[:1200]
+        suffix = "\n(code de sortie " + str(result.exit_code) + ")" if not result.ok else ""
+        return ((result.output or "(vide)") + suffix)[:2500]
     proc = None
     try:
+        python_exe = _local_python_executable(folder)
+        if not python_exe:
+            return "Tests locaux indisponibles : aucun interpreteur Python externe n'est configure."
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "pytest", "-q", cwd=folder,
+            python_exe, "-m", "pytest", "-q", cwd=folder,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=build_child_environment(),
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return (out.decode("utf-8", errors="replace") or "(vide)")[:2500]
@@ -740,6 +2379,500 @@ async def _run_pytest(folder: str, timeout: int = 120) -> str:
             except Exception:
                 pass
         return "TIMEOUT pytest apres " + str(timeout) + "s."
+
+
+INSTALL_REQUEST_TIMEOUT_SECONDS = 300
+INSTALL_PAYLOAD_FIELDS = (
+    "manager", "package", "version", "scope", "allow_scripts", "source",
+)
+
+
+def _install_destination(folder: str, plan, execution_mode: str = "local") -> str:
+    if plan.manager.value == "python":
+        if execution_mode == "docker":
+            return str(Path(folder) / ".orchestrator" / "python-packages")
+        return str(Path(folder) / ".orchestrator" / "python")
+    if plan.manager.value == "npm":
+        return str(_task_npm_root(folder) / plan.plan_hash)
+    return "votre compte Windows" if plan.access is AccessLevel.USER else "tout l'ordinateur"
+
+
+def _plan_from_install_row(row: dict):
+    payload = {
+        "manager": row["manager"],
+        "package": row["package"],
+        "version": row["version"],
+        "scope": row["scope"],
+        "allow_scripts": bool(row.get("allow_scripts")),
+    }
+    if row.get("source"):
+        payload["source"] = row["source"]
+    return make_install_plan(payload)
+
+
+def _install_request_payload(row: dict) -> dict:
+    plan = _plan_from_install_row(row)
+    return {
+        "request_id": row["id"],
+        "task_id": row["task_id"],
+        "iteration": row.get("iteration", 0),
+        "agent": row.get("agent") or "Agent",
+        "manager": plan.manager.value,
+        "package": plan.package,
+        "version": plan.version,
+        "scope": plan.scope,
+        "source": plan.source or (
+            "PyPI (sauf politique globale de la machine)"
+            if plan.manager.value == "python" else "npm officiel"
+        ),
+        "access_level": plan.access.value,
+        "reason": row.get("reason") or "Cette installation est necessaire a la tache.",
+        "risk_reason": plan.reason,
+        "allow_scripts": plan.allow_scripts,
+        "destination": None,
+        "command_preview": list(plan.command_preview),
+        "status": row.get("status"),
+        "expires_at": row.get("expires_at"),
+    }
+
+
+async def _install_payload_for_task(row: dict) -> dict:
+    payload = _install_request_payload(row)
+    task = await db_get_task(row["task_id"])
+    payload["destination"] = _install_destination(
+        task["folder"] if task else "",
+        _plan_from_install_row(row),
+        task.get("execution_mode", "local") if task else "local",
+    )
+    return payload
+
+
+async def _terminate_install_process(proc) -> None:
+    """Arrete au mieux le processus d'installation et ses enfants."""
+    if not proc or proc.returncode is not None:
+        return
+    if os.name == "nt":
+        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        taskkill = system_root / "System32" / "taskkill.exe"
+        if taskkill.is_file():
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    str(taskkill), "/PID", str(proc.pid), "/T", "/F",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env=build_child_environment(),
+                )
+                await asyncio.wait_for(killer.wait(), timeout=10)
+            except Exception:
+                pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=10)
+    except (asyncio.TimeoutError, ProcessLookupError):
+        pass
+
+
+async def _run_install_process(task_id: int, argv: tuple[str, ...], folder: str,
+                               timeout: int, env_overrides: Optional[dict] = None
+                               ) -> tuple[bool, str]:
+    proc = None
+    ctrl = running_tasks.get(task_id)
+    if ctrl is None:
+        return False, "La tache n'est plus active."
+    control_lock = ctrl["permission_lock"]
+    tail = bytearray()
+
+    async def _read_bounded_output():
+        while True:
+            chunk = await proc.stdout.read(4096)
+            if not chunk:
+                break
+            tail.extend(chunk)
+            if len(tail) > 65536:
+                del tail[:-65536]
+        await proc.wait()
+
+    try:
+        async with control_lock:
+            current = await db_get_task(task_id)
+            status = current.get("status") if current else None
+            if status not in {"running", "paused"} or (
+                status == "paused" and not ctrl["pause"].is_set()
+            ):
+                return False, "La tache a ete arretee ou mise en pause avant l'installation."
+            child_env = build_child_environment()
+            child_env.update(env_overrides or {})
+            process_options = {"start_new_session": True} if os.name != "nt" else {}
+            proc = await asyncio.create_subprocess_exec(
+                *argv, cwd=folder,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                env=child_env, **process_options,
+            )
+            ctrl["install_proc"] = proc
+        await asyncio.wait_for(_read_bounded_output(), timeout=timeout)
+        rendered = tail.decode("utf-8", errors="replace")
+        return proc.returncode == 0, (rendered or "(aucune sortie)")[-4000:]
+    except FileNotFoundError:
+        return False, "Programme d'installation introuvable : " + str(argv[0])
+    except asyncio.TimeoutError:
+        await _terminate_install_process(proc)
+        return False, "Delai d'installation depasse."
+    except asyncio.CancelledError:
+        await _terminate_install_process(proc)
+        raise
+    finally:
+        async with control_lock:
+            if ctrl.get("install_proc") is proc:
+                ctrl.pop("install_proc", None)
+
+
+async def _ensure_task_python_venv(task_id: int, folder: str) -> tuple[bool, str]:
+    try:
+        private = _ensure_task_private_directory(folder, "python")
+    except ValueError as exc:
+        return False, str(exc)
+    python_exe = _task_venv_python(folder)
+    if python_exe.exists():
+        return True, str(python_exe)
+    if getattr(sys, "frozen", False):
+        return False, (
+            "Le mode local du paquet desktop necessite un Python externe. "
+            "Utilisez le mode Docker recommande."
+        )
+    venv_dir = private
+    ok, output = await _run_install_process(
+        task_id,
+        (sys.executable, "-I", "-m", "venv", str(venv_dir)),
+        folder,
+        120,
+    )
+    if not ok or not python_exe.exists():
+        return False, "Creation de l'environnement Python impossible : " + output[-1200:]
+    return True, str(python_exe)
+
+
+async def _execute_install_plan(task_id: int, folder: str, plan) -> tuple[bool, str]:
+    task = await db_get_task(task_id)
+    if task and task.get("execution_mode") == "docker" and plan.manager.value in {"python", "npm"}:
+        if not sandbox_install_network_allowed():
+            return False, (
+                "Le reseau d'installation Docker est desactive par l'administrateur "
+                "(ORCHESTRATOR_SANDBOX_ALLOW_INSTALL_NETWORK)."
+            )
+        runtime = get_sandbox_runtime()
+        base = Path(folder).resolve()
+        try:
+            if plan.manager.value == "python":
+                destination = _ensure_task_private_directory(base, "python-packages")
+                argv = (
+                    "python", "-m", "pip", "install", "--isolated",
+                    "--only-binary=:all:", "--no-input",
+                    "--disable-pip-version-check",
+                    "--index-url", "https://pypi.org/simple",
+                    "--target", "/workspace/.orchestrator/python-packages",
+                    f"{plan.package}=={plan.version}",
+                )
+                result = await runtime.run_command(
+                    task_id, base, argv, timeout=300,
+                    env={"NO_COLOR": "1"}, network_enabled=True,
+                )
+                return result.ok, (result.output or "(aucune sortie)")[-4000:]
+
+            npm_root = _ensure_task_private_directory(base, "npm")
+            staging = npm_root / (".tmp-" + uuid.uuid4().hex)
+            destination = npm_root / plan.plan_hash
+            staging.mkdir()
+            (staging / "package.json").write_text(
+                json.dumps({"name": "orchestrator-task-package", "private": True,
+                            "version": "1.0.0"}),
+                encoding="utf-8",
+            )
+            container_prefix = "/workspace/.orchestrator/npm/" + staging.name
+            argv = build_install_argv(
+                plan, npm_executable="npm", npm_prefix=container_prefix,
+            )
+            result = await runtime.run_command(
+                task_id, base, argv, timeout=300,
+                env={"NO_COLOR": "1"}, network_enabled=True,
+            )
+            if result.ok:
+                if destination.exists():
+                    await asyncio.to_thread(_rmtree_force, destination)
+                staging.replace(destination)
+            elif staging.exists():
+                await asyncio.to_thread(_rmtree_force, staging)
+            return result.ok, (result.output or "(aucune sortie)")[-4000:]
+        except SandboxError as exc:
+            return False, "Installation isolee refusee : " + str(exc)[:1200]
+        except (OSError, ValueError) as exc:
+            return False, "Installation isolee impossible : " + str(exc)[:1200]
+
+    if plan.manager.value == "python":
+        ok, python_or_error = await _ensure_task_python_venv(task_id, folder)
+        if not ok:
+            return False, python_or_error
+        argv = build_install_argv(plan, venv_python=python_or_error)
+        timeout = 300
+    elif plan.manager.value == "npm":
+        npm = shutil.which("npm") or shutil.which("npm.cmd")
+        if not npm:
+            return False, "npm est absent de cet ordinateur."
+        try:
+            npm_root = _ensure_task_private_directory(folder, "npm")
+        except ValueError as exc:
+            return False, str(exc)
+        staging = npm_root / (".tmp-" + uuid.uuid4().hex)
+        staging.mkdir()
+        (staging / "package.json").write_text(
+            json.dumps({"name": "orchestrator-task-package", "private": True,
+                        "version": "1.0.0"}),
+            encoding="utf-8",
+        )
+        (staging / ".npmrc").write_text("", encoding="utf-8")
+        argv = build_install_argv(plan, npm_executable=npm, npm_prefix=staging)
+        if os.name == "nt" or Path(npm).suffix.lower() in {".cmd", ".bat"}:
+            node = shutil.which("node") or shutil.which("node.exe")
+            npm_cli = Path(npm).resolve().parent / "node_modules" / "npm" / "bin" / "npm-cli.js"
+            if not node or not npm_cli.is_file():
+                await asyncio.to_thread(shutil.rmtree, staging)
+                return False, "L'executable npm securise est introuvable."
+            argv = (str(Path(node).resolve()), str(npm_cli)) + argv[1:]
+        npm_env = {
+            "NPM_CONFIG_USERCONFIG": os.devnull,
+            "NPM_CONFIG_GLOBALCONFIG": os.devnull,
+            "NPM_CONFIG_REGISTRY": "https://registry.npmjs.org/",
+            "NPM_CONFIG_GLOBAL": "false",
+            "NPM_CONFIG_IGNORE_SCRIPTS": "true",
+            "NODE_OPTIONS": "",
+            "NODE_PATH": "",
+        }
+        ok, output = await _run_install_process(
+            task_id, argv, str(staging), 300, env_overrides=npm_env
+        )
+        destination = npm_root / plan.plan_hash
+
+        def _replace_environment():
+            root_resolved = npm_root.resolve()
+            if staging.resolve().parent != root_resolved:
+                raise ValueError("Dossier npm temporaire invalide.")
+            if destination.exists():
+                if destination.is_symlink() or root_resolved not in destination.resolve().parents:
+                    raise ValueError("Destination npm non sure.")
+                shutil.rmtree(destination)
+            if ok:
+                staging.replace(destination)
+            elif staging.exists():
+                shutil.rmtree(staging)
+
+        try:
+            await asyncio.to_thread(_replace_environment)
+        except Exception as exc:
+            return False, output + NL + "Finalisation npm impossible : " + str(exc)[:300]
+        return ok, output
+    else:
+        winget = shutil.which("winget") or shutil.which("winget.exe")
+        if not winget:
+            return False, "Le gestionnaire d'applications Windows (winget) est absent."
+        argv = build_install_argv(plan, winget_executable=winget)
+        timeout = 900
+    return await _run_install_process(task_id, argv, folder, timeout)
+
+
+def _read_installed_dependency_manifest(folder: str) -> dict:
+    base = Path(folder).resolve()
+    path = base / "orchestrator-dependencies.json"
+    if path.exists() and (path.is_symlink() or base not in path.resolve().parents):
+        return {}
+    manifest = {"schema": 1, "python": {}, "npm": {}, "applications": {}}
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and existing.get("schema") == 1:
+                for key in ("python", "npm", "applications"):
+                    if isinstance(existing.get(key), dict):
+                        manifest[key] = existing[key]
+        except (OSError, json.JSONDecodeError):
+            pass
+    return manifest
+
+
+def _record_installed_dependency(folder: str, plan) -> None:
+    """Ecrit un manifeste reproductible des demandes directes installees."""
+    base = Path(folder).resolve()
+    path = base / "orchestrator-dependencies.json"
+    manifest = _read_installed_dependency_manifest(folder)
+    if not manifest:
+        raise ValueError("Manifeste de dependances non sur.")
+    if plan.manager.value in {"python", "npm"}:
+        manifest[plan.manager.value][plan.package] = plan.version
+    else:
+        manifest["applications"][plan.package] = {
+            "version": plan.version,
+            "scope": plan.scope,
+            "source": plan.source,
+        }
+    temporary = path.with_suffix(".json.tmp")
+    if temporary.exists() and (
+        temporary.is_symlink() or base not in temporary.resolve().parents
+    ):
+        raise ValueError("Fichier temporaire de dependances non sur.")
+    temporary.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + NL,
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+async def _tool_install_package(task_id: int, iteration: int, folder: str,
+                                act: dict, agent_name: Optional[str]) -> str:
+    task = await db_get_task(task_id)
+    if not task:
+        return "Tache introuvable."
+    raw_payload = {key: act[key] for key in INSTALL_PAYLOAD_FIELDS if key in act}
+    try:
+        plan = make_install_plan(raw_payload)
+    except InstallValidationError as exc:
+        return "Demande d'installation refusee : " + str(exc)
+
+    agent_reason = str(act.get("reason") or "").strip()[:500]
+    decision = evaluate_install(plan, task.get("install_policy") or "ask")
+    request_id = uuid.uuid4().hex
+    created_at = datetime.utcnow()
+    expires_at = created_at + timedelta(seconds=INSTALL_REQUEST_TIMEOUT_SECONDS)
+    record = {
+        "id": request_id,
+        "task_id": task_id,
+        "iteration": iteration,
+        "agent": agent_name or "Agent",
+        "plan_hash": plan.plan_hash,
+        "manager": plan.manager.value,
+        "package": plan.package,
+        "version": plan.version,
+        "scope": plan.scope,
+        "access_level": plan.access.value,
+        "reason": agent_reason,
+        "source": plan.source,
+        "allow_scripts": plan.allow_scripts,
+        "status": (
+            "denied" if decision.outcome is DecisionOutcome.DENIED
+            else "approved" if decision.outcome is DecisionOutcome.AUTOMATIC
+            else "pending"
+        ),
+        "decision": decision.outcome.value if decision.outcome is not DecisionOutcome.PROMPT else None,
+        "result": decision.reason if decision.outcome is DecisionOutcome.DENIED else None,
+        "created_at": created_at.isoformat(),
+        "expires_at": expires_at.isoformat() if decision.outcome is DecisionOutcome.PROMPT else None,
+        "resolved_at": created_at.isoformat() if decision.outcome is not DecisionOutcome.PROMPT else None,
+    }
+    if decision.outcome is DecisionOutcome.DENIED:
+        await db_create_install_request(record)
+        await emit(task_id, iteration, agent_name or "Agent", "permission_resolved", {
+            "request_id": request_id, "decision": "denied", "message": decision.reason,
+        })
+        return "Installation refusee : " + decision.reason
+
+    if decision.outcome is DecisionOutcome.PROMPT:
+        ctrl = running_tasks.get(task_id)
+        if ctrl is None:
+            return "Installation annulee : la tache n'est plus active."
+        control_lock = ctrl["permission_lock"]
+        future = asyncio.get_running_loop().create_future()
+        async with control_lock:
+            current = await db_get_task(task_id)
+            if not current or current.get("status") == "stopped":
+                return "Installation annulee : la tache est arretee."
+            pending = await db_list_install_requests(task_id, status="pending")
+            if len(pending) >= 10:
+                return "Installation refusee : trop de demandes sont deja en attente."
+            if any(row.get("plan_hash") == plan.plan_hash for row in pending):
+                return "Une demande identique est deja en attente."
+            install_waiters[request_id] = future
+            install_waiter_tasks[request_id] = task_id
+            try:
+                await db_create_install_request(record)
+                request_payload = await _install_payload_for_task(record)
+                await emit(
+                    task_id, iteration, agent_name or "Agent",
+                    "permission_requested", request_payload,
+                )
+            except Exception:
+                install_waiters.pop(request_id, None)
+                install_waiter_tasks.pop(request_id, None)
+                await db_expire_install_request(request_id, decision="display_failed")
+                raise
+        try:
+            user_decision = await asyncio.wait_for(
+                asyncio.shield(future), timeout=INSTALL_REQUEST_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            async with control_lock:
+                changed = await db_expire_install_request(request_id)
+                if changed:
+                    if not future.done():
+                        future.set_result("expired")
+                    try:
+                        await emit(task_id, iteration, agent_name or "Agent",
+                                   "permission_resolved", {
+                                       "request_id": request_id,
+                                       "decision": "expired",
+                                       "message": "La demande a expire.",
+                                   })
+                    except Exception as exc:
+                        log.warning("Expiration d'installation non emise: %s", exc)
+                    user_decision = "expired"
+                else:
+                    user_decision = future.result() if future.done() else "expired"
+        finally:
+            async with control_lock:
+                install_waiters.pop(request_id, None)
+                install_waiter_tasks.pop(request_id, None)
+        if user_decision != "allow_once":
+            return "Installation refusee par l'utilisateur."
+    else:
+        await db_create_install_request(record)
+
+    ctrl = running_tasks.get(task_id)
+    if ctrl is None:
+        await db_cancel_install_request(request_id, "Tache inactive.")
+        return "Installation annulee : la tache n'est plus active."
+    await _wait_if_paused(task_id)
+    if await _is_stopped(task_id):
+        await db_cancel_install_request(request_id, "Tache arretee avant l'installation.")
+        return "Installation annulee : la tache est arretee."
+    install_lock = ctrl["install_lock"]
+    async with install_lock:
+        try:
+            ok, output = await _execute_install_plan(task_id, folder, plan)
+        except asyncio.CancelledError:
+            await db_finish_install_request(request_id, False, "Installation annulee.")
+            raise
+        except Exception as exc:
+            ok, output = False, "Erreur d'installation : " + str(exc)[:1000]
+
+    if ok:
+        try:
+            await asyncio.to_thread(_record_installed_dependency, folder, plan)
+        except Exception as exc:
+            log.warning("Manifeste de dependances non ecrit: %s", exc)
+
+    await db_finish_install_request(request_id, ok, output)
+    message = (
+        "Installation terminee : " + plan.display
+        if ok else "Installation echouee : " + plan.display
+    )
+    await emit(task_id, iteration, agent_name or "Agent", "installation_result", {
+        "request_id": request_id, "ok": ok, "message": message,
+    })
+    return message + NL + output[-1800:]
 
 
 async def web_search(query: str) -> str:
@@ -779,44 +2912,83 @@ async def web_search(query: str) -> str:
 # Verifie cote serveur : un agent ne peut activer qu'un serveur de cette liste
 # (serveurs de reference du projet Model Context Protocol).
 OFFICIAL_MCP = {
-    # Python : auto-installables via pip + Python courant -> AUCUN prerequis pour l'utilisateur.
+    # Les paquets doivent etre installes explicitement via install_package.
     "fetch": {"kind": "python", "pip": "mcp-server-fetch", "module": "mcp_server_fetch"},
     "git": {"kind": "python", "pip": "mcp-server-git", "module": "mcp_server_git",
             "args": ["--repository", "{folder}"]},
     "time": {"kind": "python", "pip": "mcp-server-time", "module": "mcp_server_time"},
-    # Node : necessitent npx (Node.js), non auto-installable de facon fiable.
+    # Node : lance uniquement les executables deja presents dans l'environnement isole.
     "filesystem": {"kind": "npx", "package": "@modelcontextprotocol/server-filesystem",
-                   "args": ["{folder}"]},
-    "memory": {"kind": "npx", "package": "@modelcontextprotocol/server-memory"},
-    "sequentialthinking": {"kind": "npx", "package": "@modelcontextprotocol/server-sequential-thinking"},
-    "everything": {"kind": "npx", "package": "@modelcontextprotocol/server-everything"},
+                   "bin": "mcp-server-filesystem", "args": ["{folder}"]},
+    "memory": {"kind": "npx", "package": "@modelcontextprotocol/server-memory",
+               "bin": "mcp-server-memory"},
+    "sequentialthinking": {"kind": "npx", "package": "@modelcontextprotocol/server-sequential-thinking",
+                           "bin": "mcp-server-sequential-thinking"},
+    "everything": {"kind": "npx", "package": "@modelcontextprotocol/server-everything",
+                   "bin": "mcp-server-everything"},
 }
 
 
-async def _pip_install(pkg):
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "pip", "install", "-q", pkg,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-    out, _ = await asyncio.wait_for(proc.communicate(), timeout=240)
-    if proc.returncode != 0:
-        raise RuntimeError("pip install " + pkg + " a echoue : "
-                           + out.decode("utf-8", "replace")[-300:])
-
-
 async def _ensure_mcp_command(name, folder):
-    """Construit la commande de lancement, en installant le serveur si besoin (Python)."""
+    """Construit la commande sans jamais telecharger silencieusement un serveur."""
     spec = OFFICIAL_MCP[name]
     args = [a.replace("{folder}", folder) for a in spec.get("args", [])]
+    installed = _read_installed_dependency_manifest(folder)
     if spec["kind"] == "python":
-        import importlib.util
+        task_version = (installed.get("python") or {}).get(spec["pip"])
+        candidates = []
+        if task_version:
+            candidates.append((_task_venv_python(folder), task_version))
+        if not getattr(sys, "frozen", False):
+            candidates.append((Path(sys.executable), None))
+        for candidate, expected_version in candidates:
+            if not candidate.exists():
+                continue
+            proc = await asyncio.create_subprocess_exec(
+                str(candidate), "-c",
+                "import importlib.metadata as m,importlib.util,sys;"
+                "v=m.version(sys.argv[1]);"
+                "sys.exit(0 if importlib.util.find_spec(sys.argv[3]) and "
+                "(not sys.argv[2] or v==sys.argv[2]) else 1)",
+                spec["pip"], expected_version or "", spec["module"],
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL, env=build_child_environment(),
+                cwd=str(APP_ROOT),
+            )
+            await proc.communicate()
+            if proc.returncode == 0:
+                return [str(candidate), "-m", spec["module"]] + args
+        raise RuntimeError(
+            "Le serveur MCP '" + name + "' n'est pas installe. Utilise install_package "
+            "avec manager=python, package=" + spec["pip"] + " et une version exacte."
+        )
+    expected_version = (installed.get("npm") or {}).get(spec["package"])
+    if expected_version:
+        plan = make_install_plan({
+            "manager": "npm", "package": spec["package"], "version": expected_version,
+        })
+        environment = _task_npm_root(folder) / plan.plan_hash
+        package_dir = environment / "node_modules" / Path(*spec["package"].split("/"))
+        package_json = package_dir / "package.json"
         try:
-            present = importlib.util.find_spec(spec["module"]) is not None
-        except Exception:
-            present = False
-        if not present:
-            await _pip_install(spec["pip"])   # les agents installent eux-memes
-        return [sys.executable, "-m", spec["module"]] + args
-    return ["npx", "-y", spec["package"]] + args   # kind == "npx"
+            metadata = json.loads(package_json.read_text(encoding="utf-8"))
+            binary = metadata.get("bin")
+            if isinstance(binary, dict):
+                binary = binary.get(spec["bin"])
+            if (metadata.get("name") == spec["package"]
+                    and metadata.get("version") == expected_version
+                    and isinstance(binary, str)):
+                executable = (package_dir / binary).resolve()
+                if package_dir.resolve() in executable.parents and executable.is_file():
+                    node = shutil.which("node") or shutil.which("node.exe")
+                    if node:
+                        return [str(Path(node).resolve()), str(executable)] + args
+        except (OSError, json.JSONDecodeError):
+            pass
+    raise RuntimeError(
+        "Le serveur MCP '" + name + "' n'est pas installe. Utilise install_package "
+        "avec manager=npm, package=" + spec["package"] + " et une version exacte."
+    )
 
 
 class MCPServer:
@@ -858,6 +3030,7 @@ class MCPServer:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=build_child_environment(),
         )
         await self._send("initialize", {
             "protocolVersion": "2024-11-05",
@@ -904,8 +3077,8 @@ async def _tool_add_mcp(task_id, folder, server):
     try:
         await asyncio.wait_for(s.start(), timeout=90)
     except FileNotFoundError:
-        return ("Le serveur MCP '" + server + "' necessite Node.js (npx), absent. "
-                "Prefere un serveur Python qui s'installe seul : fetch, git ou time.")
+        return ("Impossible de lancer le serveur MCP '" + server + "'. "
+                "Installe d'abord son paquet exact avec install_package.")
     except Exception as e:
         return "Echec demarrage MCP '" + server + "' : " + str(e)[:200]
     registry[server] = s
@@ -973,9 +3146,12 @@ async def _search_knowledge(query, agent_name=None):
 
 
 async def execute_tool(task_id: int, folder: str, web_enabled: bool, act: dict,
-                       agent_name: Optional[str] = None) -> str:
+                       agent_name: Optional[str] = None, iteration: int = 0) -> str:
     tool = act.get("tool")
     try:
+        current_task = await db_get_task(task_id)
+        if not current_task or current_task.get("status") != "running":
+            return "Action refusee : la tache n'est plus en cours."
         if tool == "write_file":
             p = _safe_path(folder, act.get("path", ""))
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -995,16 +3171,27 @@ async def execute_tool(task_id: int, folder: str, web_enabled: bool, act: dict,
                             + tp.read_text(encoding="utf-8", errors="replace")[:5000])
             return "Introuvable: " + str(rel)
         if tool == "run_command":
-            return await _run_cmd(folder, act.get("cmd", ""))
+            return await _run_cmd(folder, act.get("cmd", ""), task_id=task_id)
         if tool == "run_tests":
-            return await _run_pytest(folder)
+            return await _run_pytest(folder, task_id=task_id)
+        if tool == "install_package":
+            return await _tool_install_package(
+                task_id, iteration, folder, act, agent_name
+            )
         if tool == "web_search":
             if not web_enabled:
                 return "Recherche web desactivee pour cette tache."
             return await web_search(act.get("query", ""))
         if tool == "add_mcp":
+            if current_task.get("execution_mode") == "docker":
+                return (
+                    "MCP est desactive en mode Docker tant que ses processus "
+                    "ne peuvent pas etre executes dans le meme bac a sable."
+                )
             return await _tool_add_mcp(task_id, folder, act.get("server", ""))
         if tool == "mcp_call":
+            if current_task.get("execution_mode") == "docker":
+                return "Appel MCP refuse en mode Docker."
             return await _tool_mcp_call(task_id, act.get("server", ""),
                                         act.get("name") or act.get("tool_name") or "",
                                         act.get("arguments") or {})
@@ -1012,6 +3199,39 @@ async def execute_tool(task_id: int, folder: str, web_enabled: bool, act: dict,
             return await _save_knowledge(act.get("content", ""), agent_name=agent_name)
         if tool == "search_knowledge":
             return await _search_knowledge(act.get("query", ""), agent_name=agent_name)
+        if tool == "propose_skill":
+            if not agent_name:
+                return "Proposition refusee : identite d'agent absente."
+            skill = await agent_skills.propose_skill(
+                task_id=task_id,
+                agent=agent_name,
+                name=act.get("name", ""),
+                summary=act.get("summary", ""),
+                instructions=act.get("instructions", ""),
+                tags=act.get("tags") or [],
+                db_path=DB_PATH,
+            )
+            await emit(task_id, iteration, agent_name, "skill_proposed", {
+                "skill_id": skill.id,
+                "name": skill.name,
+                "summary": skill.summary,
+                "status": skill.status.value,
+            })
+            return (
+                f"Competence proposee (#{skill.id}). Elle restera inactive "
+                "jusqu'a la validation d'un humain."
+            )
+        if tool == "send_notification":
+            if not agent_name:
+                return "Notification refusee : identite d'agent absente."
+            job_id = await enqueue_notification(
+                task_id=task_id,
+                iteration=iteration,
+                agent=agent_name,
+                channel=act.get("channel", ""),
+                text=act.get("text", ""),
+            )
+            return "Notification ajoutee a la file (travail " + job_id + ")."
         return "Outil inconnu: " + str(tool)
     except Exception as e:
         return "Erreur outil " + str(tool) + ": " + str(e)
@@ -1129,11 +3349,16 @@ Reponds UNIQUEMENT avec un objet JSON decrivant tes actions pour avancer sur la 
     {{"tool":"read_file","path":"..."}},
     {{"tool":"run_command","cmd":"python script.py"}},
     {{"tool":"run_tests"}},
+    {{"tool":"install_package","manager":"python","package":"requests","version":"2.32.3","reason":"appeler l'API demandee"}},
+    {{"tool":"install_package","manager":"npm","package":"vite","version":"5.4.8","allow_scripts":false,"reason":"construire l'interface"}},
+    {{"tool":"install_package","manager":"winget","package":"Microsoft.VisualStudioCode","version":"1.95.3","scope":"user","reason":"mettre l'editeur a disposition de l'utilisateur"}},
     {{"tool":"web_search","query":"..."}},
     {{"tool":"add_mcp","server":"filesystem"}},
     {{"tool":"mcp_call","server":"filesystem","name":"list_directory","arguments":{{}}}},
     {{"tool":"search_knowledge","query":"astuce dependance windows"}},
-    {{"tool":"save_knowledge","content":"Lecon apprise reutilisable pour les futures taches"}}
+    {{"tool":"save_knowledge","content":"Lecon apprise reutilisable pour les futures taches"}},
+    {{"tool":"propose_skill","name":"Nom clair","summary":"Quand l'utiliser","instructions":"Methode documentaire reutilisable...","tags":["python"]}},
+    {{"tool":"send_notification","channel":"canal-configure","text":"Le travail est termine."}}
   ],
   "done": false,
   "report":"(quand done=true) resume clair de ce que tu as produit"}}
@@ -1141,16 +3366,25 @@ Reponds UNIQUEMENT avec un objet JSON decrivant tes actions pour avancer sur la 
 Regles :
 - Ecris tes livrables dans des fichiers (write_file), chemins relatifs au dossier de travail.
 - Commandes autorisees (run_command) : {whitelist}.
-- Tu peux installer des paquets Python via run_command (ex: "pip install requests").
+- Pour installer, utilise UNIQUEMENT install_package avec un nom et une version exacts. N'utilise jamais
+  pip install, npm install, un lien de telechargement ou un script d'installation dans run_command.
+- manager=python installe dans l'environnement prive de la tache. manager=npm installe dans un espace
+  npm prive, sans scripts (les scripts npm sont refuses). Pour une application Windows, utilise
+  manager=winget et scope=user ou system ; l'application est mise a disposition de l'utilisateur,
+  elle n'est pas lancee automatiquement par l'agent.
+  Orchestrator calcule le niveau d'acces et peut demander l'accord de l'utilisateur.
 - Outils MCP OFFICIELS uniquement : active un serveur avec add_mcp (autorises : {mcp_servers}),
   puis utilise ses outils via mcp_call. Tout serveur non officiel est refuse automatiquement.
-  fetch/git/time s'installent tout seuls (Python) ; filesystem/memory/sequentialthinking/everything
-  necessitent Node.js. Tu peux aussi installer des paquets toi-meme via run_command (pip install ...).
+  Si le paquet du serveur manque, installe-le d'abord avec install_package, puis rappelle add_mcp.
 - Memoire persistante : search_knowledge(query) cherche dans (TON namespace de role + lecons
   partagees + notes utilisateur). save_knowledge(content) ENREGISTRE une astuce dans TON namespace
   de role -- elle te servira (ainsi qu'aux futurs agents du meme role) sur les taches a venir.
   Consulte la memoire AU DEBUT de chaque mission, et enregistre une lecon AVANT de finir si tu as
   appris quelque chose de generalisable.
+- Competences reutilisables : propose_skill soumet uniquement une methode DOCUMENTAIRE. Elle ne
+  devient jamais active automatiquement : un humain doit la relire et l'approuver dans /skills.
+- Notifications sortantes : send_notification accepte seulement un nom configure par le serveur.
+  Canaux disponibles : {channels}. Tu ne fournis jamais d'URL, de webhook ni de secret.
 - Quand ta mission est accomplie : "done": true et un "report". Sinon "done": false avec des actions.
 - Un seul JSON par reponse, aucun texte autour."""
 
@@ -1180,10 +3414,19 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
         web=("oui" if web_enabled else "non"),
         whitelist=", ".join(sorted(COMMAND_WHITELIST)),
         mcp_servers=", ".join(sorted(OFFICIAL_MCP)),
+        channels=", ".join(await _configured_channels()) or "(aucun)",
     )
+    ctrl = running_tasks.get(task_id)
+    if ctrl and ctrl.get("skills_block"):
+        system += NL + ctrl["skills_block"]
     # Mode entreprise : lire le depot cible (lecture seule), ecrire UNIQUEMENT dans delivery/.
     _t = await db_get_task(task_id)
     company = bool(_t and _t.get("company_mode"))
+    if _t and _t.get("execution_mode") == "docker":
+        system += (
+            NL + "MODE DOCKER ISOLE : add_mcp et mcp_call sont indisponibles. "
+            "N'essaie pas de les utiliser dans cette mission."
+        )
     if company:
         system += (NL + "MODE ENTREPRISE : le depot d'origine est en LECTURE SEULE (read_file le voit). "
                    "Tu ecris (write_file) UNIQUEMENT dans 'delivery/...'. Ne tente jamais d'ecrire hors du "
@@ -1206,6 +3449,9 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
         await _log_prompt(task_id, iteration, name, system, hist, image)
         raw = await call_model(agent["provider"], agent["model"], system, hist,
                                on_notice=notice, image=image, task_id=task_id)
+        await _wait_if_paused(task_id)
+        if await _is_stopped(task_id):
+            break
         hist.append({"role": "assistant", "content": raw})
         data = _extract_json(raw) or {}
 
@@ -1217,7 +3463,9 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
             tool = act.get("tool")
             await emit(task_id, iteration, name, "tool_call",
                        {"tool": tool, "input": {k: v for k, v in act.items() if k != "tool"}})
-            out = await execute_tool(task_id, folder, web_enabled, act, agent_name=name)
+            out = await execute_tool(
+                task_id, folder, web_enabled, act, agent_name=name, iteration=iteration
+            )
             await emit(task_id, iteration, name, "tool_result", {"tool": tool, "output": out[:1500]})
             return tool, out
 
@@ -1233,7 +3481,7 @@ async def _run_worker(task_id, iteration, agent, instruction, folder, web_enable
         for act in sequential:
             tool, out = await _exec_one(act)
             results.append("[" + str(tool) + "] " + out)
-            if tool in ("write_file", "run_command", "run_tests"):
+            if tool in ("write_file", "run_command", "run_tests", "install_package"):
                 touched = True
         if touched:
             await emit(task_id, iteration, name, "files_changed", {"list": _list_files(folder)})
@@ -1494,6 +3742,30 @@ async def _run_task(task_id, resume=False):
         if memory_block:
             start = start + NL + memory_block
 
+        # Seules les competences explicitement approuvees par un humain sont
+        # reutilisees. Elles restent du texte documentaire, jamais du code.
+        skills_block = ""
+        try:
+            skill_hits = await agent_skills.search_skills(
+                objective, limit=5, db_path=DB_PATH
+            )
+            if skill_hits:
+                skill_lines = []
+                for hit in skill_hits:
+                    skill = hit.skill
+                    skill_lines.append(
+                        "## " + skill.name + NL + skill.summary + NL + skill.instructions
+                    )
+                skills_block = (
+                    "COMPETENCES REUTILISABLES VALIDEES PAR L'UTILISATEUR :" + NL
+                    + (NL + NL).join(skill_lines)
+                )
+                start += NL + NL + skills_block
+        except Exception as exc:
+            log.info("[skills] recherche indisponible (%s)", type(exc).__name__)
+        if ctrl0 is not None:
+            ctrl0["skills_block"] = skills_block
+
         # Agents Anthropic geres disponibles sur le compte : le chef peut leur deleguer
         # via "assign_managed_agent". Echec de listing -> on continue sans (fonctionne pareil).
         managed_block = ""
@@ -1510,8 +3782,6 @@ async def _run_task(task_id, resume=False):
         worker_histories: dict[str, list] = {}
         if resume:
             iteration = int(task.get("iteration") or 0)
-            ceiling = COMPANY_MAX_ITER if company else MAX_ITER_CEILING
-            max_iter = min(max(max_iter, iteration + 20), ceiling)  # garantit du budget pour continuer
             chef_messages = [{"role": "user", "content": await _resume_context(task_id, folder)}]
             await emit(task_id, iteration, "systeme", "info",
                        {"msg": "Reprise de la tache au tour " + str(iteration) + " (contexte reconstruit)."})
@@ -1519,7 +3789,10 @@ async def _run_task(task_id, resume=False):
             chef_messages = [{"role": "user", "content": start + managed_block}]
             iteration = 0
 
-        await db_update_task(task_id, status="running")
+        if not await db_transition_task_status(
+            task_id, "running", {"queued", "running"}
+        ):
+            return
         while iteration < max_iter:
             await _wait_if_paused(task_id)
             if await _is_stopped(task_id):
@@ -1529,9 +3802,9 @@ async def _run_task(task_id, resume=False):
             if ctrl and ctrl.get("over_budget"):
                 msg = ("Budget maximal atteint (%.2f $ depenses). Arret de la tache. "
                        "Augmente le plafond puis reprends si besoin." % ctrl.get("cost", 0.0))
-                await emit(task_id, iteration, "systeme", "info", {"msg": msg})
-                await emit(task_id, iteration, "chef", "done", {"summary": msg})
-                await db_update_task(task_id, status="stopped")
+                if await db_transition_task_status(task_id, "stopped", {"running"}):
+                    await emit(task_id, iteration, "systeme", "info", {"msg": msg})
+                    await emit(task_id, iteration, "chef", "done", {"summary": msg})
                 return
             if ctrl and ctrl.get("inbox"):
                 pending, ctrl["inbox"] = ctrl["inbox"], []
@@ -1593,8 +3866,8 @@ async def _run_task(task_id, resume=False):
                                    {"msg": str(n_saved) + " lecon(s) memorisee(s) pour les futures taches."})
                 except Exception as e:
                     log.info("[memoire] auto-resume KO : %s", e)
-                await emit(task_id, iteration, "chef", "done", {"summary": final})
-                await db_update_task(task_id, status="done")
+                if await db_transition_task_status(task_id, "done", {"running"}):
+                    await emit(task_id, iteration, "chef", "done", {"summary": final})
                 return
 
             if action == "create_agent":
@@ -1711,18 +3984,24 @@ async def _run_task(task_id, resume=False):
                                   "parallel_assign, challenge, assign_managed_agent ou finish."})
 
         if not await _is_stopped(task_id):
-            await emit(task_id, iteration, "chef", "done",
-                       {"summary": "Limite de " + str(max_iter) + " iterations atteinte."})
-            await db_update_task(task_id, status="failed")
+            if await db_transition_task_status(task_id, "failed", {"running"}):
+                await emit(task_id, iteration, "chef", "done",
+                           {"summary": "Limite de " + str(max_iter) + " iterations atteinte."})
     except asyncio.CancelledError:
-        await db_update_task(task_id, status="stopped")
+        current = await db_get_task(task_id)
+        # Une fermeture de l'application ou la perte du bail n'est pas un
+        # ordre d'arret humain. La file durable reprendra la tache.
+        if current and current.get("status") not in {"paused", "stopped", "done"}:
+            await db_transition_task_status(task_id, "queued", {"running"})
         raise
     except Exception as e:
         log.exception("Task %s crashed", task_id)
-        await emit(task_id, 0, "systeme", "error", {"msg": str(e)[:300]})
-        await db_update_task(task_id, status="failed")
+        if await db_transition_task_status(task_id, "failed", {"running", "queued"}):
+            await emit(task_id, 0, "systeme", "error", {"msg": str(e)[:300]})
+        raise
     finally:
         await _stop_mcp(task_id)
+        await _cancel_install_waiters(task_id, reason="task_finished")
         running_tasks.pop(task_id, None)
 
 
@@ -1746,6 +4025,8 @@ class TaskCreate(BaseModel):
     target_repo_url: Optional[str] = None  # URL GitHub a cloner localement (lecture seule)
     github_token: Optional[str] = None  # token pour depot prive (utilise pour le clone, jamais stocke)
     max_cost_usd: float = 0  # plafond de cout par tache en USD (0 = pas de plafond)
+    install_policy: str = "ask"  # blocked|ask|project|user|admin
+    execution_mode: str = DEFAULT_EXECUTION_MODE  # docker|local
 
 
 router = APIRouter()
@@ -1773,6 +4054,12 @@ async def create_task(body: TaskCreate):
     agents_ceiling = COMPANY_MAX_AGENTS if company else MAX_AGENTS_CEILING
     max_iter = max(1, min(body.max_iterations, iter_ceiling))
     max_agents = max(1, min(body.max_agents, agents_ceiling))
+    install_policy = (body.install_policy or "ask").strip().lower()
+    if install_policy not in INSTALL_POLICY_VALUES:
+        raise HTTPException(400, "Niveau d'installation invalide.")
+    execution_mode = (body.execution_mode or DEFAULT_EXECUTION_MODE).strip().lower()
+    if execution_mode not in EXECUTION_MODES:
+        raise HTTPException(400, "Mode d'execution invalide.")
     target_path = None
     if company:
         if body.target_repo_url:
@@ -1780,8 +4067,11 @@ async def create_task(body: TaskCreate):
                 target_path = await _clone_repo(body.target_repo_url, body.github_token)
             except Exception as e:
                 raise HTTPException(400, "Connexion au depot GitHub impossible : " + str(e)[:300])
-        elif body.target_path and Path(body.target_path).exists():
-            target_path = str(Path(body.target_path).resolve())
+        elif body.target_path:
+            try:
+                target_path = str(resolve_allowed_target_path(body.target_path))
+            except (OSError, ValueError) as e:
+                raise HTTPException(400, str(e)[:300])
         else:
             raise HTTPException(400, "Mode entreprise : fournis une URL GitHub (target_repo_url) "
                                      "OU un chemin local existant (target_path).")
@@ -1793,7 +4083,9 @@ async def create_task(body: TaskCreate):
     task_id = await db_create_task(objective, folder, max_iter, max_agents,
                                    body.web_enabled, body.chef_model or DEFAULT_CLAUDE,
                                    company_mode=company, target_path=target_path,
-                                   max_cost_usd=max(0.0, float(body.max_cost_usd or 0)))
+                                   max_cost_usd=max(0.0, float(body.max_cost_usd or 0)),
+                                   install_policy=install_policy,
+                                   execution_mode=execution_mode)
     # Amorcage optionnel d'agents par l'utilisateur
     for a in body.agents:
         name = (a.name or "").strip()
@@ -1814,22 +4106,86 @@ async def create_task(body: TaskCreate):
     return {"id": task_id, "folder": folder}
 
 
+async def _cancel_install_waiters_locked(task_id: int, reason: str):
+    rows = await db_list_install_requests(task_id, status="pending")
+    await db_cancel_pending_install_requests(task_id, decision=reason)
+    for row in rows:
+        request_id = row["id"]
+        future = install_waiters.pop(request_id, None)
+        install_waiter_tasks.pop(request_id, None)
+        if future and not future.done():
+            future.set_result("cancelled")
+        try:
+            await emit(task_id, row.get("iteration", 0), row.get("agent") or "Agent",
+                       "permission_resolved", {
+                           "request_id": request_id,
+                           "decision": "cancelled",
+                           "message": "La demande a ete annulee.",
+                       })
+        except Exception as exc:
+            log.warning("Resolution d'installation non emise: %s", exc)
+
+
+async def _cancel_install_waiters(task_id: int, reason: str = "task_stopped"):
+    ctrl = running_tasks.get(task_id)
+    if ctrl:
+        async with ctrl["permission_lock"]:
+            await _cancel_install_waiters_locked(task_id, reason)
+    else:
+        await _cancel_install_waiters_locked(task_id, reason)
+
+
 def _spawn_loop(task_id, resume=False):
+    existing = running_tasks.get(task_id)
+    if existing and existing.get("task"):
+        return existing["task"]
     pause = asyncio.Event()
     pause.set()  # set = en marche ; clear = en pause
-    running_tasks[task_id] = {"pause": pause, "step": False, "inbox": [], "mcp": {}}
-    running_tasks[task_id]["task"] = asyncio.create_task(_run_task(task_id, resume=resume))
+    running_tasks[task_id] = {
+        "pause": pause,
+        "step": False,
+        "inbox": [],
+        "mcp": {},
+        "install_lock": asyncio.Lock(),
+        "permission_lock": asyncio.Lock(),
+    }
+    running_tasks[task_id]["task"] = asyncio.create_task(
+        _run_task(task_id, resume=resume), name=f"agent-task-{task_id}"
+    )
+    return running_tasks[task_id]["task"]
 
 
 @router.post("/api/tasks/{task_id}/start")
 async def start_task(task_id: int):
+    async with _task_lifecycle_lock(task_id):
+        _require_runtime_services()
+        return await _start_task_locked(task_id)
+
+
+async def _start_task_locked(task_id: int):
     t = await db_get_task(task_id)
     if not t:
         raise HTTPException(404, "Tache introuvable")
     if task_id in running_tasks:
         return {"status": "already_running"}
-    _spawn_loop(task_id, resume=False)
-    return {"status": "running"}
+    if t.get("status") not in {"idle", "queued"}:
+        raise HTTPException(409, "Cette tache doit etre reprise, pas redemarree.")
+    if task_queue is None:
+        raise HTTPException(503, "La file durable n'est pas encore prete.")
+    if t.get("execution_mode") == "docker":
+        try:
+            await get_sandbox_runtime().ensure_available()
+        except SandboxUnavailableError as exc:
+            raise HTTPException(409, str(exc))
+    try:
+        job = await enqueue_task_run(
+            task_id,
+            resume=False,
+            expected_statuses={str(t.get("status"))},
+        )
+    except TaskReservationConflict as exc:
+        raise HTTPException(409, str(exc)) from None
+    return {"status": "queued", "job_id": job.id}
 
 
 class RestartBody(BaseModel):
@@ -1838,6 +4194,12 @@ class RestartBody(BaseModel):
 
 @router.post("/api/tasks/{task_id}/restart")
 async def restart_task(task_id: int, body: Optional[RestartBody] = None):
+    async with _task_lifecycle_lock(task_id):
+        _require_runtime_services()
+        return await _restart_task_locked(task_id, body)
+
+
+async def _restart_task_locked(task_id: int, body: Optional[RestartBody] = None):
     """Reprend une tache terminee/arretee/echouee la ou elle s'etait arretee (contexte reconstruit)."""
     t = await db_get_task(task_id)
     if not t:
@@ -1848,56 +4210,298 @@ async def restart_task(task_id: int, body: Optional[RestartBody] = None):
         raise HTTPException(400, "La tache n'est pas dans un etat reprenable (" + str(t["status"]) + ").")
     if body and body.max_cost_usd is not None:
         await db_update_task(task_id, max_cost_usd=max(0.0, float(body.max_cost_usd)))
-    _spawn_loop(task_id, resume=True)
-    return {"status": "running", "resumed": True}
+    if task_queue is None:
+        raise HTTPException(503, "La file durable n'est pas encore prete.")
+    if t.get("execution_mode") == "docker":
+        try:
+            await get_sandbox_runtime().ensure_available()
+        except SandboxUnavailableError as exc:
+            raise HTTPException(409, str(exc))
+    try:
+        job = await enqueue_task_run(
+            task_id,
+            resume=True,
+            source="restart",
+            expected_statuses={str(t.get("status"))},
+        )
+    except TaskReservationConflict as exc:
+        raise HTTPException(409, str(exc)) from None
+    return {"status": "queued", "resumed": True, "job_id": job.id}
 
 
 @router.post("/api/tasks/{task_id}/pause")
 async def pause_task(task_id: int):
+    async with _task_lifecycle_lock(task_id):
+        return await _pause_task_locked(task_id)
+
+
+async def _pause_task_locked(task_id: int):
+    task = await db_get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Tache introuvable")
+    if task.get("status") not in {"running", "queued"}:
+        raise HTTPException(409, "Seule une tache en cours ou en attente peut etre mise en pause.")
     ctrl = running_tasks.get(task_id)
-    if not ctrl:
-        raise HTTPException(404, "Tache non active")
-    ctrl["pause"].clear()
-    await db_update_task(task_id, status="paused")
+    if ctrl is None and not task.get("queue_job_id"):
+        raise HTTPException(409, "Cette tache n'a pas de lancement actif.")
+    worker_task = ctrl.get("task") if ctrl else None
+    if ctrl:
+        async with ctrl["permission_lock"]:
+            transitioned = await db_transition_task_status(
+                task_id, "paused", {"running", "queued"}
+            )
+            if not transitioned:
+                raise HTTPException(409, "La tache vient deja de se terminer.")
+            ctrl["pause"].clear()
+    else:
+        transitioned = await db_transition_task_status(
+            task_id, "paused", {"running", "queued"}
+        )
+        if not transitioned:
+            raise HTTPException(409, "La tache vient deja de se terminer.")
+    if task_queue is not None and task.get("queue_job_id"):
+        paused = await task_queue.pause(task["queue_job_id"])
+        # Si le travail durable s'est termine exactement pendant la pause, on
+        # conserve l'etat frais ``paused``. Reprendre creera une nouvelle
+        # occurrence au lieu de restaurer l'ancien snapshot (souvent running)
+        # par-dessus un etat terminal plus recent.
+        if paused is not None and paused.state not in {
+            JobState.PAUSED,
+            JobState.SUCCEEDED,
+            JobState.FAILED,
+            JobState.CANCELLED,
+        }:
+            raise HTTPException(409, "Ce lancement ne peut plus etre mis en pause.")
+    if worker_task and not worker_task.done():
+        worker_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await worker_task
     await emit(task_id, 0, "systeme", "paused", {})
     return {"status": "paused"}
 
 
 @router.post("/api/tasks/{task_id}/resume")
 async def resume_task(task_id: int):
+    async with _task_lifecycle_lock(task_id):
+        _require_runtime_services()
+        return await _resume_task_locked(task_id)
+
+
+async def _resume_task_locked(task_id: int):
+    task = await db_get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Tache introuvable")
+    if task.get("status") != "paused":
+        raise HTTPException(409, "Seule une tache en pause peut etre reprise.")
     ctrl = running_tasks.get(task_id)
-    if not ctrl:
-        raise HTTPException(404, "Tache non active")
-    ctrl["pause"].set()
-    await db_update_task(task_id, status="running")
+    if ctrl and (task_queue is None or not task.get("queue_job_id")):
+        async with ctrl["permission_lock"]:
+            if not await db_transition_task_status(task_id, "running", {"paused"}):
+                raise HTTPException(409, "La tache a change d'etat.")
+            ctrl["pause"].set()
+            await emit(task_id, 0, "systeme", "resumed", {})
+            return {"status": "running"}
+    if task_queue is not None and task.get("queue_job_id"):
+        current_job = await task_queue.get(task["queue_job_id"])
+        if current_job is not None and current_job.state is JobState.PAUSED:
+            # La tache est le verrou logique. Un second appel perd ici et ne
+            # touche jamais au travail que le premier est en train de reprendre.
+            if not await db_transition_task_status(task_id, "queued", {"paused"}):
+                raise HTTPException(409, "La tache a change d'etat.")
+            try:
+                resumed = await task_queue.resume(current_job.id)
+            except BaseException:
+                await db_transition_task_status(task_id, "paused", {"queued"})
+                raise
+            if resumed is None or resumed.state is not JobState.QUEUED:
+                await db_transition_task_status(task_id, "paused", {"queued"})
+                raise HTTPException(409, "Le lancement durable est introuvable.")
+            if ctrl:
+                async with ctrl["permission_lock"]:
+                    ctrl["pause"].set()
+            job_id = resumed.id
+        elif current_job is None or current_job.state in {
+            JobState.SUCCEEDED,
+            JobState.FAILED,
+            JobState.CANCELLED,
+        }:
+            # La pause a pu gagner la course avec la toute fin du worker. Le
+            # contexte persiste en DB ; une nouvelle occurrence le reprend.
+            try:
+                resumed = await enqueue_task_run(
+                    task_id,
+                    resume=True,
+                    source="resume",
+                    expected_statuses={"paused"},
+                )
+            except TaskReservationConflict as exc:
+                raise HTTPException(409, str(exc)) from None
+            job_id = resumed.id
+        else:
+            raise HTTPException(409, "Le lancement durable ne peut pas etre repris.")
+    else:
+        raise HTTPException(409, "Cette tache n'a pas de lancement a reprendre.")
     await emit(task_id, 0, "systeme", "resumed", {})
-    return {"status": "running"}
+    return {"status": "queued", "job_id": job_id}
 
 
 @router.post("/api/tasks/{task_id}/step")
 async def step_task(task_id: int):
-    """Avance la tache si elle est en pause : on debloque brievement la boucle."""
-    ctrl = running_tasks.get(task_id)
-    if not ctrl:
-        raise HTTPException(404, "Tache non active")
-    pause = ctrl["pause"]
-    pause.set()
-    await asyncio.sleep(0.05)
-    pause.clear()
-    await db_update_task(task_id, status="paused")
-    return {"status": "stepped"}
+    """Le pas-a-pas durable est desactive tant que son etat n'est pas persiste."""
+    task = await db_get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Tache introuvable")
+    if task.get("status") != "paused":
+        raise HTTPException(409, "La tache doit etre en pause.")
+    raise HTTPException(
+        409,
+        "Le mode Etape est temporairement indisponible avec la reprise durable. "
+        "Utilisez Reprendre puis Pause.",
+    )
+
+
+async def _cleanup_task_runtime(task_id: int, task: dict) -> None:
+    """Nettoie les ressources sans modifier le resultat persiste de la tache."""
+    await _stop_launched(task_id)
+    if task.get("execution_mode") == "docker":
+        runtime = get_sandbox_runtime()
+        try:
+            cleanup = await runtime.stop(task_id, strict=False)
+        except SandboxError as exc:
+            runtime.block_execution(
+                "Le nettoyage d'une tache Docker n'a pas pu etre verifie. "
+                "Redemarrez Docker Desktop puis l'Orchestrateur."
+            )
+            raise HTTPException(503, str(exc)[:500]) from None
+        if cleanup.failed:
+            runtime.block_execution(
+                "Un conteneur de tache a resiste au nettoyage. Aucune nouvelle "
+                "execution Docker n'est autorisee avant intervention."
+            )
+            raise HTTPException(
+                500, "La tache est arretee, mais son conteneur n'a pas pu etre nettoye."
+            )
+    await _stop_mcp(task_id)
 
 
 @router.post("/api/tasks/{task_id}/stop")
 async def stop_task(task_id: int):
-    await db_update_task(task_id, status="stopped")
+    async with _task_lifecycle_lock(task_id):
+        return await _stop_task_locked(task_id)
+
+
+async def _stop_task_locked(task_id: int):
+    task = await db_get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Tache introuvable")
     ctrl = running_tasks.get(task_id)
+    worker_task = ctrl.get("task") if ctrl else None
     if ctrl:
-        ctrl["pause"].set()  # debloque la boucle pour qu'elle constate l'arret
-    await _stop_launched(task_id)
-    await _stop_mcp(task_id)
+        async with ctrl["permission_lock"]:
+            transitioned = await db_transition_task_status(
+                task_id, "stopped", {"idle", "running", "queued", "paused"}
+            )
+            current = await db_get_task(task_id)
+            if not transitioned and (current or {}).get("status") != "stopped":
+                raise HTTPException(409, "La tache vient deja de se terminer.")
+            ctrl["pause"].set()  # debloque la boucle pour qu'elle constate l'arret
+            await _terminate_install_process(ctrl.get("install_proc"))
+            await _cancel_install_waiters_locked(task_id, "task_stopped")
+    else:
+        transitioned = await db_transition_task_status(
+            task_id, "stopped", {"idle", "running", "queued", "paused"}
+        )
+        current = await db_get_task(task_id)
+        if not transitioned and (current or {}).get("status") != "stopped":
+            raise HTTPException(409, "La tache vient deja de se terminer.")
+        await _cancel_install_waiters(task_id)
+    task = await db_get_task(task_id) or task
+    if task_queue is not None and task.get("queue_job_id"):
+        await task_queue.cancel(task["queue_job_id"])
+    await _discard_pending_completion_intents(task_id)
+    if worker_task and not worker_task.done():
+        worker_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await worker_task
+    await _cleanup_task_runtime(task_id, task)
     await emit(task_id, 0, "systeme", "stopped", {})
     return {"status": "stopped"}
+
+
+class InstallDecisionBody(BaseModel):
+    decision: str
+
+
+@router.get("/api/tasks/{task_id}/install-requests")
+async def list_install_requests(task_id: int, status: Optional[str] = Query(default=None)):
+    if not await db_get_task(task_id):
+        raise HTTPException(404, "Tache introuvable")
+    allowed_statuses = {
+        "pending", "approved", "denied", "succeeded", "failed", "expired", "cancelled",
+    }
+    if status is not None and status not in allowed_statuses:
+        raise HTTPException(400, "Etat de demande invalide.")
+    rows = await db_list_install_requests(task_id, status=status)
+    payloads = []
+    for row in rows:
+        try:
+            payloads.append(await _install_payload_for_task(row))
+        except InstallValidationError:
+            log.warning("Demande d'installation invalide en base : %s", row.get("id"))
+    return {"requests": payloads}
+
+
+@router.post("/api/tasks/{task_id}/install-requests/{request_id}/decision")
+async def decide_install_request(task_id: int, request_id: str, body: InstallDecisionBody):
+    if body.decision not in {"allow_once", "deny"}:
+        raise HTTPException(400, "Decision invalide.")
+    if not await db_get_task(task_id):
+        raise HTTPException(404, "Tache introuvable")
+    ctrl = running_tasks.get(task_id)
+    if not ctrl:
+        raise HTTPException(409, "La tache n'est plus active.")
+    async with ctrl["permission_lock"]:
+        row = await db_get_install_request(request_id)
+        if not row or row["task_id"] != task_id:
+            raise HTTPException(404, "Demande d'installation introuvable.")
+        if row["status"] != "pending":
+            raise HTTPException(409, "Cette demande a deja ete traitee.")
+        future = install_waiters.get(request_id)
+        if future is None or future.done() or install_waiter_tasks.get(request_id) != task_id:
+            raise HTTPException(409, "La tache n'attend plus cette decision.")
+
+        expires_at = row.get("expires_at")
+        if expires_at:
+            try:
+                expired = datetime.fromisoformat(expires_at) <= datetime.utcnow()
+            except ValueError:
+                expired = True
+            if expired:
+                await db_expire_install_request(request_id)
+                future.set_result("expired")
+                try:
+                    await emit(task_id, row.get("iteration", 0), row.get("agent") or "Agent",
+                               "permission_resolved", {
+                                   "request_id": request_id,
+                                   "decision": "expired",
+                               })
+                except Exception as exc:
+                    log.warning("Expiration d'installation non emise: %s", exc)
+                raise HTTPException(410, "Cette demande a expire.")
+
+        changed = await db_resolve_install_request(task_id, request_id, body.decision)
+        if not changed:
+            raise HTTPException(409, "Cette demande a deja ete traitee.")
+        future.set_result(body.decision)
+        try:
+            await emit(task_id, row.get("iteration", 0), row.get("agent") or "Agent",
+                       "permission_resolved", {
+                           "request_id": request_id,
+                           "decision": body.decision,
+                       })
+        except Exception as exc:
+            log.warning("Decision d'installation non emise: %s", exc)
+    return {"request_id": request_id, "decision": body.decision}
 
 
 class TaskMessage(BaseModel):
@@ -1922,13 +4526,64 @@ async def task_message(task_id: int, body: TaskMessage):
 WEB_ENTRYPOINTS = ["app.py", "main.py", "server.py", "run.py"]
 
 
+def _launched_app_lock(task_id: int) -> asyncio.Lock:
+    return _launched_app_locks.setdefault(task_id, asyncio.Lock())
+
+
 async def _stop_launched(task_id):
-    info = launched_apps.pop(task_id, None)
-    if info and info.get("proc") and info["proc"].returncode is None:
+    async with _launched_app_lock(task_id):
+        await _stop_launched_unlocked(task_id)
+
+
+async def _stop_launched_unlocked(task_id):
+    info = launched_apps.get(task_id)
+    if info and info.get("sandbox"):
+        runtime = get_sandbox_runtime()
         try:
-            info["proc"].terminate()
-        except Exception:
+            await runtime.stop_handle(info["sandbox"], strict=True)
+        except SandboxStopError:
+            # Le runtime conserve le suivi et bloque déjà les nouvelles
+            # exécutions. Ne pas oublier le handle tant que Docker n'a pas
+            # confirmé sa suppression.
+            raise
+        if launched_apps.get(task_id) is info:
+            launched_apps.pop(task_id, None)
+        return
+    if info and info.get("proc") and info["proc"].returncode is None:
+        proc = info["proc"]
+        try:
+            proc.terminate()
+        except ProcessLookupError:
             pass
+        except Exception as exc:
+            raise PreviewStopError(
+                "Impossible de demander l'arret de l'apercu local."
+            ) from exc
+        try:
+            await asyncio.wait_for(
+                proc.wait(), timeout=_PREVIEW_STOP_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                raise PreviewStopError(
+                    "Impossible de forcer l'arret de l'apercu local."
+                ) from exc
+            try:
+                await asyncio.wait_for(
+                    proc.wait(), timeout=_PREVIEW_STOP_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError as exc:
+                raise PreviewStopError(
+                    "L'apercu local ne confirme pas son arret."
+                ) from exc
+        if proc.returncode is None:
+            raise PreviewStopError("L'apercu local reste actif apres son arret.")
+    if launched_apps.get(task_id) is info:
+        launched_apps.pop(task_id, None)
 
 
 async def _drain_proc(task_id, proc):
@@ -1947,10 +4602,64 @@ async def _drain_proc(task_id, proc):
 
 
 async def _launch_python_app(task_id, base, name):
-    await _stop_launched(task_id)
+    await _stop_launched_unlocked(task_id)
+    task = await db_get_task(task_id)
+    if task and task.get("execution_mode") == "docker":
+        if not sandbox_app_network_allowed():
+            raise HTTPException(
+                409,
+                "L'aperçu d'une application dynamique est desactive : le reseau "
+                "Docker bridge donne aussi un acces sortant. Un administrateur "
+                "peut l'activer explicitement avec ORCHESTRATOR_SANDBOX_ALLOW_APP_NETWORK.",
+            )
+        source = (Path(base) / name).read_text(
+            encoding="utf-8", errors="replace"
+        )[:200_000]
+        match = re.search(r"\bport\s*=\s*(\d{2,5})", source)
+        container_port = int(match.group(1)) if match else 5000
+        if not 1024 <= container_port <= 65535:
+            container_port = 5000
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            host_port = int(probe.getsockname()[1])
+        try:
+            handle = await get_sandbox_runtime().launch(
+                task_id,
+                base,
+                ("python", name),
+                env={
+                    **_sandbox_task_environment(base),
+                    "PORT": str(container_port),
+                },
+                network_enabled=True,
+                published_ports={host_port: container_port},
+                lifetime_seconds=3600,
+            )
+        except SandboxError as exc:
+            raise HTTPException(409, "Lancement isole refuse : " + str(exc)[:1200])
+        url = f"http://127.0.0.1:{host_port}"
+        launched_apps[task_id] = {
+            "sandbox": handle,
+            "url": url,
+            "output": [],
+        }
+        return {
+            "type": "python",
+            "entry": name,
+            "url": url,
+            "running": True,
+            "output": "Application lancee dans un conteneur isole (duree maximale : 1 h).",
+        }
+    python_exe = _local_python_executable(base)
+    if not python_exe:
+        raise HTTPException(
+            409,
+            "Le lancement local exige un Python externe. Utilisez le mode Docker.",
+        )
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, name, cwd=str(base),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        python_exe, name, cwd=str(base),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        env=build_child_environment())
     launched_apps[task_id] = {"proc": proc, "url": None, "output": []}
     url, lines = None, []
     for _ in range(15):
@@ -1979,6 +4688,14 @@ async def _launch_python_app(task_id, base, name):
 
 @router.post("/api/tasks/{task_id}/launch")
 async def launch_app(task_id: int):
+    async with _preview_shutdown_lock():
+        async with _task_lifecycle_lock(task_id):
+            _require_runtime_services()
+            async with _launched_app_lock(task_id):
+                return await _launch_app_locked(task_id)
+
+
+async def _launch_app_locked(task_id: int):
     t = await db_get_task(task_id)
     if not t:
         raise HTTPException(404, "Tache introuvable")
@@ -1995,8 +4712,9 @@ async def launch_app(task_id: int):
 
 @router.post("/api/tasks/{task_id}/launch/stop")
 async def launch_stop(task_id: int):
-    await _stop_launched(task_id)
-    return {"stopped": True}
+    async with _task_lifecycle_lock(task_id):
+        await _stop_launched(task_id)
+        return {"stopped": True}
 
 
 @router.get("/api/tasks/{task_id}/app/{path:path}")
@@ -2010,7 +4728,23 @@ async def serve_app(task_id: int, path: str):
         raise HTTPException(400, "Chemin invalide")
     if not p.exists() or not p.is_file():
         raise HTTPException(404, "Fichier introuvable")
-    return FileResponse(p)
+    # Le livrable est non fiable. Une origine opaque et l'absence de connexion
+    # l'empechent de lire localStorage, d'appeler l'API Orchestrator ou
+    # d'exfiltrer la cle depuis le navigateur.
+    return FileResponse(
+        p,
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": (
+                "sandbox allow-scripts; default-src 'none'; "
+                "script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                "img-src data: blob:; font-src data:; base-uri 'none'; "
+                "form-action 'none'"
+            ),
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 # ── Edition de fichier depuis l'UI (#13 Monaco) ──────────────────────────────
@@ -2075,8 +4809,9 @@ async def export_task(task_id: int):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for p in base.rglob("*"):
-            if p.is_file():
-                z.write(p, p.relative_to(base).as_posix())
+            rel = p.relative_to(base)
+            if p.is_file() and not any(part in _WORKSPACE_IGNORE_DIRS for part in rel.parts):
+                z.write(p, rel.as_posix())
         if not (base / "start.bat").exists():
             z.writestr("start.bat", bat)
         if not (base / "start.sh").exists():
@@ -2089,17 +4824,26 @@ async def export_task(task_id: int):
 
 
 # ── CI locale : build & test + historique (#16) ──────────────────────────────
-def _venv_python(venv_dir: Path) -> Path:
-    sub = "Scripts" if os.name == "nt" else "bin"
-    return venv_dir / sub / ("python.exe" if os.name == "nt" else "python")
-
-
-async def _proc_run(args, cwd, timeout):
+async def _proc_run(args, cwd, timeout, *, task_id: Optional[int] = None):
     """Lance une commande, renvoie (code, sortie tronquee)."""
+    if await _task_uses_docker(task_id):
+        docker_args = list(args)
+        executable = Path(str(docker_args[0])).name.lower()
+        if executable.startswith("python") or executable in {"python.exe", "python3"}:
+            docker_args[0] = "python"
+        try:
+            result = await get_sandbox_runtime().run_command(
+                task_id, cwd, tuple(str(arg) for arg in docker_args),
+                timeout=timeout, env=_sandbox_task_environment(cwd),
+            )
+            return result.exit_code, (result.output or "(aucune sortie)")[:3000]
+        except SandboxError as exc:
+            return 1, "Execution isolee refusee : " + str(exc)[:1200]
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=build_child_environment())
     except FileNotFoundError:
         return 1, "Programme introuvable: " + str(args[0])
     try:
@@ -2125,15 +4869,22 @@ def _http_ping(url, timeout=5):
         return "erreur: " + str(e)[:120]
 
 
-async def _build_ping(folder, py_exe):
+async def _build_ping(folder, py_exe, *, task_id: Optional[int] = None):
     base = Path(folder)
     entry = next((n for n in WEB_ENTRYPOINTS if (base / n).exists()), None)
     if not entry:
         return {"name": "ping HTTP /", "ok": True, "log": "Pas d'app web Python (ignore)."}
+    if await _task_uses_docker(task_id):
+        return {
+            "name": "ping HTTP /",
+            "ok": True,
+            "log": "Le code n'est pas execute sur l'hote pendant le build. "
+                   "Utilisez Lancer pour le test HTTP isole.",
+        }
     # PYTHONUNBUFFERED : stdout non bufferise -> on lit l'URL de demarrage en temps reel.
     # FLASK_DEBUG=0 : decourage le reloader. On NE met PAS WERKZEUG_RUN_MAIN (sinon Werkzeug
     # cherche WERKZEUG_SERVER_FD -> KeyError fatale au demarrage).
-    env = os.environ.copy()
+    env = build_child_environment()
     env["PYTHONUNBUFFERED"] = "1"
     env["FLASK_DEBUG"] = "0"
     proc = None
@@ -2173,7 +4924,9 @@ async def _run_build(task_id, folder):
 
     # 1. Verification syntaxique globale
     py_files = [p for p in base.rglob("*.py")
-                if not any(x in p.parts for x in (".ci", "venv", ".venv", "__pycache__"))]
+                if not any(x in p.parts for x in (
+                    ".ci", "venv", ".venv", ".orchestrator", "node_modules", "__pycache__"
+                ))]
     errs = []
     for p in py_files:
         try:
@@ -2183,29 +4936,48 @@ async def _run_build(task_id, folder):
     steps.append({"name": "syntaxe", "ok": not errs,
                   "log": (str(len(py_files)) + " fichier(s) OK") if not errs else NL.join(errs)})
 
-    # 2. Installation propre dans un venv dedie (si requirements.txt)
-    py_exe = sys.executable
-    if (base / "requirements.txt").exists():
-        venv_dir = PROJECTS / ".ci" / str(task_id) / "venv"
-        venv_dir.parent.mkdir(parents=True, exist_ok=True)
-        code, vlog = await _proc_run([sys.executable, "-m", "venv", str(venv_dir)], base, 120)
-        cand = _venv_python(venv_dir)
-        if code == 0 and cand.exists():
-            py_exe = str(cand)
-            code, ilog = await _proc_run([py_exe, "-m", "pip", "install", "-q", "-r", "requirements.txt"], base, 300)
-            steps.append({"name": "install (venv)", "ok": code == 0, "log": ilog or "OK"})
-        else:
-            steps.append({"name": "install (venv)", "ok": False, "log": "Creation du venv echouee: " + vlog})
+    # 2. Reutilise uniquement l'environnement alimente par install_package.
+    # Le bouton Build ne doit jamais installer silencieusement un requirements.txt controle par un agent.
+    docker_mode = await _task_uses_docker(task_id)
+    task_python = _task_venv_python(base)
+    py_exe = "python" if docker_mode else _local_python_executable(base)
+    docker_packages = base / ".orchestrator" / "python-packages"
+    dependencies_ready = docker_packages.is_dir() if docker_mode else task_python.exists()
+    if (base / "requirements.txt").exists() and not dependencies_ready:
+        steps.append({
+            "name": "dependances autorisees",
+            "ok": False,
+            "log": "Aucune dependance n'a ete approuvee pour cette tache. "
+                   "L'agent doit utiliser install_package avant le build.",
+        })
     else:
-        steps.append({"name": "install (venv)", "ok": True, "log": "Pas de requirements.txt (ignore)."})
+        steps.append({
+            "name": "dependances autorisees",
+            "ok": True,
+            "log": ("Dependances privees de la tache utilisees."
+                    if dependencies_ready else "Aucune dependance Python declaree."),
+        })
 
     # 3. Tests unitaires (pytest)
-    code, tlog = await _proc_run([py_exe, "-m", "pytest", "-q"], base, 180)
+    if py_exe is None:
+        code, tlog = 1, (
+            "Tests locaux indisponibles dans le paquet autonome sans Python externe."
+        )
+    else:
+        code, tlog = await _proc_run(
+            [py_exe, "-m", "pytest", "-q"], base, 180, task_id=task_id
+        )
     # pytest renvoie 5 quand aucun test collecte -> on ne compte pas ca comme un echec
     steps.append({"name": "pytest", "ok": code in (0, 5), "log": tlog or "(aucune sortie)"})
 
     # 4. Ping HTTP /
-    steps.append(await _build_ping(folder, py_exe))
+    if py_exe is None:
+        steps.append({
+            "name": "ping HTTP /", "ok": False,
+            "log": "Lancement local indisponible sans Python externe.",
+        })
+    else:
+        steps.append(await _build_ping(folder, py_exe, task_id=task_id))
 
     status = "success" if all(s["ok"] for s in steps) else "failed"
     report = json.dumps(steps, ensure_ascii=False)
@@ -2259,14 +5031,53 @@ async def get_task(task_id: int):
 
 @router.delete("/api/tasks/{task_id}")
 async def delete_task(task_id: int):
-    await stop_task(task_id)
+    async with _task_lifecycle_lock(task_id):
+        return await _delete_task_locked(task_id)
+
+
+async def _delete_task_locked(task_id: int):
+    if automation_store is not None:
+        await automation_store.cancel_for_task(task_id)
+    if task_queue is not None:
+        await task_queue.cancel_scheduled_for_task(task_id)
+        await task_queue.cancel_notifications_for_task(task_id)
+    before_delete = await db_get_task(task_id)
+    if not before_delete:
+        raise HTTPException(404, "Tache introuvable")
+    if task_queue is not None and before_delete.get("queue_job_id"):
+        await task_queue.cancel(before_delete["queue_job_id"])
+    if before_delete.get("status") in {"done", "failed"}:
+        # Supprimer une tache terminee reste permis, sans reecrire son resultat
+        # en ``stopped`` pendant la fenetre de nettoyage.
+        finishing = (running_tasks.get(task_id) or {}).get("task")
+        if finishing and not finishing.done():
+            with suppress(asyncio.CancelledError, Exception):
+                await finishing
+        await _cleanup_task_runtime(task_id, before_delete)
+    else:
+        await _stop_task_locked(task_id)
     t = await db_get_task(task_id)
     if t:
-        shutil.rmtree(t["folder"], ignore_errors=True)
+        folder = Path(t["folder"]).resolve(strict=False)
+        projects_root = PROJECTS.resolve()
+        if folder != projects_root and projects_root in folder.parents:
+            if not await asyncio.to_thread(_rmtree_force, folder):
+                raise HTTPException(500, "Le dossier de la tache n'a pas pu etre supprime.")
+        else:
+            log.error("Suppression du dossier de tache refusee : %s", folder)
+            raise HTTPException(400, "Dossier de tache invalide ; suppression refusee.")
     # Nettoyer aussi le venv de CI et les snapshots (sinon orphelins, ~50 Mo+).
-    shutil.rmtree(PROJECTS / ".ci" / str(task_id), ignore_errors=True)
-    shutil.rmtree(PROJECTS / ".snapshots" / str(task_id), ignore_errors=True)
+    for auxiliary in (
+        PROJECTS / ".ci" / str(task_id),
+        PROJECTS / ".snapshots" / str(task_id),
+    ):
+        if not await asyncio.to_thread(_rmtree_force, auxiliary):
+            raise HTTPException(500, "Des fichiers annexes n'ont pas pu etre supprimes.")
     await db_delete_task(task_id)
+    if task_queue is not None:
+        # Second balayage sous le verrou lifecycle : couvre un enfilage qui
+        # aurait commence juste avant l'annulation du runner.
+        await task_queue.cancel_notifications_for_task(task_id)
     return {"deleted": True}
 
 
@@ -2382,13 +5193,13 @@ async def task_file(task_id: int, path: str = Query(...)):
 
 
 @router.get("/api/tasks/{task_id}/stream")
-async def stream_task(task_id: int):
+async def stream_task(task_id: int, after_id: int = Query(default=0, ge=0)):
     t = await db_get_task(task_id)
     if not t:
         raise HTTPException(404, "Tache introuvable")
 
     async def gen() -> AsyncGenerator[str, None]:
-        last_id = 0
+        last_id = after_id
         while True:
             rows = await db_messages_after(task_id, last_id)
             for r in rows:

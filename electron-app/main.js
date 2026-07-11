@@ -1,14 +1,24 @@
 const{app,BrowserWindow,Menu,Tray,shell,dialog,ipcMain}=require('electron');
 const path=require('path');
 const{spawn}=require('child_process');
+const crypto=require('crypto');
 const http=require('http');
+const net=require('net');
 const fs=require('fs');
 const security=require('./electron_hardening');
 
-const PORT=8000,BASE='http://127.0.0.1:8000',TITLE='Multi-Agent Orchestrator';
-let win=null,splash=null,tray=null,srv=null,quitting=false,relaunching=false;
+const TITLE='Multi-Agent Orchestrator';
+const INSTANCE_TOKEN=crypto.randomBytes(32).toString('base64url');
+let PORT=0,BASE='';
+let win=null,splash=null,tray=null,srv=null,quitting=false,relaunching=false,stopPromise=null;
 
-function appRoot(){return app.isPackaged?path.join(process.resourcesPath,'app'):path.join(__dirname,'..');}
+function appRoot(){return path.join(__dirname,'..');}
+
+function backendPath(){
+  if(!app.isPackaged)return null;
+  const name=process.platform==='win32'?'orchestrator-backend.exe':'orchestrator-backend';
+  return path.join(process.resourcesPath,'backend','orchestrator-backend',name);
+}
 
 function pyPath(){
   const r=appRoot();
@@ -18,32 +28,128 @@ function pyPath(){
   return 'python';
 }
 
+function findFreePort(){
+  return new Promise((resolve,reject)=>{
+    const probe=net.createServer();
+    probe.unref();
+    probe.once('error',reject);
+    probe.listen(0,'127.0.0.1',()=>{
+      const address=probe.address();
+      const port=address&&typeof address==='object'?address.port:0;
+      probe.close(err=>err?reject(err):resolve(port));
+    });
+  });
+}
+
 function checkServer(){
   return new Promise(res=>{
-    const r=http.get(BASE+'/api/stats',resp=>{res(resp.statusCode===200);});
-    r.on('error',()=>res(false));
-    r.setTimeout(2000,()=>{r.destroy();res(false);});
+    let settled=false;
+    const finish=value=>{if(!settled){settled=true;res(value);}};
+    const r=http.get(BASE+'/health',{headers:{'X-Orchestrator-Instance':INSTANCE_TOKEN}},resp=>{
+      let body='';
+      resp.setEncoding('utf8');
+      resp.on('data',chunk=>{body+=chunk;if(body.length>4096)r.destroy();});
+      resp.on('end',()=>{
+        try{
+          const data=JSON.parse(body);
+          finish(resp.statusCode===200&&data.status==='ok'&&
+            data.version===app.getVersion()&&data.instance===true);
+        }catch(e){finish(false);}
+      });
+    });
+    r.on('error',()=>finish(false));
+    r.setTimeout(2000,()=>{r.destroy();finish(false);});
   });
 }
 
 async function startServer(){
-  if(await checkServer()){console.log('[srv] already running');return true;}
-  const root=appRoot(),py=pyPath(),script=path.join(root,'orchestrator.py');
-  console.log('[srv] starting',py,script,'cwd:',root);
-  srv=spawn(py,[script],{cwd:root,env:{...process.env},stdio:['ignore','pipe','pipe']});
+  const root=appRoot();
+  const packagedBackend=backendPath();
+  const command=packagedBackend||pyPath();
+  const args=packagedBackend?[]:[path.join(root,'orchestrator.py')];
+  if(packagedBackend&&!fs.existsSync(packagedBackend)){
+    console.error('[srv] packaged backend missing',packagedBackend);
+    return false;
+  }
+  const dataDir=app.getPath('userData');
+  const env={...process.env,ORCHESTRATOR_DATA_DIR:dataDir,PORT:String(PORT),
+    ORCHESTRATOR_INSTANCE_TOKEN:INSTANCE_TOKEN};
+  console.log('[srv] starting',command,args.join(' '),'data:',dataDir);
+  srv=spawn(command,args,{cwd:packagedBackend?path.dirname(packagedBackend):root,env,stdio:['ignore','pipe','pipe'],windowsHide:true});
   srv.stdout.on('data',d=>console.log('[py]',d.toString().trim()));
   srv.stderr.on('data',d=>console.warn('[py!]',d.toString().trim()));
+  srv.on('error',error=>console.error('[srv] child process error',error.message));
   srv.on('close',code=>{srv=null;if(!quitting)dialog.showErrorBox('Serveur arrete','Code: '+code);});
-  return new Promise(res=>{
-    const t=Date.now();
-    const iv=setInterval(async()=>{
-      if(await checkServer()){clearInterval(iv);console.log('[srv] ready');res(true);}
-      else if(Date.now()-t>30000){clearInterval(iv);console.error('[srv] timeout');res(false);}
-    },500);
+  const child=srv;
+  const deadline=Date.now()+30000;
+  while(Date.now()<deadline){
+    if(await checkServer()){
+      console.log('[srv] ready');
+      return true;
+    }
+    if(srv!==child||child.exitCode!==null)return false;
+    await new Promise(resolve=>setTimeout(resolve,500));
+  }
+  console.error('[srv] timeout');
+  const stopped=await stopServer({force:true});
+  if(!stopped)console.error('[srv] backend still active after forced stop');
+  return false;
+}
+
+function prepareBackendShutdown(){
+  return new Promise(resolve=>{
+    if(!BASE){resolve(true);return;}
+    const req=http.request(BASE+'/api/runtime/prepare-shutdown',{
+      method:'POST',headers:{'X-Orchestrator-Instance':INSTANCE_TOKEN}
+    },resp=>{const ok=resp.statusCode>=200&&resp.statusCode<300;resp.resume();resp.on('end',()=>resolve(ok));});
+    req.on('error',()=>resolve(false));
+    req.setTimeout(12000,()=>{req.destroy();resolve(false);});
+    req.end();
   });
 }
 
-function stopServer(){if(srv){srv.kill('SIGTERM');srv=null;}}
+function waitForChildClose(child,timeoutMs){
+  return new Promise(resolve=>{
+    if(child.exitCode!==null){resolve(true);return;}
+    let settled=false;
+    const finish=value=>{
+      if(settled)return;
+      settled=true;
+      clearTimeout(timer);
+      child.removeListener('close',onClose);
+      resolve(value);
+    };
+    const onClose=()=>finish(true);
+    const timer=setTimeout(()=>finish(child.exitCode!==null),timeoutMs);
+    child.once('close',onClose);
+  });
+}
+
+function stopServer(options){
+  if(stopPromise)return stopPromise;
+  const child=srv;
+  if(!child)return Promise.resolve(true);
+  const force=Boolean(options&&options.force);
+  stopPromise=(async()=>{
+    const prepared=await prepareBackendShutdown();
+    if(!prepared&&!force){stopPromise=null;return false;}
+    if(child.exitCode===null){
+      try{child.kill('SIGTERM');}catch(e){console.warn('[srv] SIGTERM failed',e.message);}
+    }
+    let closed=await waitForChildClose(child,5000);
+    if(!closed&&child.exitCode===null){
+      try{child.kill();}catch(e){console.warn('[srv] forced stop failed',e.message);}
+      closed=await waitForChildClose(child,3000);
+    }
+    if(!closed&&child.exitCode===null){
+      stopPromise=null;
+      return false;
+    }
+    if(srv===child)srv=null;
+    return true;
+  })();
+  return stopPromise;
+}
 
 function createSplash(){
   splash=new BrowserWindow({width:460,height:280,frame:false,alwaysOnTop:true,resizable:false,center:true,backgroundColor:'#2b2b2b',webPreferences:{nodeIntegration:false,contextIsolation:true,sandbox:true}});
@@ -73,7 +179,9 @@ function createWin(){
   win.once('ready-to-show',()=>{if(splash&&!splash.isDestroyed()){splash.close();splash=null;}win.show();win.focus();});
   win.on('close',e=>{if(!quitting){e.preventDefault();win.hide();}});
   win.on('closed',()=>{win=null;});
-  win.webContents.on('did-fail-load',()=>{if(!quitting)win.loadURL('data:text/html,<body style="font-family:sans-serif;text-align:center;padding:40px"><h2>Connexion echouee</h2><br><button onclick="location.reload()">Reessayer</button></body>');});
+  win.webContents.on('did-fail-load',(_event,code,description,_url,isMainFrame)=>{
+    if(!quitting&&isMainFrame)dialog.showErrorBox('Connexion echouee',`${description} (${code})`);
+  });
 }
 
 function createTray(){
@@ -93,10 +201,29 @@ function createTray(){
 }
 
 function show(){if(win){win.show();win.focus();if(win.isMinimized())win.restore();}}
-function quit(){quitting=true;stopServer();app.quit();}
+async function quit(){
+  if(quitting)return;
+  quitting=true;
+  const stopped=await stopServer();
+  if(!stopped){
+    quitting=false;
+    dialog.showErrorBox('Fermeture suspendue','Des conteneurs sont encore actifs. Vérifiez Docker puis réessayez.');
+    return;
+  }
+  app.quit();
+}
 
+const TRUSTED_UI_PATHS=new Set(['/','/control','/workspace','/memory','/skills','/automations','/chat']);
+function isTrustedIpcEvent(event){
+  try{
+    const frameUrl=event.senderFrame&&event.senderFrame.url;
+    const parsed=new URL(frameUrl);
+    return parsed.origin===BASE&&TRUSTED_UI_PATHS.has(parsed.pathname);
+  }catch(e){return false;}
+}
 
-ipcMain.handle('select-folder', async () => {
+ipcMain.handle('select-folder', async (event) => {
+  if(!isTrustedIpcEvent(event))throw new Error('IPC origin refused');
   const result = await dialog.showOpenDialog(win || null, {
     properties: ['openDirectory', 'createDirectory'],
     title: 'Choisir le dossier du projet'
@@ -104,29 +231,62 @@ ipcMain.handle('select-folder', async () => {
   return result.canceled ? null : result.filePaths[0];
 });
 
-ipcMain.handle('open-external', (event, url) => { security.safeOpenExternal(url); });
+ipcMain.handle('open-external', (event, url) => {
+  if(!isTrustedIpcEvent(event))throw new Error('IPC origin refused');
+  security.safeOpenExternal(url);
+});
 
-ipcMain.handle('get-server-url',()=>BASE);
-ipcMain.handle('get-version',()=>app.getVersion());
-ipcMain.on('quit',()=>quit());
+ipcMain.handle('get-server-url',event=>{
+  if(!isTrustedIpcEvent(event))throw new Error('IPC origin refused');
+  return BASE;
+});
+ipcMain.handle('get-app-version',event=>{
+  if(!isTrustedIpcEvent(event))throw new Error('IPC origin refused');
+  return app.getVersion();
+});
+ipcMain.on('quit',event=>{if(isTrustedIpcEvent(event))quit();});
 
 app.whenReady().then(async()=>{
   if(!app.requestSingleInstanceLock()){app.quit();return;}
   app.on('second-instance',()=>show());
+  PORT=await findFreePort();
+  BASE=`http://127.0.0.1:${PORT}`;
+  security.configureLocalOrigin(BASE);
   security.setupSecureSession();
   createSplash();
   const ok=await startServer();
   if(!ok){
-    if(splash&&!splash.isDestroyed())splash.close();
-    const c=dialog.showMessageBoxSync({type:'error',title:'Erreur',message:'Impossible de demarrer le serveur Python.',detail:'Python: '+pyPath()+'\nRacine: '+appRoot(),buttons:['Reessayer','Quitter']});
-    if(c===0){relaunching=true;app.relaunch();}
-    app.quit();return;
+    while(true){
+      const c=dialog.showMessageBoxSync({type:'error',title:'Erreur',message:'Impossible de demarrer le serveur local.',detail:'Moteur: '+(backendPath()||pyPath())+'\nDonnees: '+app.getPath('userData'),buttons:['Reessayer','Quitter']});
+      const stopped=!srv||await stopServer({force:true});
+      if(!stopped){
+        dialog.showErrorBox('Fermeture suspendue','Le serveur local reste actif. Fermez-le depuis le gestionnaire des taches, puis reessayez.');
+        continue;
+      }
+      if(splash&&!splash.isDestroyed())splash.close();
+      if(c===0){relaunching=true;app.relaunch();}
+      app.quit();return;
+    }
   }
   createWin();
   createTray();
 });
 
 app.on('activate',()=>{if(BrowserWindow.getAllWindows().length===0)createWin();else show();});
-app.on('before-quit',()=>{quitting=true;if(!relaunching)stopServer();});
+app.on('before-quit',event=>{
+  if(!relaunching&&srv){
+    event.preventDefault();
+    if(!quitting){
+      quitting=true;
+      stopServer().then(stopped=>{
+        if(stopped){app.quit();return;}
+        quitting=false;
+        dialog.showErrorBox('Fermeture suspendue','Des conteneurs sont encore actifs. Vérifiez Docker puis réessayez.');
+      });
+    }
+  }else{
+    quitting=true;
+  }
+});
 process.on('SIGTERM',()=>quit());
 process.on('SIGINT',()=>quit());

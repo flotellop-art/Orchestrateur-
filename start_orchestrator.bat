@@ -1,7 +1,11 @@
 @echo off
-cd /d C:\Users\Tellop\claude-managed-agents
-call .venv\Scripts\activate
-pip install -r requirements_orchestrator.txt -q
+setlocal
+cd /d "%~dp0"
+if not exist ".venv\Scripts\python.exe" (
+    echo [ERREUR] Environnement Python absent. Lancez install_desktop.bat.
+    exit /b 1
+)
 echo Orchestrateur demarre sur http://localhost:8000
 start http://localhost:8000
-python orchestrator.py
+".venv\Scripts\python.exe" orchestrator.py
+exit /b %ERRORLEVEL%

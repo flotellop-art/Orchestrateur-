@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Créateur d'applications</title>
+<script src="/static/session-auth.js"></script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
@@ -126,6 +127,9 @@ header h1 span { color: var(--orange); }
 <header>
   <h1>✨ Créateur d'<span>Applications</span></h1>
   <div class="hdr-stats">
+    <a href="/workspace" style="color:var(--orange);text-decoration:none;font-weight:600">Espace agents</a>
+    <a href="/automations" style="color:var(--orange);text-decoration:none;font-weight:600">Programmations</a>
+    <a href="/skills" style="color:var(--orange);text-decoration:none;font-weight:600">Comp&eacute;tences</a>
     <div><strong id="hdr-total">0</strong> créées</div>
     <div><strong id="hdr-running">0</strong> en ligne</div>
     <a href="/memory" style="color:var(--orange);text-decoration:none;font-weight:600">Gérer la mémoire →</a>
@@ -188,6 +192,25 @@ header h1 span { color: var(--orange); }
 <script>
 var currentUrl = null;
 var creationRunning = false;
+
+// Ajoute la cle configuree dans /control a tous les appels du tableau de bord.
+(function () {
+  var nativeFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    init = init || {};
+    var headers = new Headers(init.headers || (input && input.headers) || {});
+    try {
+      var rawUrl = input && input.url ? input.url : input;
+      var requestUrl = new URL(rawUrl, window.location.href);
+      if (requestUrl.origin === window.location.origin) {
+        var key = sessionStorage.getItem('ORCH_API_KEY') || '';
+        if (key && !headers.has('X-API-Key')) headers.set('X-API-Key', key);
+      }
+    } catch (_) {}
+    init.headers = headers;
+    return nativeFetch(input, init);
+  };
+})();
 
 // ── Exemples ──────────────────────────────────────────────────────────────────
 var EXAMPLES = {

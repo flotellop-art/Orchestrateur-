@@ -25,7 +25,7 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).parent / "apps.db"
+from app_paths import DB_PATH
 
 EMBED_MODEL = os.getenv("MEMORY_EMBED_MODEL", "text-embedding-3-small")
 EMBED_DIM = int(os.getenv("MEMORY_EMBED_DIM", "256"))

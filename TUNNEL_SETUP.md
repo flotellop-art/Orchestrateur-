@@ -1,99 +1,74 @@
-# Configuration du tunnel Cloudflare permanent - agent.tryarty.com
+# Exposer Orchestrateur avec un tunnel Cloudflare
 
-## Prérequis
-- Compte Cloudflare avec le domaine `tryarty.com`
-- `cloudflared` installé (déjà fait)
+Un tunnel donne un accès distant à des fonctions capables de créer et lancer du
+code. N'ouvrez jamais le serveur sans clé forte, liste d'hôtes explicite et
+contrôle du compte Cloudflare.
 
----
+## Sécurité obligatoire
 
-## Étapes pour créer le tunnel permanent
+Dans `.env`, configurez au minimum :
 
-### 1. Se connecter à Cloudflare depuis le terminal
+```dotenv
+API_SECRET_KEY=<cle-aleatoire-d-au-moins-24-caracteres>
+ORCHESTRATOR_ALLOWED_HOSTS=localhost,127.0.0.1,::1,orchestrateur.example.com
+```
 
-```bat
+Vous pouvez générer la clé avec :
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Pour un tunnel temporaire, ajoutez `*.trycloudflare.com` aux hôtes autorisés.
+`start_tunnel.bat` refuse de démarrer si la clé est trop courte ou si aucun hôte
+distant n'est déclaré.
+
+## Tunnel permanent
+
+Les noms ci-dessous sont des exemples : remplacez le domaine, le nom du tunnel
+et son identifiant par les vôtres.
+
+```powershell
 cloudflared login
+cloudflared tunnel create orchestrateur-prod
 ```
 
-> Un navigateur s'ouvre. Connectez-vous à votre compte Cloudflare et autorisez le domaine `tryarty.com`.
-> Un fichier `cert.pem` est créé dans `C:\Users\Tellop\.cloudflared\`
-
-### 2. Créer le tunnel nommé
-
-```bat
-cloudflared tunnel create agent-tryarty
-```
-
-> Note l'UUID du tunnel affiché (ex: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
-
-### 3. Créer le fichier de configuration
-
-Créer le fichier `C:\Users\Tellop\.cloudflared\config.yml` :
+Créez `%USERPROFILE%\.cloudflared\config.yml` :
 
 ```yaml
-tunnel: agent-tryarty
-credentials-file: C:\Users\Tellop\.cloudflared\<UUID-DU-TUNNEL>.json
+tunnel: orchestrateur-prod
+credentials-file: C:\Users\VOTRE-COMPTE\.cloudflared\UUID-DU-TUNNEL.json
 
 ingress:
-  - hostname: agent.tryarty.com
-    service: http://localhost:8002
+  - hostname: orchestrateur.example.com
+    service: http://localhost:8000
   - service: http_status:404
 ```
 
-> Remplacez `<UUID-DU-TUNNEL>` par l'UUID obtenu à l'étape 2.
+Créez ensuite la route DNS et démarrez le tunnel :
 
-### 4. Créer l'enregistrement DNS
-
-```bat
-cloudflared tunnel route dns agent-tryarty agent.tryarty.com
+```powershell
+cloudflared tunnel route dns orchestrateur-prod orchestrateur.example.com
+cloudflared tunnel run orchestrateur-prod
 ```
 
-> Cela crée automatiquement un enregistrement CNAME dans le dashboard Cloudflare :
-> `agent.tryarty.com` → `<UUID>.cfargotunnel.com`
+Le script du dépôt peut aussi le lancer :
 
-### 5. Tester le tunnel
-
-```bat
-cloudflared tunnel run agent-tryarty
+```powershell
+.\start_tunnel.bat orchestrateur-prod
 ```
 
-Puis tester : `curl https://agent.tryarty.com/api/stats`
+Sans argument, il utilise le tunnel déclaré dans `config.yml`. Sans fichier de
+configuration, il ouvre un tunnel temporaire vers `http://localhost:8000`.
 
-### 6. Installer comme service Windows (démarrage automatique)
+## Vérification
 
-```bat
-cloudflared service install
+Une requête distante doit fournir la clé dans un en-tête, jamais dans l'URL :
+
+```powershell
+curl.exe -H "X-API-Key: VOTRE_CLE" https://orchestrateur.example.com/api/stats
 ```
 
-> Le tunnel démarrera automatiquement avec Windows, même sans être connecté.
-
----
-
-## Vérification du DNS dans Cloudflare Dashboard
-
-1. Aller sur https://dash.cloudflare.com
-2. Sélectionner `tryarty.com`
-3. DNS > Records
-4. Vérifier qu'il existe un CNAME : `agent` → `<UUID>.cfargotunnel.com` (Proxied)
-
----
-
-## Commandes utiles
-
-```bat
-# Lister les tunnels existants
-cloudflared tunnel list
-
-# Voir les logs du tunnel
-cloudflared tunnel info agent-tryarty
-
-# Supprimer un tunnel
-cloudflared tunnel delete agent-tryarty
-```
-
----
-
-## Lancement rapide
-
-Double-cliquer sur `start_tunnel.bat` dans ce dossier.
-- Si le tunnel permanent est configuré → lance `agent.tryarty.com`
-- Sinon → lance un tunnel temporaire `trycloudflare.com`
+Vérifiez aussi qu'une requête sans clé et une requête envoyée avec un autre
+en-tête `Host` sont refusées. Consultez [`SECURITY.md`](SECURITY.md) avant toute
+exposition durable.
